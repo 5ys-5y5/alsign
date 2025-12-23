@@ -1,0 +1,198 @@
+openapi: 3.0.3
+info:
+  title: Set Events Table API
+  description: Consolidate events from multiple evt_* source tables into unified txn_events table with sector/industry enrichment
+  version: 1.0.0
+
+servers:
+  - url: https://api.example.com
+    description: Production server (Render.com)
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /setEventsTable:
+    post:
+      operationId: setEventsTable
+      summary: Consolidate and enrich events from source tables
+      description: |
+        Auto-discovers evt_* tables in specified schema, extracts events, inserts into txn_events,
+        and enriches with sector/industry from config_lv3_targets.
+      tags:
+        - Event Processing
+      parameters:
+        - name: overwrite
+          in: query
+          required: false
+          description: |
+            Controls sector/industry update strategy:
+            - false (default): Update only NULL sector/industry values
+            - true: Update both NULL and mismatched sector/industry values
+          schema:
+            type: boolean
+            default: false
+
+        - name: dryRun
+          in: query
+          required: false
+          description: |
+            If true, returns projected changes without modifying database.
+          schema:
+            type: boolean
+            default: false
+
+        - name: schema
+          in: query
+          required: false
+          description: |
+            Target schema to search for evt_* tables.
+          schema:
+            type: string
+            default: "public"
+          example: "public"
+
+        - name: table
+          in: query
+          required: false
+          description: |
+            Comma-separated list of specific table names to process.
+            If unspecified, auto-discovers all evt_* tables in schema.
+            All specified tables must match evt_* pattern.
+          schema:
+            type: string
+            pattern: ^evt_[a-z_]+(,evt_[a-z_]+)*$
+          example: "evt_consensus,evt_earning"
+
+      requestBody:
+        description: Empty JSON body (endpoint accepts no input payload)
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+
+      responses:
+        '200':
+          description: Event consolidation completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetEventsTableResponse'
+
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidTablePattern:
+                  value:
+                    error: "Invalid table name"
+                    details: "Table 'invalid_table' does not match required evt_* pattern"
+                invalidSchema:
+                  value:
+                    error: "Schema not found"
+                    details: "Schema 'nonexistent' does not exist"
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    SetEventsTableResponse:
+      type: object
+      required:
+        - reqId
+        - endpoint
+        - dryRun
+        - summary
+        - tables
+      properties:
+        reqId:
+          type: string
+          format: uuid
+        endpoint:
+          type: string
+          enum: ['POST /setEventsTable']
+        dryRun:
+          type: boolean
+        summary:
+          type: object
+          required:
+            - tablesDiscovered
+            - tablesProcessed
+            - totalRowsScanned
+            - totalInserted
+            - totalConflicts
+            - sectorIndustryUpdated
+            - elapsedMs
+          properties:
+            tablesDiscovered:
+              type: integer
+            tablesProcessed:
+              type: integer
+            totalRowsScanned:
+              type: integer
+            totalInserted:
+              type: integer
+            totalConflicts:
+              type: integer
+            sectorIndustryUpdated:
+              type: integer
+            sectorIndustrySkippedNoTarget:
+              type: integer
+            sectorIndustryUpdatedMismatch:
+              type: integer
+            sectorIndustryUpdatedNull:
+              type: integer
+            elapsedMs:
+              type: integer
+        tables:
+          type: array
+          items:
+            $ref: '#/components/schemas/TableProcessingResult'
+
+    TableProcessingResult:
+      type: object
+      required:
+        - tableName
+        - rowsScanned
+        - inserted
+        - conflicts
+        - skipped
+      properties:
+        tableName:
+          type: string
+        rowsScanned:
+          type: integer
+        inserted:
+          type: integer
+        conflicts:
+          type: integer
+        skipped:
+          type: integer
+        skipReason:
+          type: string
+          description: Reason for skipping (e.g., "missing required columns")
+        warn:
+          type: array
+          items:
+            type: string
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+        code:
+          type: string

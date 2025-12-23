@@ -1,50 +1,154 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+# AlSign Financial Data API Constitution
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Simplicity
+Every component must have a clear, singular purpose. Avoid unnecessary abstraction layers. Use straightforward FastAPI patterns and direct SQL queries. The UI must use plain HTML/CSS/React without component libraries.
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+**MUST**:
+- Use direct SQL connections (no ORM, no PostgREST)
+- Keep service layer thin (business logic only)
+- Avoid premature optimization
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+**MUST NOT**:
+- Use supabase-js, PostgREST, or Supabase Python client for CRUD
+- Add abstraction layers without clear justification
+- Use UI component libraries (shadcn/ui, MUI, Ant, Chakra, Mantine)
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+### II. Testability
+Each endpoint and business logic phase must be independently testable. Unit tests, integration tests, and contract tests must be possible without complex setup.
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+**MUST**:
+- Each user story must be independently testable
+- Each endpoint must have clear input/output contracts
+- Use pytest with async support for all backend tests
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+**SHOULD**:
+- Provide seed data scripts for independent testing
+- Mock external API calls in unit tests
+- Use contract testing for API schemas
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+### III. Single Responsibility
+Clear separation between data collection, consolidation, valuation, and aggregation. Each router handles one concern. Each service implements one business capability.
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+**MUST**:
+- One router per major domain (source_data, events, analyst, dashboard, control, condition_group)
+- One service per business operation
+- One database query module per entity type
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+**MUST NOT**:
+- Mix concerns across layers (e.g., router doing database queries directly)
+- Duplicate business logic across services
+
+### IV. Database Responsibility Boundary (NON-NEGOTIABLE)
+The application must never write to database-managed columns. This prevents logic duplication and maintains clear boundaries.
+
+**MUST NEVER** write to:
+- `created_at` (DB manages via DEFAULT NOW())
+- `updated_at` (DB manages via trigger)
+- `analyst_name_key` (DB manages via GENERATED ALWAYS AS)
+- `analyst_company_key` (DB manages via GENERATED ALWAYS AS)
+
+**MUST**:
+- Use upsert for: config_lv3_market_holidays, config_lv3_targets, evt_consensus, config_lv3_analyst, txn_events
+- Use insert-only for: evt_earning
+- Log 'POLICY_CONFLICT_DB_SCHEMA' warning if guideline conflicts with DB constraints
+
+**Violation of this principle is CRITICAL and will cause database errors.**
+
+### V. Performance & Observability
+All operations must be observable through structured logging. Performance bottlenecks must be identifiable from logs alone without additional debugging.
+
+**MUST**:
+- Use fixed 1-line log format: `[endpoint | phase] elapsed=Xms | progress=done/total(pct%) | eta=Yms | rate=perMin/limitPerMin(usagePct%) | batch=size(mode) | ok=X fail=Y skip=Z upd=A ins=B cf=C | warn=[codes] | message`
+- Calculate and log ETA for long-running operations
+- Track success/fail/skip/update/insert/conflict counts per operation
+- Log all rate limit adjustments with current usage percentage
+
+**MUST**:
+- Respect external API rate limits (dynamic batch sizing)
+- Meet performance targets: GET /sourceData <10min for 500 tickers, POST /setEventsTable <2min for 10K events
+- Dashboard interactions <200ms response time
+
+### VI. Data Integrity & Timezone Handling
+All date/time operations must use UTC. No local timezone conversions. All dates must be traceable and consistent.
+
+**MUST**:
+- Parse all incoming dates to UTC
+- Store all timestamps as timestamptz (PostgreSQL)
+- Store dates in jsonb as UTC ISO8601 strings with +00:00 timezone
+- Return 400 Bad Request on date parsing failures
+
+**MUST NOT**:
+- Use local timezones
+- Store timezone-naive datetime objects
+- Assume any date is in a specific timezone without validation
+
+### VII. Security & Secrets Management
+No secrets in code. All sensitive data via environment variables. Input validation on all user-provided data.
+
+**MUST**:
+- Load API keys from environment variables only
+- Validate all user inputs (ticker format, date ranges, column names)
+- Use SQL parameter binding (never string interpolation)
+- Whitelist column names for dynamic queries (prevent SQL injection)
+
+**MUST NOT**:
+- Commit .env files to git
+- Log API keys or sensitive credentials
+- Trust user input without validation
+- Use string concatenation for SQL queries
+
+## Design System Compliance (UI)
+
+### VIII. Design System Lock (NON-NEGOTIABLE)
+The frontend must exactly replicate the design system specification. No creative interpretation.
+
+**MUST**:
+- Use exact dimensions: btn-sm (32px height), btn-md (40px height)
+- Use 8px spacing grid: only 8/12/16/24/32px values
+- Use exact font weights: only 400/500/600
+- Use exact z-index values: 0/10/20/21/30/100/200
+- Use SVG icons only (no Unicode glyphs, no icon libraries)
+
+**MUST NOT**:
+- Deviate from button/table dimensions in 2_designSystem.ini
+- Use arbitrary spacing (e.g., 6px, 10px, 14px)
+- Use font weights other than 400/500/600
+- Use UI component libraries or icon libraries
+- Use Unicode glyphs for functional icons (arrows, filters, etc.)
+
+**Source of Truth**: `alsign/prompt/2_designSystem.ini`
+
+## Error Handling Standards
+
+### IX. Structured Error Responses
+All errors must use standardized codes and formats. HTTP status codes must match error semantics.
+
+**MUST**:
+- Use ErrorCode enum: POLICY_NOT_FOUND, INVALID_POLICY, INVALID_CONSENSUS_DATA, INVALID_PRICE_TREND_RANGE, METRIC_NOT_FOUND, EVENT_ROW_NOT_FOUND, AMBIGUOUS_EVENT_DATE, INTERNAL_ERROR
+- Return HTTP 207 Multi-Status for batch operations with per-record status
+- Return summary with counts: success/fail/skip/update/insert/conflict
+- Return 400 Bad Request for client errors (invalid input)
+- Return 500 Internal Server Error for server errors
+
+**MUST NOT**:
+- Return generic "error occurred" messages without error codes
+- Mix successful and failed batch items in HTTP 200 response
+- Expose internal stack traces to API clients
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+This constitution supersedes all other development practices. All implementation decisions must align with these principles.
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**Amendments**:
+- Require documentation of rationale
+- Require approval from project stakeholders
+- Require migration plan if existing code conflicts
+
+**Enforcement**:
+- All code reviews must verify constitution compliance
+- Complexity must be justified against these principles
+- Violations of NON-NEGOTIABLE principles are blocking issues
+
+**Version**: 1.0.0 | **Ratified**: 2025-12-18 | **Last Amended**: 2025-12-18

@@ -1,0 +1,187 @@
+/**
+ * Design Tokens - AlSign Design System
+ *
+ * Based on alsign/prompt/2_designSystem.ini
+ * These tokens define the visual language of the application.
+ * DO NOT modify without updating the design system specification.
+ */
+
+:root {
+  /* ===== COLORS ===== */
+  /* Base Colors */
+  --ink: #000000;
+  --text: #374151;
+  --text-dim: #9ca3af;
+  --surface: #f9fafb;
+  --border: #e5e7eb;
+
+  /* Accent Colors */
+  --accent-primary: #3b82f6;
+  --accent-success: #10b981;
+  --accent-warning: #f59e0b;
+  --accent-danger: #ef4444;
+
+  /* Position Badge Colors */
+  --position-long: #3b82f6; /* blue */
+  --position-short: #ef4444; /* red */
+  --position-undefined: #6b7280; /* gray */
+
+  /* ===== SPACING ===== */
+  /* 8px grid system - ONLY these values allowed */
+  --space-1: 8px;
+  --space-2: 12px; /* exception to 8px grid */
+  --space-3: 16px;
+  --space-4: 24px;
+  --space-5: 32px;
+
+  /* ===== TYPOGRAPHY ===== */
+  /* Font Family */
+  --font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+
+  /* Font Sizes */
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 18px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+
+  /* Font Weights - ONLY these values allowed */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+
+  /* Line Heights */
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.6;
+
+  /* Letter Spacing */
+  --tracking-wider: 0.05em;
+
+  /* ===== DIMENSIONS ===== */
+  /* Button Sizes - ABSOLUTE VALUES */
+  --btn-sm-height: 32px;
+  --btn-sm-padding-x: 12px;
+  --btn-sm-font-size: 13px;
+
+  --btn-md-height: 40px;
+  --btn-md-padding-x: 16px;
+  --btn-md-font-size: 14px;
+
+  /* Table Dimensions */
+  --table-header-padding-y: 12px;
+  --table-header-padding-x: 16px;
+  --table-body-padding-y: 12px;
+  --table-body-padding-x: 16px;
+  --table-row-min-height: 48px;
+
+  /* ===== BORDER RADIUS ===== */
+  --rounded-lg: 8px;
+  --rounded-xl: 12px;
+  --rounded-2xl: 16px;
+
+  /* ===== ICON SIZES ===== */
+  --icon-sm: 14px; /* sort/filter icons */
+  --icon-md: 16px; /* button icons */
+
+  /* ===== Z-INDEX LAYERS ===== */
+  /* NUMERIC Z-INDEX CONSTANTS - DO NOT DEVIATE */
+  --z-base: 0; /* route base content */
+  --z-scroll: 10; /* scroll containers */
+  --z-sticky: 20; /* sticky table header */
+  --z-divider: 21; /* header divider line */
+  --z-toolbar: 30; /* table toolbar */
+  --z-popover: 100; /* popover panels */
+  --z-topbar: 200; /* global topbar */
+
+  /* ===== EFFECTS ===== */
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+
+  /* Focus Ring */
+  --focus-ring-width: 2px;
+  --focus-ring-color: var(--ink);
+  --focus-ring-offset: 2px;
+
+  /* Transitions */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow: 300ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Backdrop Blur */
+  --backdrop-blur: blur(8px);
+}
+
+/**
+ * Typography Scale
+ *
+ * Pre-defined text styles following the design system.
+ */
+.text-xs {
+  font-size: var(--text-xs);
+}
+
+.text-sm {
+  font-size: var(--text-sm);
+}
+
+.text-base {
+  font-size: var(--text-base);
+}
+
+.text-lg {
+  font-size: var(--text-lg);
+}
+
+.text-xl {
+  font-size: var(--text-xl);
+}
+
+.text-2xl {
+  font-size: var(--text-2xl);
+}
+
+.text-3xl {
+  font-size: var(--text-3xl);
+}
+
+/* Font Weights */
+.font-normal {
+  font-weight: var(--font-normal);
+}
+
+.font-medium {
+  font-weight: var(--font-medium);
+}
+
+.font-semibold {
+  font-weight: var(--font-semibold);
+}
+
+/* Text Colors */
+.text-ink {
+  color: var(--ink);
+}
+
+.text-default {
+  color: var(--text);
+}
+
+.text-dim {
+  color: var(--text-dim);
+}
+
+/* Text Transform */
+.uppercase {
+  text-transform: uppercase;
+}
+
+/* Letter Spacing */
+.tracking-wider {
+  letter-spacing: var(--tracking-wider);
+}

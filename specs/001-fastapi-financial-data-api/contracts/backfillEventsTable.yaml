@@ -1,0 +1,197 @@
+openapi: 3.0.3
+info:
+  title: Backfill Events Table API
+  description: Calculate quantitative and qualitative value metrics for events in txn_events table
+  version: 1.0.0
+
+servers:
+  - url: https://api.example.com
+    description: Production server (Render.com)
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /backfillEventsTable:
+    post:
+      operationId: backfillEventsTable
+      summary: Calculate valuation metrics for events
+      description: |
+        Calculates value_quantitative, value_qualitative, position_quantitative, position_qualitative,
+        disparity_quantitative, and disparity_qualitative for events in txn_events.
+        Queries config_lv2_metric for metric definitions and fetches data from external APIs.
+      tags:
+        - Event Processing
+      parameters:
+        - name: overwrite
+          in: query
+          required: false
+          description: |
+            Controls value field update strategy:
+            - false (default): Partially update NULL values within value_* jsonb fields
+            - true: Fully replace value_* fields (only for rows meeting preconditions)
+          schema:
+            type: boolean
+            default: false
+
+      requestBody:
+        description: Empty JSON body (endpoint accepts no input payload)
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+
+      responses:
+        '200':
+          description: Valuation calculation completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackfillEventsTableResponse'
+
+        '207':
+          description: Multi-Status - some events succeeded, some failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BackfillEventsTableResponse'
+
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    BackfillEventsTableResponse:
+      type: object
+      required:
+        - reqId
+        - endpoint
+        - overwrite
+        - summary
+        - results
+      properties:
+        reqId:
+          type: string
+          format: uuid
+        endpoint:
+          type: string
+          enum: ['POST /backfillEventsTable']
+        overwrite:
+          type: boolean
+        summary:
+          type: object
+          required:
+            - totalEventsProcessed
+            - quantitativeSuccess
+            - quantitativeFail
+            - qualitativeSuccess
+            - qualitativeFail
+            - elapsedMs
+          properties:
+            totalEventsProcessed:
+              type: integer
+            quantitativeSuccess:
+              type: integer
+            quantitativeFail:
+              type: integer
+            qualitativeSuccess:
+              type: integer
+            qualitativeFail:
+              type: integer
+            priceTrendSuccess:
+              type: integer
+            priceTrendFail:
+              type: integer
+            elapsedMs:
+              type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventProcessingResult'
+
+    EventProcessingResult:
+      type: object
+      required:
+        - ticker
+        - event_date
+        - source
+        - source_id
+        - status
+      properties:
+        ticker:
+          type: string
+        event_date:
+          type: string
+          format: date-time
+        source:
+          type: string
+        source_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [success, partial, failed]
+        quantitative:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [success, failed, skipped]
+            message:
+              type: string
+        qualitative:
+          type: object
+          properties:
+            status:
+              type: string
+              enum: [success, failed, skipped]
+            message:
+              type: string
+        position:
+          type: object
+          properties:
+            quantitative:
+              type: string
+              enum: [long, short, undefined]
+            qualitative:
+              type: string
+              enum: [long, short, undefined]
+        disparity:
+          type: object
+          properties:
+            quantitative:
+              type: number
+            qualitative:
+              type: number
+        error:
+          type: string
+        errorCode:
+          type: string
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+        code:
+          type: string
+          enum:
+            - INVALID_CONSENSUS_DATA
+            - METRIC_NOT_FOUND
+            - INTERNAL_ERROR

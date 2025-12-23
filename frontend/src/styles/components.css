@@ -1,0 +1,457 @@
+/**
+ * Component Styles - AlSign Design System
+ *
+ * Component-level styles for tables, buttons, badges, and other UI elements.
+ * Based on alsign/prompt/2_designSystem.ini
+ */
+
+/* ===== BUTTONS ===== */
+
+/* Base Button Styles */
+.btn {
+  font-family: var(--font-family);
+  font-weight: var(--font-medium);
+  border: 1px solid var(--border);
+  border-radius: var(--rounded-lg);
+  cursor: pointer;
+  transition: all var(--transition-base);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  background-color: white;
+  color: var(--text);
+}
+
+.btn:hover:not(:disabled) {
+  background-color: var(--surface);
+  border-color: var(--text-dim);
+}
+
+.btn:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Button Sizes - ABSOLUTE DIMENSIONS */
+.btn-sm {
+  height: var(--btn-sm-height);
+  padding-left: var(--btn-sm-padding-x);
+  padding-right: var(--btn-sm-padding-x);
+  font-size: var(--btn-sm-font-size);
+}
+
+.btn-md {
+  height: var(--btn-md-height);
+  padding-left: var(--btn-md-padding-x);
+  padding-right: var(--btn-md-padding-x);
+  font-size: var(--btn-md-font-size);
+}
+
+/* Button Variants */
+.btn-primary {
+  background-color: var(--accent-primary);
+  border-color: var(--accent-primary);
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: var(--accent-primary);
+  opacity: 0.9;
+  border-color: var(--accent-primary);
+}
+
+.btn-danger {
+  background-color: var(--accent-danger);
+  border-color: var(--accent-danger);
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: var(--accent-danger);
+  opacity: 0.9;
+  border-color: var(--accent-danger);
+}
+
+.btn-success {
+  background-color: var(--accent-success);
+  border-color: var(--accent-success);
+  color: white;
+}
+
+.btn-success:hover:not(:disabled) {
+  background-color: var(--accent-success);
+  opacity: 0.9;
+  border-color: var(--accent-success);
+}
+
+/* Outline Button */
+.btn-outline {
+  background-color: transparent;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.btn-outline:hover:not(:disabled) {
+  background-color: var(--surface);
+  border-color: var(--text-dim);
+}
+
+/* ===== BADGES ===== */
+
+/* Base Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px var(--space-1);
+  border-radius: var(--rounded-lg);
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium);
+  line-height: 1;
+}
+
+/* Position Badges - Exact Colors from Design System */
+.badge-long {
+  background-color: var(--position-long);
+  color: white;
+}
+
+.badge-short {
+  background-color: var(--position-short);
+  color: white;
+}
+
+.badge-undefined {
+  background-color: var(--position-undefined);
+  color: white;
+}
+
+/* ===== TABLES ===== */
+
+/* Table Shell - Container with border and rounded corners */
+.table-shell {
+  border: 1px solid var(--border);
+  border-radius: var(--rounded-xl);
+  background-color: white;
+  overflow: hidden;
+  position: relative;
+  z-index: var(--z-base);
+}
+
+/* Table Toolbar - Column selector and other controls */
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background-color: white;
+  position: relative;
+  z-index: var(--z-toolbar);
+}
+
+/* Scroll Containers - Two-level scroll with sticky header */
+.scroll-y {
+  max-height: 70vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  z-index: var(--z-scroll);
+}
+
+.scroll-x {
+  overflow-x: auto;
+  overflow-y: visible;
+  position: relative;
+  z-index: var(--z-scroll);
+}
+
+/* Table Element */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+/* Table Header */
+thead {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background-color: rgb(241 245 249 / 0.8); /* slate-100 with opacity */
+  backdrop-filter: var(--backdrop-blur);
+}
+
+thead th {
+  padding: var(--table-header-padding-y) var(--table-header-padding-x);
+  text-align: left;
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  border-bottom: 1px solid var(--ink); /* Black divider line */
+  position: relative;
+  z-index: var(--z-sticky);
+}
+
+/* Header Divider Line */
+thead th::after {
+  content: '';
+  position: absolute;
+  bottom: -1px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background-color: var(--ink);
+  z-index: var(--z-divider);
+}
+
+/* Table Header Interactive Elements */
+.th-content {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* Table Body */
+tbody tr {
+  border-bottom: 1px solid var(--border);
+  min-height: var(--table-row-min-height);
+}
+
+tbody tr:hover {
+  background-color: var(--surface);
+}
+
+tbody tr:last-child {
+  border-bottom: none;
+}
+
+tbody td {
+  padding: var(--table-body-padding-y) var(--table-body-padding-x);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+/* Null/Empty Cell Rendering */
+td.cell-null,
+span.cell-null {
+  color: var(--text-dim);
+}
+
+/* Long Text Truncation */
+.cell-truncate {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== POPOVERS ===== */
+
+/* Popover Panel */
+.panel {
+  position: absolute;
+  background-color: white;
+  border: 1px solid var(--border);
+  border-radius: var(--rounded-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-2);
+  z-index: var(--z-popover);
+  display: none;
+}
+
+.panel.open {
+  display: block;
+}
+
+/* Column Selector Panel */
+.column-selector-panel {
+  min-width: 200px;
+  max-width: 300px;
+}
+
+/* Filter Panel */
+.filter-panel {
+  width: 256px; /* w-64 */
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.filter-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-2);
+}
+
+.filter-panel-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--ink);
+}
+
+.filter-panel-body {
+  padding: var(--space-1) 0;
+}
+
+/* ===== FORMS ===== */
+
+/* Input Fields */
+input[type='text'],
+input[type='password'],
+input[type='date'],
+input[type='number'],
+select,
+textarea {
+  width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--rounded-lg);
+  font-size: var(--text-sm);
+  font-family: var(--font-family);
+  color: var(--text);
+  background-color: white;
+  transition: border-color var(--transition-base);
+}
+
+input[type='text']:focus,
+input[type='password']:focus,
+input[type='date']:focus,
+input[type='number']:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+}
+
+input[type='text']::placeholder,
+input[type='password']::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+}
+
+/* Checkbox */
+input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  accent-color: var(--accent-primary);
+}
+
+/* Checkbox Label */
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) 0;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+.checkbox-label:hover {
+  background-color: var(--surface);
+}
+
+/* ===== ICONS ===== */
+
+/* Sort Icons */
+.sort-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  display: inline-block;
+  cursor: pointer;
+}
+
+.sort-icon-none {
+  opacity: 0.3;
+}
+
+.sort-icon-asc,
+.sort-icon-desc {
+  opacity: 1;
+}
+
+/* Filter Icons */
+.filter-icon {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  display: inline-block;
+  cursor: pointer;
+  color: var(--text-dim);
+}
+
+.filter-icon.active {
+  color: var(--ink);
+}
+
+/* ===== CARDS ===== */
+
+/* KPI Card */
+.kpi-card {
+  background-color: white;
+  border: 1px solid var(--border);
+  border-radius: var(--rounded-xl);
+  padding: var(--space-4);
+  min-width: 200px;
+}
+
+.kpi-card-title {
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--text-dim);
+  margin-bottom: var(--space-1);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+}
+
+.kpi-card-value {
+  font-size: var(--text-3xl);
+  font-weight: var(--font-semibold);
+  color: var(--ink);
+}
+
+.kpi-card-subtitle {
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  margin-top: var(--space-1);
+}
+
+/* ===== ALERTS ===== */
+
+.alert {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--rounded-lg);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+}
+
+.alert-success {
+  background-color: rgb(220 252 231); /* green-100 */
+  border: 1px solid var(--accent-success);
+  color: rgb(22 101 52); /* green-900 */
+}
+
+.alert-error {
+  background-color: rgb(254 226 226); /* red-100 */
+  border: 1px solid var(--accent-danger);
+  color: rgb(127 29 29); /* red-900 */
+}
+
+.alert-warning {
+  background-color: rgb(254 243 199); /* yellow-100 */
+  border: 1px solid var(--accent-warning);
+  color: rgb(120 53 15); /* yellow-900 */
+}

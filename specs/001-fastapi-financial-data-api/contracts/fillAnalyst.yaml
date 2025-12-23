@@ -1,0 +1,186 @@
+openapi: 3.0.3
+info:
+  title: Fill Analyst API
+  description: Aggregate analyst performance metrics from consensus events with price trend analysis
+  version: 1.0.0
+
+servers:
+  - url: https://api.example.com
+    description: Production server (Render.com)
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /fillAnalyst:
+    post:
+      operationId: fillAnalyst
+      summary: Aggregate analyst performance metrics
+      description: |
+        Groups consensus events by (analyst_name, analyst_company), calculates return distributions
+        per dayOffset, and upserts performance statistics to config_lv3_analyst table.
+        Uses generated keys (analyst_name_key, analyst_company_key) for handling NULL values.
+      tags:
+        - Analytics
+      requestBody:
+        description: Empty JSON body (endpoint accepts no input payload)
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+
+      responses:
+        '200':
+          description: Analyst performance aggregation completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FillAnalystResponse'
+
+        '207':
+          description: Multi-Status - some groups succeeded, some failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FillAnalystResponse'
+
+        '400':
+          description: Bad request - validation failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                policyNotFound:
+                  value:
+                    error: "Policy not found"
+                    code: "POLICY_NOT_FOUND"
+                    details: "config_lv0_policy.function='fillPriceTrend_dateRange' not found"
+                invalidPriceTrendRange:
+                  value:
+                    error: "Invalid price trend range"
+                    code: "INVALID_PRICE_TREND_RANGE"
+                    details: "Event priceTrend range does not match policy countStart/countEnd"
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    FillAnalystResponse:
+      type: object
+      required:
+        - reqId
+        - endpoint
+        - summary
+        - groups
+      properties:
+        reqId:
+          type: string
+          format: uuid
+        endpoint:
+          type: string
+          enum: ['POST /fillAnalyst']
+        summary:
+          type: object
+          required:
+            - totalEventsLoaded
+            - eventsSkippedBothNullAnalyst
+            - totalGroups
+            - groupsSuccess
+            - groupsFailed
+            - elapsedMs
+          properties:
+            totalEventsLoaded:
+              type: integer
+            eventsSkippedBothNullAnalyst:
+              type: integer
+            totalGroups:
+              type: integer
+            groupsSuccess:
+              type: integer
+            groupsFailed:
+              type: integer
+            groupsSkipped:
+              type: integer
+            errorsByCode:
+              type: object
+              additionalProperties:
+                type: integer
+            elapsedMs:
+              type: integer
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalystGroupResult'
+
+    AnalystGroupResult:
+      type: object
+      required:
+        - analyst_name
+        - analyst_company
+        - status
+      properties:
+        analyst_name:
+          type: string
+          nullable: true
+        analyst_company:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [success, failed, skipped]
+        eventsCount:
+          type: integer
+        performanceSummary:
+          type: object
+          properties:
+            dayOffsets:
+              type: array
+              items:
+                type: integer
+            meanReturns:
+              type: object
+              additionalProperties:
+                type: number
+            medianReturns:
+              type: object
+              additionalProperties:
+                type: number
+            sampleCounts:
+              type: object
+              additionalProperties:
+                type: integer
+        error:
+          type: string
+        errorCode:
+          type: string
+          enum:
+            - POLICY_NOT_FOUND
+            - INVALID_POLICY
+            - INVALID_PRICE_TREND_RANGE
+            - METRIC_NOT_FOUND
+            - INTERNAL_ERROR
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+        code:
+          type: string
+          enum:
+            - POLICY_NOT_FOUND
+            - INVALID_POLICY
+            - INVALID_PRICE_TREND_RANGE
+            - METRIC_NOT_FOUND
+            - INTERNAL_ERROR

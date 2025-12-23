@@ -1,0 +1,307 @@
+"""Database queries for metric definitions and event valuations."""
+
+import asyncpg
+import json
+from typing import List, Dict, Any
+
+
+async def select_metric_definitions(
+    pool: asyncpg.Pool
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load metric definitions from config_lv2_metric table.
+
+    Groups metrics by domain suffix (valuation, profitability, momentum, risk, dilution).
+
+    Returns:
+        Dict with domain as key, list of metric definitions as value
+        Example: {
+            'valuation': [{'name': 'PER', 'formula': '...', ...}],
+            'profitability': [{'name': 'ROE', ...}],
+            ...
+        }
+    Note: 'name' maps to 'id' column and 'formula' maps to 'expression' column in the database.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, domain, expression, description
+            FROM config_lv2_metric
+            WHERE domain LIKE 'quantitative-%'
+               OR domain LIKE 'qualitative-%'
+            ORDER BY domain, id
+            """
+        )
+
+        # Group by domain suffix
+        metrics_by_domain = {}
+        for row in rows:
+            domain_full = row['domain']
+
+            # Extract suffix (quantitative-valuation -> valuation)
+            if '-' in domain_full:
+                domain_suffix = domain_full.split('-', 1)[1]
+            else:
+                domain_suffix = domain_full
+
+            if domain_suffix not in metrics_by_domain:
+                metrics_by_domain[domain_suffix] = []
+
+            metrics_by_domain[domain_suffix].append({
+                'name': row['id'],
+                'domain': row['domain'],
+                'formula': row['expression'],
+                'description': row['description']
+            })
+
+        return metrics_by_domain
+
+
+async def select_events_for_valuation(
+    pool: asyncpg.Pool,
+    limit: int = None,
+    from_date = None,
+    to_date = None,
+    tickers: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Select events from txn_events that need valuation processing.
+
+    Args:
+        pool: Database connection pool
+        limit: Optional limit on number of events to process
+        from_date: Optional start date for filtering events by event_date
+        to_date: Optional end date for filtering events by event_date
+        tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
+
+    Returns:
+        List of event dictionaries with ticker, event_date, source, source_id
+    """
+    async with pool.acquire() as conn:
+        query = """
+            SELECT ticker, event_date, source, source_id,
+                   sector, industry,
+                   value_quantitative, value_qualitative,
+                   position_quantitative, position_qualitative,
+                   disparity_quantitative, disparity_qualitative
+            FROM txn_events
+            WHERE 1=1
+        """
+        params = []
+        param_idx = 1
+
+        if from_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date >= ${param_idx}"
+            params.append(from_date)
+            param_idx += 1
+
+        if to_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date <= ${param_idx}"
+            params.append(to_date)
+            param_idx += 1
+
+        if tickers is not None and len(tickers) > 0:
+            query += f" AND ticker = ANY(${param_idx})"
+            params.append(tickers)
+            param_idx += 1
+
+        query += " ORDER BY ticker, event_date"
+
+        if limit:
+            query += f" LIMIT {limit}"
+
+        rows = await conn.fetch(query, *params)
+        return [dict(row) for row in rows]
+
+
+async def select_event_by_id(
+    pool: asyncpg.Pool,
+    ticker: str,
+    event_date,
+    source: str,
+    source_id
+) -> Dict[str, Any]:
+    """
+    Select a single event by composite key.
+
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        event_date: Event date
+        source: Source table name
+        source_id: Source record ID
+
+    Returns:
+        Event dictionary or None
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT ticker, event_date, source, source_id,
+                   sector, industry,
+                   value_quantitative, value_qualitative,
+                   position_quantitative, position_qualitative,
+                   disparity_quantitative, disparity_qualitative
+            FROM txn_events
+            WHERE ticker = $1
+              AND event_date = $2
+              AND source = $3
+              AND source_id = $4
+            """,
+            ticker,
+            event_date,
+            source,
+            source_id
+        )
+
+        return dict(row) if row else None
+
+
+async def select_consensus_data(
+    pool: asyncpg.Pool,
+    ticker: str,
+    event_date
+) -> Dict[str, Any]:
+    """
+    Select consensus data for qualitative calculation.
+
+    Fetches Phase 2 data (price_target, price_when_posted, direction, prev values).
+
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        event_date: Event date
+
+    Returns:
+        Consensus data dictionary or None
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT ticker, event_date, analyst_name, analyst_company,
+                   price_target, price_when_posted,
+                   price_target_prev, price_when_posted_prev,
+                   direction, response_key
+            FROM evt_consensus
+            WHERE ticker = $1
+              AND event_date = $2
+            ORDER BY event_date DESC
+            LIMIT 1
+            """,
+            ticker,
+            event_date
+        )
+
+        return dict(row) if row else None
+
+
+async def update_event_valuations(
+    pool: asyncpg.Pool,
+    ticker: str,
+    event_date,
+    source: str,
+    source_id,
+    value_quantitative: Dict[str, Any] = None,
+    value_qualitative: Dict[str, Any] = None,
+    position_quantitative: str = None,
+    position_qualitative: str = None,
+    disparity_quantitative: float = None,
+    disparity_qualitative: float = None,
+    overwrite: bool = False
+) -> int:
+    """
+    Update event valuations in txn_events.
+
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        event_date: Event date
+        source: Source table name
+        source_id: Source record ID
+        value_quantitative: Quantitative metrics jsonb
+        value_qualitative: Qualitative metrics jsonb
+        position_quantitative: Position signal (long/short/undefined)
+        position_qualitative: Position signal (long/short/undefined)
+        disparity_quantitative: Quantitative disparity
+        disparity_qualitative: Qualitative disparity
+        overwrite: If False, partial update (NULL values only). If True, full replace.
+
+    Returns:
+        Number of rows updated (should be 1)
+
+    Table columns (never write to created_at, updated_at):
+    - value_quantitative (jsonb)
+    - value_qualitative (jsonb)
+    - position_quantitative (text)
+    - position_qualitative (text)
+    - disparity_quantitative (numeric)
+    - disparity_qualitative (numeric)
+    """
+    async with pool.acquire() as conn:
+        if overwrite:
+            # Full replace mode
+            result = await conn.execute(
+                """
+                UPDATE txn_events
+                SET value_quantitative = $5,
+                    value_qualitative = $6,
+                    position_quantitative = $7,
+                    position_qualitative = $8,
+                    disparity_quantitative = $9,
+                    disparity_qualitative = $10
+                WHERE ticker = $1
+                  AND event_date = $2
+                  AND source = $3
+                  AND source_id = $4
+                """,
+                ticker,
+                event_date,
+                source,
+                source_id,
+                json.dumps(value_quantitative) if value_quantitative else None,
+                json.dumps(value_qualitative) if value_qualitative else None,
+                position_quantitative,
+                position_qualitative,
+                disparity_quantitative,
+                disparity_qualitative
+            )
+        else:
+            # Partial update mode - only update NULL values
+            result = await conn.execute(
+                """
+                UPDATE txn_events
+                SET value_quantitative = CASE
+                        WHEN value_quantitative IS NULL THEN $5::jsonb
+                        ELSE value_quantitative
+                    END,
+                    value_qualitative = CASE
+                        WHEN value_qualitative IS NULL THEN $6::jsonb
+                        ELSE value_qualitative
+                    END,
+                    position_quantitative = COALESCE(position_quantitative, $7),
+                    position_qualitative = COALESCE(position_qualitative, $8),
+                    disparity_quantitative = COALESCE(disparity_quantitative, $9),
+                    disparity_qualitative = COALESCE(disparity_qualitative, $10)
+                WHERE ticker = $1
+                  AND event_date = $2
+                  AND source = $3
+                  AND source_id = $4
+                """,
+                ticker,
+                event_date,
+                source,
+                source_id,
+                json.dumps(value_quantitative) if value_quantitative else None,
+                json.dumps(value_qualitative) if value_qualitative else None,
+                position_quantitative,
+                position_qualitative,
+                disparity_quantitative,
+                disparity_qualitative
+            )
+
+        # Parse result to get row count
+        if "UPDATE" in result:
+            count = int(result.split()[-1])
+            return count
+
+        return 0

@@ -1,0 +1,280 @@
+openapi: 3.0.3
+info:
+  title: Source Data API
+  description: Collect and process financial data from external APIs (market holidays, company targets, analyst consensus, earnings calendar)
+  version: 1.0.0
+
+servers:
+  - url: https://api.example.com
+    description: Production server (Render.com)
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /sourceData:
+    get:
+      operationId: getSourceData
+      summary: Fetch and store financial data from external sources
+      description: |
+        Collects market foundation data from Financial Modeling Prep (FMP) APIs and stores in database.
+        Supports selective execution via mode parameter. Performs two-phase processing for consensus data.
+      tags:
+        - Data Collection
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          description: |
+            Comma-separated list of data collection modes. Allowed values: holiday, target, consensus, earning.
+            If unspecified, executes all modes in default order (holiday → target → consensus → earning).
+            Duplicate values are removed before execution.
+          schema:
+            type: string
+            pattern: ^(holiday|target|consensus|earning)(,(holiday|target|consensus|earning))*$
+          examples:
+            all:
+              value: ""
+              summary: All modes (default)
+            single:
+              value: "consensus"
+              summary: Consensus only
+            multiple:
+              value: "holiday,target"
+              summary: Holidays and targets
+
+        - name: past
+          in: query
+          required: false
+          description: |
+            Controls historical earnings data fetching. Only effective when mode includes "earning".
+            - false (default): Fetch future 28 days only
+            - true: Fetch past 5 years + future 28 days
+          schema:
+            type: boolean
+            default: false
+
+        - name: calc_mode
+          in: query
+          required: false
+          description: |
+            Controls consensus Phase 2 calculation scope. Only effective when mode includes "consensus".
+            - (unset): Default mode - only affected partitions from current run
+            - maintenance: Maintenance mode - requires calc_scope parameter
+          schema:
+            type: string
+            enum: [maintenance]
+
+        - name: calc_scope
+          in: query
+          required: false
+          description: |
+            Required when calc_mode=maintenance. Defines which partitions to recalculate in Phase 2.
+            - all: Recalculate all partitions (no additional params)
+            - ticker: Requires tickers parameter
+            - event_date_range: Requires from and to parameters
+            - partition_keys: Requires partitions parameter
+          schema:
+            type: string
+            enum: [all, ticker, event_date_range, partition_keys]
+
+        - name: tickers
+          in: query
+          required: false
+          description: |
+            Required when calc_scope=ticker. Comma-separated list of ticker symbols.
+          schema:
+            type: string
+            pattern: ^[A-Z0-9]+(,[A-Z0-9]+)*$
+          example: "AAPL,MSFT,GOOGL"
+
+        - name: from
+          in: query
+          required: false
+          description: |
+            Required when calc_scope=event_date_range. Start date (inclusive) in YYYY-MM-DD format.
+          schema:
+            type: string
+            format: date
+          example: "2025-01-01"
+
+        - name: to
+          in: query
+          required: false
+          description: |
+            Required when calc_scope=event_date_range. End date (inclusive) in YYYY-MM-DD format.
+          schema:
+            type: string
+            format: date
+          example: "2025-12-31"
+
+        - name: partitions
+          in: query
+          required: false
+          description: |
+            Required when calc_scope=partition_keys. JSON array of partition objects.
+            Each object must have: ticker (string), analyst_name (string|null), analyst_company (string|null).
+          schema:
+            type: string
+          example: '[{"ticker":"AAPL","analyst_name":"John Doe","analyst_company":"ABC Securities"}]'
+
+      responses:
+        '200':
+          description: Data collection completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceDataResponse'
+
+        '400':
+          description: Bad request - invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidMode:
+                  value:
+                    error: "Invalid mode value"
+                    details: "Mode 'invalid' is not allowed. Allowed values: holiday, target, consensus, earning"
+                missingCalcScope:
+                  value:
+                    error: "calc_scope required"
+                    details: "calc_scope parameter is required when calc_mode=maintenance"
+                invalidCalcMode:
+                  value:
+                    error: "Invalid calc_mode"
+                    details: "calc_mode must be 'maintenance' or unset"
+
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    SourceDataResponse:
+      type: object
+      required:
+        - reqId
+        - endpoint
+        - summary
+        - results
+      properties:
+        reqId:
+          type: string
+          format: uuid
+          description: Request unique identifier
+        endpoint:
+          type: string
+          enum: ['GET /sourceData']
+        summary:
+          $ref: '#/components/schemas/Summary'
+        results:
+          type: object
+          properties:
+            holiday:
+              $ref: '#/components/schemas/ModeResult'
+            target:
+              $ref: '#/components/schemas/ModeResult'
+            consensus:
+              $ref: '#/components/schemas/ConsensusResult'
+            earning:
+              $ref: '#/components/schemas/ModeResult'
+
+    ModeResult:
+      type: object
+      required:
+        - executed
+        - elapsedMs
+        - counters
+      properties:
+        executed:
+          type: boolean
+        elapsedMs:
+          type: integer
+          description: Elapsed time in milliseconds
+        counters:
+          $ref: '#/components/schemas/Counters'
+        warn:
+          type: array
+          items:
+            type: string
+          description: Warning codes
+
+    ConsensusResult:
+      allOf:
+        - $ref: '#/components/schemas/ModeResult'
+        - type: object
+          properties:
+            phase1:
+              $ref: '#/components/schemas/PhaseCounters'
+            phase2:
+              type: object
+              properties:
+                partitionsProcessed:
+                  type: integer
+                partitionsFailed:
+                  type: integer
+                counters:
+                  $ref: '#/components/schemas/Counters'
+
+    PhaseCounters:
+      type: object
+      properties:
+        elapsedMs:
+          type: integer
+        counters:
+          $ref: '#/components/schemas/Counters'
+
+    Counters:
+      type: object
+      properties:
+        success:
+          type: integer
+        fail:
+          type: integer
+        skip:
+          type: integer
+        update:
+          type: integer
+        insert:
+          type: integer
+        conflict:
+          type: integer
+
+    Summary:
+      type: object
+      properties:
+        totalElapsedMs:
+          type: integer
+        modesExecuted:
+          type: array
+          items:
+            type: string
+        totalSuccess:
+          type: integer
+        totalFail:
+          type: integer
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+        code:
+          type: string
+          enum:
+            - POLICY_NOT_FOUND
+            - INVALID_POLICY
+            - INVALID_CONSENSUS_DATA
+            - INVALID_PRICE_TREND_RANGE
+            - METRIC_NOT_FOUND
+            - EVENT_ROW_NOT_FOUND
+            - AMBIGUOUS_EVENT_DATE
+            - INTERNAL_ERROR

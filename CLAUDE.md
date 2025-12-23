@@ -1,0 +1,30 @@
+﻿# alsign Development Guidelines
+
+Auto-generated from all feature plans. Last updated: 2025-12-18
+
+## Active Technologies
+
+- Python 3.11+ (001-fastapi-financial-data-api)
+
+## Project Structure
+
+```text
+backend/
+frontend/
+tests/
+```
+
+## Commands
+
+cd src; pytest; ruff check .
+
+## Code Style
+
+Python 3.11+: Follow standard conventions
+
+## Recent Changes
+
+- 001-fastapi-financial-data-api: Added Python 3.11+
+
+<!-- MANUAL ADDITIONS START -->
+<!-- MANUAL ADDITIONS END -->
