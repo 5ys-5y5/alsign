@@ -144,3 +144,27 @@ async def get_all_tickers(pool: asyncpg.Pool) -> List[str]:
         ticker_list = [row['ticker'] for row in rows]
         logger.info(f"[get_all_tickers] Fetched {len(ticker_list)} tickers")
         return ticker_list
+
+
+async def get_company_info(pool: asyncpg.Pool, ticker: str) -> Dict[str, Any]:
+    """
+    Get sector and industry for a ticker from config_lv3_targets.
+
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+
+    Returns:
+        Dict with 'sector' and 'industry' keys, or empty dict if not found
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT sector, industry FROM config_lv3_targets WHERE ticker = $1",
+            ticker.upper()
+        )
+        if row:
+            return {
+                'sector': row['sector'],
+                'industry': row['industry']
+            }
+        return {}

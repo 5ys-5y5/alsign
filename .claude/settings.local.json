@@ -67,7 +67,20 @@
       "Bash(dir:*)",
       "Bash(killall:*)",
       "Bash(cmd //c \"for /f \"\"tokens=5\"\" %p in \\(''netstat -ano ^| findstr \"\":8000\"\" ^| findstr \"\"LISTENING\"\"''\\) do taskkill /F /PID %p 2>nul\")",
-      "Bash(cmd //c \"taskkill /F /PID 27404 && taskkill /F /PID 12168\")"
+      "Bash(cmd //c \"taskkill /F /PID 27404 && taskkill /F /PID 12168\")",
+      "Bash(cmd //c \"taskkill /F /PID 8952 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 28372 2>&1\")",
+      "Bash(cmd //c \"for %p in (8952 2724) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in (2724 8952 25840) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in (29452 29344 10140) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 18048 2>&1\")",
+      "Bash(if [ -f \"backend/.env\" ])",
+      "Bash(then grep \"^DB_\" backend/.env)",
+      "Bash(else echo \".env not found\")",
+      "Bash(cmd //c \"for %p in (12552 25840) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 15532 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 15084 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 30040 2>&1\")"
     ]
   }
 }

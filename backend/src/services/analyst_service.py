@@ -6,10 +6,112 @@ import json
 from typing import Dict, Any, List, Optional
 
 from ..database.connection import db_pool
-from ..database.queries import analyst, policies
+from ..database.queries import analyst, policies, metrics
 from ..models.response_models import AnalystGroupResult
 
 logger = logging.getLogger("alsign")
+
+
+def calculate_statistics_from_db_metrics(
+    values: List[float],
+    internal_metrics: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Calculate statistics based on internal(qual) metric definitions from config_lv2_metric.
+
+    Field mapping (guideline line 1171-1178):
+    - returnMeanByDayOffset → mean
+    - returnMedianByDayOffset → median
+    - returnFirstQuartileByDayOffset → p25
+    - returnThirdQuartileByDayOffset → p75
+    - returnIQRByDayOffset → iqr
+    - returnStdDevByDayOffset → stddev
+    - returnCountByDayOffset → count
+
+    Args:
+        values: List of return values for a specific dayOffset
+        internal_metrics: List of metric definitions from config_lv2_metric
+
+    Returns:
+        Dict with statistics based on DB metric definitions
+    """
+    if not values:
+        # Return empty stats for all defined metrics
+        stats = {}
+        for metric in internal_metrics:
+            metric_id = metric['id']
+            # Map metric ID to field name
+            if 'Mean' in metric_id:
+                stats['mean'] = None
+            elif 'Median' in metric_id:
+                stats['median'] = None
+            elif 'FirstQuartile' in metric_id or 'p25' in metric_id.lower():
+                stats['p25'] = None
+            elif 'ThirdQuartile' in metric_id or 'p75' in metric_id.lower():
+                stats['p75'] = None
+            elif 'IQR' in metric_id:
+                stats['iqr'] = None
+            elif 'StdDev' in metric_id or 'standardDeviation' in metric_id:
+                stats['stddev'] = None
+            elif 'Count' in metric_id:
+                stats['count'] = 0
+        return stats
+
+    import statistics
+
+    sorted_values = sorted(values)
+    count = len(values)
+
+    # Calculate all statistics (we'll filter based on DB metrics)
+    mean_val = statistics.mean(values)
+    median_val = statistics.median(values)
+    stddev_val = statistics.stdev(values) if count > 1 else 0
+
+    # Calculate percentiles
+    def percentile(data, p):
+        """Calculate percentile using linear interpolation."""
+        if not data:
+            return None
+        k = (len(data) - 1) * p
+        f = int(k)
+        c = f + 1
+        if c >= len(data):
+            return data[f]
+        d0 = data[f]
+        d1 = data[c]
+        return d0 + (d1 - d0) * (k - f)
+
+    p25_val = percentile(sorted_values, 0.25)
+    p75_val = percentile(sorted_values, 0.75)
+    iqr_val = p75_val - p25_val if p25_val is not None and p75_val is not None else None
+
+    # Build result based on DB metric definitions
+    stats = {}
+    for metric in internal_metrics:
+        metric_id = metric['id']
+
+        # Map metric ID to calculated value
+        # Guideline field mapping (line 1171-1178)
+        if 'Mean' in metric_id:
+            stats['mean'] = mean_val
+        elif 'Median' in metric_id:
+            stats['median'] = median_val
+        elif 'FirstQuartile' in metric_id or 'p25' in metric_id.lower():
+            stats['p25'] = p25_val
+        elif 'ThirdQuartile' in metric_id or 'p75' in metric_id.lower():
+            stats['p75'] = p75_val
+        elif 'IQR' in metric_id:
+            stats['iqr'] = iqr_val
+        elif 'StdDev' in metric_id or 'standardDeviation' in metric_id:
+            stats['stddev'] = stddev_val
+        elif 'Count' in metric_id:
+            stats['count'] = count
+
+    # Ensure count is always present
+    if 'count' not in stats:
+        stats['count'] = count
+
+    return stats
 
 
 async def aggregate_analyst_performance() -> Dict[str, Any]:
@@ -60,6 +162,53 @@ async def aggregate_analyst_performance() -> Dict[str, Any]:
             'error': str(e),
             'errorCode': 'POLICY_NOT_FOUND'
         }
+
+    # Load internal(qual) metric definitions (DB-based statistics calculation)
+    logger.info(
+        "Loading internal(qual) metric definitions",
+        extra={
+            'endpoint': 'POST /fillAnalyst',
+            'phase': 'load_metrics',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
+    internal_metrics = await metrics.select_internal_qual_metrics(pool)
+
+    if not internal_metrics:
+        logger.error("No internal(qual) metrics found in config_lv2_metric")
+        return {
+            'summary': {
+                'totalEventsLoaded': 0,
+                'eventsSkippedBothNullAnalyst': 0,
+                'totalGroups': 0,
+                'groupsSuccess': 0,
+                'groupsFailed': 1,
+                'elapsedMs': int((time.time() - start_time) * 1000)
+            },
+            'groups': [],
+            'error': 'No internal(qual) metrics defined in config_lv2_metric',
+            'errorCode': 'METRIC_NOT_FOUND'
+        }
+
+    logger.info(
+        f"Loaded {len(internal_metrics)} internal(qual) metrics",
+        extra={
+            'endpoint': 'POST /fillAnalyst',
+            'phase': 'load_metrics',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {'metrics': len(internal_metrics)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
 
     # Phase 2: Load consensus events
     logger.info(
@@ -183,11 +332,11 @@ async def aggregate_analyst_performance() -> Dict[str, Any]:
                 count_end
             )
 
-            # Calculate statistics per dayOffset
+            # Calculate statistics per dayOffset using DB-driven metrics
             performance = {}
             for dayoffset in range(count_start, count_end + 1):
                 returns = returns_by_offset.get(dayoffset, [])
-                stats = analyst.calculate_statistics(returns)
+                stats = calculate_statistics_from_db_metrics(returns, internal_metrics)
                 performance[str(dayoffset)] = stats
 
             # Upsert to database

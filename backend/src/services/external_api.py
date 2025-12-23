@@ -434,6 +434,25 @@ class FMPAPIClient:
             logger.error(f"Failed to fetch cash flow for {ticker}: {str(e)}", exc_info=True)
             return []
 
+    async def get_quote(self, ticker: str) -> List[Dict[str, Any]]:
+        """
+        Fetch current quote/market data using DB config.
+
+        Args:
+            ticker: Stock ticker symbol
+
+        Returns:
+            List with single quote dictionary containing marketCap, price, etc.
+        """
+        try:
+            result = await self.call_api('fmp-quote', {
+                'ticker': ticker
+            })
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            logger.error(f"Failed to fetch quote for {ticker}: {str(e)}", exc_info=True)
+            return []
+
     def get_current_rate(self) -> int:
         """Get current API call rate."""
         return self.rate_limiter.get_current_rate()

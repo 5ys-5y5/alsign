@@ -7,10 +7,11 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, date
 
 from ..database.connection import db_pool
-from ..database.queries import metrics, policies
+from ..database.queries import metrics, policies, targets
 from .external_api import FMPAPIClient
 from .utils.datetime_utils import calculate_dayOffset_dates
 from ..models.response_models import EventProcessingResult
+from .metric_engine import MetricCalculationEngine
 
 logger = logging.getLogger("alsign")
 
@@ -188,7 +189,7 @@ async def calculate_valuations(
         # Calculate qualitative metrics
         try:
             qual_result = await calculate_qualitative_metrics(
-                pool, ticker, event_date, source
+                pool, ticker, event_date, source, source_id
             )
             logger.info(f"[backfillEventsTable] Qualitative result for {ticker}: {qual_result['status']}")
         except Exception as e:
@@ -242,6 +243,20 @@ async def calculate_valuations(
             elif qual_result['status'] == 'failed':
                 qualitative_fail += 1
 
+            # Build position dict (only include non-None values)
+            position_dict = {}
+            if position_quant is not None:
+                position_dict['quantitative'] = position_quant
+            if position_qual is not None:
+                position_dict['qualitative'] = position_qual
+
+            # Build disparity dict (only include non-None values)
+            disparity_dict = {}
+            if disparity_quant is not None:
+                disparity_dict['quantitative'] = disparity_quant
+            if disparity_qual is not None:
+                disparity_dict['qualitative'] = disparity_qual
+
             # Build result
             results.append(EventProcessingResult(
                 ticker=ticker,
@@ -257,14 +272,8 @@ async def calculate_valuations(
                     'status': qual_result['status'],
                     'message': qual_result.get('message')
                 },
-                position={
-                    'quantitative': position_quant,
-                    'qualitative': position_qual
-                } if position_quant or position_qual else None,
-                disparity={
-                    'quantitative': disparity_quant,
-                    'qualitative': disparity_qual
-                } if disparity_quant is not None or disparity_qual is not None else None
+                position=position_dict if position_dict else None,
+                disparity=disparity_dict if disparity_dict else None
             ))
 
         except Exception as e:
@@ -337,7 +346,8 @@ async def calculate_valuations(
     try:
         price_trend_result = await generate_price_trends(
             from_date=from_date,
-            to_date=to_date
+            to_date=to_date,
+            tickers=tickers
         )
         logger.info(f"[backfillEventsTable] Price trends generated: success={price_trend_result.get('success', 0)}, fail={price_trend_result.get('fail', 0)}")
     except Exception as e:
@@ -409,49 +419,147 @@ async def calculate_quantitative_metrics(
         Dict with status, value (jsonb), message
     """
     try:
-        # Fetch quarterly financials from FMP
-        async with FMPAPIClient() as fmp_client:
-            income_stmt = await fmp_client.get_income_statement(ticker, period='quarter', limit=4)
-            balance_sheet = await fmp_client.get_balance_sheet(ticker, period='quarter', limit=4)
-            cash_flow = await fmp_client.get_cash_flow(ticker, period='quarter', limit=4)
+        # Load transform definitions from DB for dynamic calculation
+        transforms = await metrics.select_metric_transforms(pool)
+        
+        # Initialize metric calculation engine with transforms
+        engine = MetricCalculationEngine(metrics_by_domain, transforms)
+        required_apis = engine.get_required_apis()
 
-        if not income_stmt or not balance_sheet:
+        logger.info(f"[calculate_quantitative_metrics] Required APIs (from DB): {required_apis}")
+
+        # Dynamically fetch all required API data based on config_lv2_metric definitions
+        api_data_raw = {}
+        async with FMPAPIClient() as fmp_client:
+            for api_id in required_apis:
+                try:
+                    # Call API using DB configuration
+                    result = await fmp_client.call_api(api_id, {
+                        'ticker': ticker,
+                        'period': 'quarter',
+                        'limit': 100  # For temporal validity
+                    })
+                    api_data_raw[api_id] = result
+                    logger.info(f"[calculate_quantitative_metrics] Fetched {api_id}: {len(result) if isinstance(result, list) else 'single'} records")
+                except Exception as e:
+                    logger.warning(f"[calculate_quantitative_metrics] Failed to fetch {api_id}: {e}")
+                    api_data_raw[api_id] = []
+
+        # Check if we have any data
+        if not api_data_raw:
             return {
                 'status': 'failed',
                 'value': None,
-                'message': 'Missing financial data from FMP'
+                'message': 'No API data fetched - check config_lv2_metric.api_list_id definitions'
             }
 
-        # Calculate TTM values
-        # For simplicity, we'll use basic TTM calculation
-        # In production, this would implement complex formula parsing
+        # Filter quarterly data by event_date (temporal validity)
+        # Only use quarters where quarter end date <= event_date
+        from datetime import datetime
 
-        # Build value_quantitative structure
-        value_quantitative = {}
+        # Convert event_date to date object for comparison
+        if isinstance(event_date, str):
+            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+        elif hasattr(event_date, 'date'):
+            event_date_obj = event_date.date()
+        else:
+            event_date_obj = event_date
 
-        # Example: Calculate PER (Price to Earnings Ratio)
-        # This is a simplified example - real implementation would parse formulas
-        if 'valuation' in metrics_by_domain:
-            valuation_metrics = {}
+        # Filter all API data by event_date (for time-series data)
+        api_data = {}
+        for api_id, data in api_data_raw.items():
+            if isinstance(data, list):
+                # Time-series data (quarterly financials) - filter by date
+                filtered_data = []
+                for record in data:
+                    record_date_str = record.get('date')
+                    if record_date_str:
+                        try:
+                            record_date = datetime.fromisoformat(record_date_str.replace('Z', '+00:00')).date()
+                            if record_date <= event_date_obj:
+                                filtered_data.append(record)
+                        except:
+                            pass  # Skip records with invalid date format
+                    else:
+                        # No date field - include as-is (snapshot data)
+                        filtered_data.append(record)
 
-            # Get latest market cap and earnings
-            if income_stmt:
-                ttm_earnings = sum([q.get('netIncome', 0) for q in income_stmt[:4]])
-                # Note: In real implementation, fetch current price and calculate P/E
-                valuation_metrics['PER'] = None  # Would calculate: current_price / (ttm_earnings / shares_outstanding)
+                api_data[api_id] = filtered_data
+                logger.info(f"[calculate_quantitative_metrics] Filtered {api_id}: {len(data)} -> {len(filtered_data)} records for event_date {event_date_obj}")
+            else:
+                # Snapshot data (e.g., quote) - use as-is
+                api_data[api_id] = data
 
-            if valuation_metrics:
-                value_quantitative['valuation'] = {
-                    **valuation_metrics,
-                    '_meta': {
-                        'date_range': f"{income_stmt[-1].get('date')} to {income_stmt[0].get('date')}" if income_stmt else None,
-                        'calcType': 'TTM_fullQuarter',
-                        'count': len(income_stmt)
+        # Check if we have sufficient data after filtering
+        has_data = any(
+            len(data) > 0 if isinstance(data, list) else data
+            for data in api_data.values()
+        )
+
+        if not has_data:
+            return {
+                'status': 'failed',
+                'value': None,
+                'message': f'no_valid_data: No data available before event_date {event_date_obj}'
+            }
+
+        # Calculate all quantitative metrics
+        # Dynamically extract target domains from metrics_by_domain (exclude 'internal')
+        target_domains = [domain for domain in metrics_by_domain.keys() if domain != 'internal']
+        logger.info(f"[calculate_quantitative_metrics] Target domains: {target_domains}")
+
+        value_quantitative = engine.calculate_all(api_data, target_domains)
+
+        # Get sector and industry from config_lv3_targets
+        company_info = await targets.get_company_info(pool, ticker)
+
+        # Add metadata to each domain
+        # Find a time-series API to determine quarters used (prefer income statement, then any quarterly data)
+        quarterly_data = None
+        for api_id in ['fmp-income-statement', 'fmp-balance-sheet-statement']:
+            if api_id in api_data and isinstance(api_data[api_id], list) and len(api_data[api_id]) > 0:
+                quarterly_data = api_data[api_id]
+                break
+
+        # If no known quarterly API, search for any list with 'date' field
+        if not quarterly_data:
+            for data in api_data.values():
+                if isinstance(data, list) and len(data) > 0 and 'date' in data[0]:
+                    quarterly_data = data
+                    break
+
+        quarters_used = min(len(quarterly_data), 4) if quarterly_data else 0
+
+        for domain_key in value_quantitative:
+            if '_meta' not in value_quantitative[domain_key]:
+                value_quantitative[domain_key]['_meta'] = {}
+
+            # Add date range information based on actual quarters used
+            if quarterly_data and len(quarterly_data) > 0:
+                # TTM uses most recent N quarters (where N = min(available, 4))
+                if quarters_used >= 4:
+                    # Full TTM: use quarters 0-3
+                    value_quantitative[domain_key]['_meta']['date_range'] = {
+                        'start': quarterly_data[3].get('date'),  # 4th oldest quarter
+                        'end': quarterly_data[0].get('date')      # Most recent quarter
                     }
-                }
+                    value_quantitative[domain_key]['_meta']['calcType'] = 'TTM_fullQuarter'
+                else:
+                    # Partial TTM: use all available quarters
+                    value_quantitative[domain_key]['_meta']['date_range'] = {
+                        'start': quarterly_data[quarters_used - 1].get('date') if quarters_used > 0 else None,
+                        'end': quarterly_data[0].get('date')
+                    }
+                    value_quantitative[domain_key]['_meta']['calcType'] = 'TTM_partialQuarter'
 
-        # For this implementation, we'll return a placeholder structure
-        # Real implementation would process all domains and formulas
+                value_quantitative[domain_key]['_meta']['count'] = quarters_used
+                value_quantitative[domain_key]['_meta']['event_date'] = str(event_date_obj)
+
+                # Add sector and industry from config_lv3_targets
+                if company_info:
+                    value_quantitative[domain_key]['_meta']['sector'] = company_info.get('sector')
+                    value_quantitative[domain_key]['_meta']['industry'] = company_info.get('industry')
+
         return {
             'status': 'success',
             'value': value_quantitative if value_quantitative else None,
@@ -459,7 +567,7 @@ async def calculate_quantitative_metrics(
         }
 
     except Exception as e:
-        logger.error(f"Quantitative calculation failed for {ticker}: {e}")
+        logger.error(f"Quantitative calculation failed for {ticker}: {e}", exc_info=True)
         return {
             'status': 'failed',
             'value': None,
@@ -471,18 +579,27 @@ async def calculate_qualitative_metrics(
     pool,
     ticker: str,
     event_date,
-    source: str
+    source: str,
+    source_id: str
 ) -> Dict[str, Any]:
     """
     Calculate qualitative metrics (consensusSignal).
 
+    Uses source_id to find the exact evt_consensus row,
+    ensuring we compare the same analyst's previous values.
+
     Extracts consensus data from evt_consensus Phase 2 fields.
+
+    Note: This function currently handles consensus-specific logic.
+    Future enhancement: Use MetricCalculationEngine for all qualitative metrics
+    based on config_lv2_metric domain='qualatative-*' definitions.
 
     Args:
         pool: Database connection pool
         ticker: Ticker symbol
         event_date: Event date
         source: Source table name
+        source_id: evt_consensus.id (UUID string)
 
     Returns:
         Dict with status, value (jsonb), currentPrice, message
@@ -497,15 +614,17 @@ async def calculate_qualitative_metrics(
                 'message': 'Not a consensus event'
             }
 
-        # Fetch consensus data
-        consensus_data = await metrics.select_consensus_data(pool, ticker, event_date)
+        # Fetch consensus data using source_id for exact row match
+        consensus_data = await metrics.select_consensus_data(
+            pool, ticker, event_date, source_id
+        )
 
         if not consensus_data:
             return {
                 'status': 'failed',
                 'value': None,
                 'currentPrice': None,
-                'message': 'Consensus data not found'
+                'message': f'Consensus data not found for source_id={source_id}'
             }
 
         # Extract Phase 2 data
@@ -618,7 +737,8 @@ def calculate_position_disparity(
 
 async def generate_price_trends(
     from_date: Optional[date] = None,
-    to_date: Optional[date] = None
+    to_date: Optional[date] = None,
+    tickers: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Generate price_trend arrays for all events in txn_events.
@@ -629,6 +749,7 @@ async def generate_price_trends(
     Args:
         from_date: Optional start date for filtering events by event_date
         to_date: Optional end date for filtering events by event_date
+        tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
 
     Returns:
         Dict with summary and statistics
@@ -637,7 +758,7 @@ async def generate_price_trends(
 
     pool = await db_pool.get_pool()
 
-    # Load policy configuration
+    # Load policy configurations
     logger.info(
         "Loading price trend policies",
         extra={
@@ -653,9 +774,15 @@ async def generate_price_trends(
     )
 
     try:
+        # Load fillPriceTrend_dateRange policy (for price trend dayOffset calculations)
         range_policy = await policies.get_price_trend_range_policy(pool)
         count_start = range_policy['countStart']
         count_end = range_policy['countEnd']
+
+        # Load priceEodOHLC_dateRange policy (separate policy for OHLC API fetch date range)
+        ohlc_policy = await policies.get_ohlc_date_range_policy(pool)
+        ohlc_count_start = ohlc_policy['countStart']
+        ohlc_count_end = ohlc_policy['countEnd']
     except ValueError as e:
         logger.error(f"Failed to load price trend policy: {e}")
         return {
@@ -669,7 +796,8 @@ async def generate_price_trends(
     events = await metrics.select_events_for_valuation(
         pool,
         from_date=from_date,
-        to_date=to_date
+        to_date=to_date,
+        tickers=tickers
     )
 
     logger.info(
@@ -695,18 +823,17 @@ async def generate_price_trends(
         events_by_ticker[ticker].append(event)
 
     # Calculate OHLC fetch ranges per ticker
+    # Guideline line 986-987: fromDate = min_event_date + countStart, toDate = max_event_date + countEnd
+    from datetime import timedelta
     ohlc_ranges = {}
     for ticker, ticker_events in events_by_ticker.items():
         event_dates = [e['event_date'].date() if hasattr(e['event_date'], 'date') else e['event_date'] for e in ticker_events]
         min_date = min(event_dates)
         max_date = max(event_dates)
 
-        # Calculate range with buffer for dayOffset
-        # For now, use approximate calendar day calculation
-        # In production, would calculate exact trading day range
-        from datetime import timedelta
-        fetch_start = min_date + timedelta(days=count_start * 2)  # Approximate
-        fetch_end = max_date + timedelta(days=count_end * 2)  # Approximate
+        # Apply priceEodOHLC_dateRange policy (countStart/countEnd are calendar day offsets)
+        fetch_start = min_date + timedelta(days=ohlc_count_start)
+        fetch_end = max_date + timedelta(days=ohlc_count_end)
 
         ohlc_ranges[ticker] = (fetch_start, fetch_end)
 

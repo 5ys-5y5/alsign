@@ -93,6 +93,36 @@ async def get_price_trend_range_policy(pool: asyncpg.Pool) -> Dict[str, int]:
     }
 
 
+async def get_ohlc_date_range_policy(pool: asyncpg.Pool) -> Dict[str, int]:
+    """
+    Get OHLC API fetch date range policy (countStart, countEnd).
+    Uses priceEodOHLC_dateRange policy, separate from fillPriceTrend_dateRange.
+
+    Args:
+        pool: Database connection pool
+
+    Returns:
+        Dict with countStart and countEnd
+
+    Raises:
+        ValueError: If policy not found or invalid
+    """
+    policy = await select_policy(pool, 'priceEodOHLC_dateRange')
+
+    if not policy:
+        raise ValueError("Policy 'priceEodOHLC_dateRange' not found in config_lv0_policy")
+
+    policy_config = policy['policy']
+
+    if 'countStart' not in policy_config or 'countEnd' not in policy_config:
+        raise ValueError("Policy 'priceEodOHLC_dateRange' missing countStart or countEnd")
+
+    return {
+        'countStart': int(policy_config['countStart']),
+        'countEnd': int(policy_config['countEnd'])
+    }
+
+
 async def get_ohlc_fetch_policy(pool: asyncpg.Pool) -> Dict[str, Any]:
     """
     Get OHLC fetch policy configuration.

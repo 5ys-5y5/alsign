@@ -25,10 +25,13 @@ async def select_metric_definitions(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, domain, expression, description
+            SELECT id, domain, expression, description,
+                   source, api_list_id, base_metric_id,
+                   aggregation_kind, aggregation_params, response_key
             FROM config_lv2_metric
             WHERE domain LIKE 'quantitative-%'
                OR domain LIKE 'qualitative-%'
+               OR domain = 'internal'
             ORDER BY domain, id
             """
         )
@@ -36,6 +39,15 @@ async def select_metric_definitions(
         # Group by domain suffix
         metrics_by_domain = {}
         for row in rows:
+            # Parse JSONB fields if they come as strings
+            agg_params = row['aggregation_params']
+            if isinstance(agg_params, str):
+                agg_params = json.loads(agg_params) if agg_params else {}
+
+            resp_key = row['response_key']
+            if isinstance(resp_key, str):
+                resp_key = json.loads(resp_key) if resp_key else None
+
             domain_full = row['domain']
 
             # Extract suffix (quantitative-valuation -> valuation)
@@ -51,7 +63,13 @@ async def select_metric_definitions(
                 'name': row['id'],
                 'domain': row['domain'],
                 'formula': row['expression'],
-                'description': row['description']
+                'description': row['description'],
+                'source': row['source'],
+                'api_list_id': row['api_list_id'],
+                'base_metric_id': row['base_metric_id'],
+                'aggregation_kind': row['aggregation_kind'],
+                'aggregation_params': agg_params,
+                'response_key': resp_key
             })
 
         return metrics_by_domain
@@ -160,10 +178,15 @@ async def select_event_by_id(
 async def select_consensus_data(
     pool: asyncpg.Pool,
     ticker: str,
-    event_date
+    event_date,
+    source_id: str
 ) -> Dict[str, Any]:
     """
     Select consensus data for qualitative calculation.
+
+    Uses source_id to find the exact row in evt_consensus table.
+    This ensures we get the correct analyst's data when multiple
+    analysts have events on the same date.
 
     Fetches Phase 2 data (price_target, price_when_posted, direction, prev values).
 
@@ -171,6 +194,7 @@ async def select_consensus_data(
         pool: Database connection pool
         ticker: Ticker symbol
         event_date: Event date
+        source_id: evt_consensus.id (UUID string)
 
     Returns:
         Consensus data dictionary or None
@@ -178,16 +202,16 @@ async def select_consensus_data(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT ticker, event_date, analyst_name, analyst_company,
+            SELECT id, ticker, event_date, analyst_name, analyst_company,
                    price_target, price_when_posted,
                    price_target_prev, price_when_posted_prev,
                    direction, response_key
             FROM evt_consensus
-            WHERE ticker = $1
-              AND event_date = $2
-            ORDER BY event_date DESC
-            LIMIT 1
+            WHERE id = $1
+              AND ticker = $2
+              AND event_date = $3
             """,
+            source_id,
             ticker,
             event_date
         )
@@ -305,3 +329,106 @@ async def update_event_valuations(
             return count
 
         return 0
+
+
+async def select_internal_qual_metrics(pool: asyncpg.Pool) -> List[Dict[str, Any]]:
+    """
+    Select internal(qual) metrics for analyst performance calculation.
+
+    These metrics define which statistics to calculate from the return distribution.
+
+    Returns:
+        List of metric definitions with domain='internal(qual)' and base_metric_id='priceTrendReturnSeries'
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, domain, expression, description,
+                   source, base_metric_id, aggregation_kind,
+                   aggregation_params, response_key
+            FROM config_lv2_metric
+            WHERE domain = 'internal(qual)'
+              AND base_metric_id = 'priceTrendReturnSeries'
+            ORDER BY id
+            """
+        )
+        result = []
+        for row in rows:
+            # Parse JSONB fields if they come as strings
+            agg_params = row['aggregation_params']
+            if isinstance(agg_params, str):
+                agg_params = json.loads(agg_params) if agg_params else {}
+
+            resp_key = row['response_key']
+            if isinstance(resp_key, str):
+                resp_key = json.loads(resp_key) if resp_key else None
+
+            result.append({
+                'id': row['id'],
+                'domain': row['domain'],
+                'expression': row['expression'],
+                'description': row['description'],
+                'source': row['source'],
+                'base_metric_id': row['base_metric_id'],
+                'aggregation_kind': row['aggregation_kind'],
+                'aggregation_params': agg_params,
+                'response_key': resp_key
+            })
+        return result
+
+
+async def select_metric_transforms(
+    pool: asyncpg.Pool
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Load metric transform definitions from config_lv2_metric_transform table.
+    
+    Returns:
+        Dict with transform id as key, transform definition as value
+        Example: {
+            'avgFromQuarter': {
+                'id': 'avgFromQuarter',
+                'calculation': 'if not quarterly_values: ...',
+                'input_kind': 'quarter_series',
+                'output_kind': 'scalar',
+                ...
+            },
+            ...
+        }
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, transform_type, description, input_kind, output_kind,
+                   params_schema, example_params, calculation, version, is_active
+            FROM config_lv2_metric_transform
+            WHERE is_active = true
+            ORDER BY id
+            """
+        )
+        
+        transforms = {}
+        for row in rows:
+            # Parse JSONB fields if they come as strings
+            params_schema = row['params_schema']
+            if isinstance(params_schema, str):
+                params_schema = json.loads(params_schema) if params_schema else {}
+            
+            example_params = row['example_params']
+            if isinstance(example_params, str):
+                example_params = json.loads(example_params) if example_params else {}
+            
+            transforms[row['id']] = {
+                'id': row['id'],
+                'transform_type': row['transform_type'],
+                'description': row['description'],
+                'input_kind': row['input_kind'],
+                'output_kind': row['output_kind'],
+                'params_schema': params_schema,
+                'example_params': example_params,
+                'calculation': row['calculation'],  # Python code string
+                'version': row['version'],
+                'is_active': row['is_active']
+            }
+        
+        return transforms
