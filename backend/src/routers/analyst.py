@@ -2,8 +2,9 @@
 
 import uuid
 import logging
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response, Depends
 
+from ..models.request_models import FillAnalystQueryParams
 from ..models.response_models import FillAnalystResponse
 from ..services import analyst_service
 
@@ -15,7 +16,8 @@ router = APIRouter(prefix="", tags=["Analytics"])
 @router.post("/fillAnalyst", response_model=FillAnalystResponse)
 async def fill_analyst(
     request: Request,
-    response: Response
+    response: Response,
+    params: FillAnalystQueryParams = Depends()
 ):
     """
     Aggregate analyst performance metrics.
@@ -23,6 +25,9 @@ async def fill_analyst(
     Groups consensus events by (analyst_name, analyst_company), calculates
     return distributions per dayOffset, and upserts performance statistics
     to config_lv3_analyst table.
+
+    Args:
+        params: Query parameters including overwrite
 
     Returns:
         FillAnalystResponse with summary and per-group results
@@ -34,7 +39,7 @@ async def fill_analyst(
     req_id = request.state.reqId if hasattr(request.state, 'reqId') else str(uuid.uuid4())
 
     try:
-        result = await analyst_service.aggregate_analyst_performance()
+        result = await analyst_service.aggregate_analyst_performance(overwrite=params.overwrite)
 
         # Check if there was a global error
         if 'error' in result and 'errorCode' in result:

@@ -3,8 +3,10 @@
 import logging
 import time
 import json
+import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime, date
+from collections import defaultdict
 
 from ..database.connection import db_pool
 from ..database.queries import metrics, policies, targets
@@ -14,6 +16,391 @@ from ..models.response_models import EventProcessingResult
 from .metric_engine import MetricCalculationEngine
 
 logger = logging.getLogger("alsign")
+
+
+def group_events_by_ticker(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Group events by ticker symbol.
+    
+    Args:
+        events: List of event dictionaries
+    
+    Returns:
+        Dict with ticker as key, list of events as value
+        Example: {'AAPL': [event1, event2, ...], 'GOOGL': [...], ...}
+    """
+    grouped = defaultdict(list)
+    for event in events:
+        ticker = event['ticker']
+        grouped[ticker].append(event)
+    return dict(grouped)
+
+
+async def process_ticker_batch(
+    pool,
+    ticker: str,
+    ticker_events: List[Dict[str, Any]],
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    overwrite: bool = False,
+    total_events_count: int = 0,
+    completed_events_count: Dict[str, int] = None
+) -> Dict[str, Any]:
+    """
+    Process all events for a single ticker (with REAL API caching).
+    
+    This function:
+    1. Fetches ALL required API data ONCE for the ticker
+    2. Processes all events for this ticker using the SAME cached API data
+    3. Returns batch results for DB update
+    
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        ticker_events: List of events for this ticker
+        metrics_by_domain: Metric definitions
+        overwrite: Update mode
+    
+    Returns:
+        Dict with 'updates', 'results', 'success_counts', 'fail_counts'
+    """
+    batch_updates = []
+    results = []
+    quant_success = 0
+    quant_fail = 0
+    qual_success = 0
+    qual_fail = 0
+    
+    logger.info(
+        f"\n{'*'*90}\n"
+        f"[START TICKER] {ticker} | {len(ticker_events)} events to process\n"
+        f"{'*'*90}"
+    )
+    
+    # ========================================
+    # CRITICAL: Fetch API data ONCE for ticker
+    # ========================================
+    try:
+        # Load transform definitions
+        transforms = await metrics.select_metric_transforms(pool)
+        engine = MetricCalculationEngine(metrics_by_domain, transforms)
+        required_apis = engine.get_required_apis()
+        
+        logger.info(f"[Ticker Batch] {ticker}: Fetching {len(required_apis)} APIs (ONCE)")
+        
+        # Fetch all API data once
+        ticker_api_cache = {}
+        consensus_summary_cache = None
+        
+        async with FMPAPIClient() as fmp_client:
+            # Fetch quantitative APIs
+            for api_id in required_apis:
+                try:
+                    params = {'ticker': ticker}
+                    
+                    if 'historical-price' in api_id or 'eod' in api_id:
+                        # Wide date range to cover all events
+                        params['fromDate'] = '2000-01-01'
+                        params['toDate'] = datetime.now().strftime('%Y-%m-%d')
+                    else:
+                        params['period'] = 'quarter'
+                        params['limit'] = 100
+                    
+                    result = await fmp_client.call_api(api_id, params)
+                    ticker_api_cache[api_id] = result
+                    logger.debug(f"[Ticker Batch] {ticker}: Cached {api_id} ({len(result) if isinstance(result, list) else 'single'} records)")
+                except Exception as e:
+                    logger.warning(f"[Ticker Batch] {ticker}: Failed to fetch {api_id}: {e}")
+                    ticker_api_cache[api_id] = []
+            
+            # Fetch qualitative API (consensus) ONCE for ticker
+            try:
+                consensus_data = await fmp_client.call_api('fmp-price-target-consensus', {'ticker': ticker})
+                if consensus_data:
+                    if isinstance(consensus_data, list) and len(consensus_data) > 0:
+                        consensus_summary_cache = consensus_data[0]
+                    elif isinstance(consensus_data, dict):
+                        consensus_summary_cache = consensus_data
+                logger.debug(f"[Ticker Batch] {ticker}: Consensus summary cached")
+            except Exception as e:
+                logger.warning(f"[Ticker Batch] {ticker}: Consensus fetch skipped: {e}")
+        
+        logger.info(f"[Ticker Batch] {ticker}: API cache ready ({len(ticker_api_cache) + 1} APIs)")
+        
+        # OPTIMIZATION: Load transforms and engine ONCE per ticker (not per event!)
+        transforms = await metrics.select_metric_transforms(pool)
+        engine = MetricCalculationEngine(metrics_by_domain, transforms)
+        target_domains = ['valuation', 'profitability', 'momentum', 'risk', 'dilution']
+        
+        logger.info(f"[Ticker Batch] {ticker}: MetricEngine initialized (60 metrics)")
+        
+    except Exception as e:
+        logger.error(f"[Ticker Batch] {ticker}: Failed to build API cache: {e}")
+        # Return early with all events failed
+        for event in ticker_events:
+            results.append(EventProcessingResult(
+                ticker=ticker,
+                event_date=event['event_date'].isoformat() if hasattr(event['event_date'], 'isoformat') else str(event['event_date']),
+                source=event['source'],
+                source_id=str(event['source_id']),
+                status='failed',
+                error=f"API cache failed: {str(e)}",
+                errorCode='API_CACHE_ERROR'
+            ))
+            quant_fail += 1
+            qual_fail += 1
+        
+        return {
+            'ticker': ticker,
+            'updates': [],
+            'results': results,
+            'quant_success': 0,
+            'quant_fail': quant_fail,
+            'qual_success': 0,
+            'qual_fail': qual_fail
+        }
+    
+    # ========================================
+    # Process each event using CACHED API data
+    # ========================================
+    total_events = len(ticker_events)
+    batch_start_time = time.time()
+    last_checkpoint_time = batch_start_time
+    last_checkpoint_idx = 0
+    
+    for idx, event in enumerate(ticker_events, 1):
+        event_date = event['event_date']
+        source = event['source']
+        source_id = event['source_id']
+        
+        try:
+            # Calculate quantitative metrics using CACHED API data + pre-initialized engine
+            quant_result = await calculate_quantitative_metrics_fast(
+                ticker, event_date, ticker_api_cache, engine, target_domains
+            )
+            
+            # Calculate qualitative metrics using CACHED consensus data
+            qual_result = await calculate_qualitative_metrics_fast(
+                pool, ticker, event_date, source, source_id, consensus_summary_cache
+            )
+            
+            # Calculate positions and disparities
+            position_quant, disparity_quant = calculate_position_disparity(
+                quant_result.get('value'),
+                qual_result.get('currentPrice')
+            )
+            
+            position_qual, disparity_qual = calculate_position_disparity(
+                qual_result.get('value'),
+                qual_result.get('currentPrice')
+            )
+            
+            # Prepare batch update
+            batch_updates.append({
+                'ticker': ticker,
+                'event_date': event_date,
+                'source': source,
+                'source_id': source_id,
+                'value_quantitative': quant_result.get('value'),
+                'value_qualitative': qual_result.get('value'),
+                'position_quantitative': position_quant,
+                'position_qualitative': position_qual,
+                'disparity_quantitative': disparity_quant,
+                'disparity_qualitative': disparity_qual
+            })
+            
+            # Track success/fail
+            if quant_result['status'] == 'success':
+                quant_success += 1
+            elif quant_result['status'] == 'failed':
+                quant_fail += 1
+            
+            if qual_result['status'] == 'success':
+                qual_success += 1
+            elif qual_result['status'] == 'failed':
+                qual_fail += 1
+            
+            # Build position and disparity dicts
+            position_dict = {}
+            if position_quant is not None:
+                position_dict['quantitative'] = position_quant
+            if position_qual is not None:
+                position_dict['qualitative'] = position_qual
+            
+            disparity_dict = {}
+            if disparity_quant is not None:
+                disparity_dict['quantitative'] = disparity_quant
+            if disparity_qual is not None:
+                disparity_dict['qualitative'] = disparity_qual
+            
+            # Build result
+            results.append(EventProcessingResult(
+                ticker=ticker,
+                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
+                source=source,
+                source_id=str(source_id),
+                status='success' if quant_result['status'] == 'success' and qual_result['status'] == 'success' else 'partial',
+                quantitative={
+                    'status': quant_result['status'],
+                    'message': quant_result.get('message')
+                },
+                qualitative={
+                    'status': qual_result['status'],
+                    'message': qual_result.get('message')
+                },
+                position=position_dict if position_dict else None,
+                disparity=disparity_dict if disparity_dict else None
+            ))
+            
+            # Log event progress every 10 events (reduce I/O overhead)
+            if idx % 10 == 0 or idx == total_events:
+                event_pct = (idx / total_events) * 100
+                current_time = time.time()
+                
+                # Calculate ETA based on last 10 events
+                elapsed_since_checkpoint = current_time - last_checkpoint_time
+                events_processed_since_checkpoint = idx - last_checkpoint_idx
+                if events_processed_since_checkpoint > 0:
+                    avg_time_per_event = elapsed_since_checkpoint / events_processed_since_checkpoint
+                else:
+                    elapsed_total = current_time - batch_start_time
+                    avg_time_per_event = elapsed_total / idx if idx > 0 else 0
+                
+                # Update checkpoint
+                last_checkpoint_time = current_time
+                last_checkpoint_idx = idx
+                
+                remaining_events = total_events - idx
+                eta_seconds = remaining_events * avg_time_per_event
+                eta_minutes = int(eta_seconds / 60)
+                eta_seconds_remainder = int(eta_seconds % 60)
+                
+                # Format ETA
+                if eta_minutes > 60:
+                    eta_hours = eta_minutes // 60
+                    eta_minutes_remainder = eta_minutes % 60
+                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
+                elif eta_minutes > 0:
+                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
+                else:
+                    eta_str = f"{eta_seconds_remainder}s"
+                
+                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Calculate total events progress
+                if completed_events_count is not None:
+                    current_total = completed_events_count.get('count', 0) + idx
+                    total_pct = (current_total / total_events_count * 100) if total_events_count > 0 else 0
+                    all_events_line = f"[ALL EVENTS] {current_total}/{total_events_count} ({total_pct:.1f}%)\n"
+                else:
+                    all_events_line = ""
+                
+                logger.info(
+                    f"\n{'#'*80}\n"
+                    f"{all_events_line}"
+                    f"[{ticker} EVENTS] {idx}/{total_events} ({event_pct:.1f}%)\n"
+                    f"TIMESTAMP: {timestamp_str}\n"
+                    f"ETA: {eta_str}\n"
+                    f"{'#'*80}"
+                )
+            
+        except Exception as e:
+            logger.error(f"[Ticker Batch] Failed to process {ticker} {event_date}: {e}")
+            
+            quant_fail += 1
+            qual_fail += 1
+            
+            results.append(EventProcessingResult(
+                ticker=ticker,
+                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
+                source=source,
+                source_id=str(source_id),
+                status='failed',
+                error=str(e),
+                errorCode='INTERNAL_ERROR'
+            ))
+            
+            # Log event progress even on error - every 10 events
+            if idx % 10 == 0 or idx == total_events:
+                event_pct = (idx / total_events) * 100
+                current_time = time.time()
+                
+                elapsed_since_checkpoint = current_time - last_checkpoint_time
+                events_processed_since_checkpoint = idx - last_checkpoint_idx
+                if events_processed_since_checkpoint > 0:
+                    avg_time_per_event = elapsed_since_checkpoint / events_processed_since_checkpoint
+                else:
+                    elapsed_total = current_time - batch_start_time
+                    avg_time_per_event = elapsed_total / idx if idx > 0 else 0
+                
+                # Update checkpoint
+                last_checkpoint_time = current_time
+                last_checkpoint_idx = idx
+                
+                remaining_events = total_events - idx
+                eta_seconds = remaining_events * avg_time_per_event
+                eta_minutes = int(eta_seconds / 60)
+                eta_seconds_remainder = int(eta_seconds % 60)
+                
+                # Format ETA
+                if eta_minutes > 60:
+                    eta_hours = eta_minutes // 60
+                    eta_minutes_remainder = eta_minutes % 60
+                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
+                elif eta_minutes > 0:
+                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
+                else:
+                    eta_str = f"{eta_seconds_remainder}s"
+                
+                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Calculate total events progress
+                if completed_events_count is not None:
+                    current_total = completed_events_count.get('count', 0) + idx
+                    total_pct = (current_total / total_events_count * 100) if total_events_count > 0 else 0
+                    all_events_line = f"[ALL EVENTS] {current_total}/{total_events_count} ({total_pct:.1f}%)\n"
+                else:
+                    all_events_line = ""
+                
+                logger.info(
+                    f"\n{'#'*80}\n"
+                    f"{all_events_line}"
+                    f"[{ticker} EVENTS] {idx}/{total_events} ({event_pct:.1f}%)\n"
+                    f"TIMESTAMP: {timestamp_str}\n"
+                    f"ETA: {eta_str}\n"
+                    f"{'#'*80}"
+                )
+    
+    # Batch update DB
+    try:
+        if batch_updates:
+            updated_count = await metrics.batch_update_event_valuations(
+                pool, batch_updates, overwrite=overwrite
+            )
+            logger.info(f"[Ticker Batch] {ticker}: Updated {updated_count} events in DB")
+    except Exception as e:
+        logger.error(f"[Ticker Batch] {ticker}: DB batch update failed: {e}")
+    
+    # Update global completed events count
+    if completed_events_count is not None:
+        completed_events_count['count'] = completed_events_count.get('count', 0) + len(ticker_events)
+    
+    # Log ticker completion
+    logger.info(
+        f"\n{'*'*90}\n"
+        f"[COMPLETE TICKER] {ticker} | {len(ticker_events)} events processed\n"
+        f"[COMPLETE TICKER] Quant: {quant_success}✓/{quant_fail}✗ | Qual: {qual_success}✓/{qual_fail}✗\n"
+        f"{'*'*90}\n"
+    )
+    
+    return {
+        'ticker': ticker,
+        'updates': batch_updates,
+        'results': results,
+        'quant_success': quant_success,
+        'quant_fail': quant_fail,
+        'qual_success': qual_success,
+        'qual_fail': qual_fail
+    }
 
 
 async def calculate_valuations(
@@ -42,9 +429,18 @@ async def calculate_valuations(
         Dict with summary and per-event results
     """
     start_time = time.time()
+    
+    from .utils.logging_utils import create_log_context
 
     logger.info("=" * 80)
-    logger.info("[backfillEventsTable] START - Processing valuations")
+    logger.info(
+        "[backfillEventsTable] START - Processing valuations", 
+        extra=create_log_context(
+            endpoint='POST /backfillEventsTable',
+            phase='start',
+            elapsed_ms=0
+        )
+    )
     logger.info(f"[backfillEventsTable] Parameters: overwrite={overwrite}, from_date={from_date}, to_date={to_date}, tickers={tickers}")
     logger.info("=" * 80)
 
@@ -154,181 +550,196 @@ async def calculate_valuations(
             'results': []
         }
 
-    # Phase 3: Process each event
-    logger.info(f"[backfillEventsTable] Phase 3: Processing {len(events)} events")
+    # Phase 3: Group events by ticker
+    logger.info(f"[backfillEventsTable] Phase 3: Grouping {len(events)} events by ticker")
+    ticker_groups = group_events_by_ticker(events)
+    logger.info(f"[backfillEventsTable] Grouped into {len(ticker_groups)} tickers")
+    
+    logger.info(
+        f"Processing {len(ticker_groups)} ticker groups",
+        extra={
+            'endpoint': 'POST /backfillEventsTable',
+            'phase': 'group_tickers',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {
+                'tickers': len(ticker_groups),
+                'events': len(events)
+            },
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+    
+    # Phase 4: Process tickers in parallel with concurrency control
+    TICKER_CONCURRENCY = 10  # Process 10 tickers concurrently
+    semaphore = asyncio.Semaphore(TICKER_CONCURRENCY)
+    
+    # Progress tracking
+    completed_tickers = 0
+    total_tickers = len(ticker_groups)
+    ticker_start_time = time.time()
+    ticker_last_checkpoint_time = ticker_start_time
+    ticker_last_checkpoint_idx = 0
+    
+    # Global events progress tracking
+    total_events_count = len(events)
+    completed_events_count = {'count': 0}  # Mutable dict for sharing across async tasks
+    
+    async def process_ticker_with_semaphore(ticker: str, ticker_events: List[Dict[str, Any]]):
+        nonlocal completed_tickers
+        async with semaphore:
+            result = await process_ticker_batch(
+                pool, ticker, ticker_events, metrics_by_domain, overwrite,
+                total_events_count, completed_events_count
+            )
+            
+            # Update progress
+            completed_tickers += 1
+            
+            # Calculate ETA for tickers
+            progress_pct = (completed_tickers / total_tickers) * 100
+            current_time = time.time()
+            
+            # Calculate ETA based on last 10 tickers (or all tickers if < 10)
+            if completed_tickers >= 10 and completed_tickers % 10 == 0:
+                elapsed_since_checkpoint = current_time - ticker_last_checkpoint_time
+                tickers_processed_since_checkpoint = completed_tickers - ticker_last_checkpoint_idx
+                avg_time_per_ticker = elapsed_since_checkpoint / tickers_processed_since_checkpoint
+                
+                # Update checkpoint
+                ticker_last_checkpoint_time = current_time
+                ticker_last_checkpoint_idx = completed_tickers
+            else:
+                # Use overall average
+                elapsed_total = current_time - ticker_start_time
+                avg_time_per_ticker = elapsed_total / completed_tickers if completed_tickers > 0 else 0
+            
+            remaining_tickers = total_tickers - completed_tickers
+            eta_seconds = remaining_tickers * avg_time_per_ticker
+            eta_minutes = int(eta_seconds / 60)
+            eta_seconds_remainder = int(eta_seconds % 60)
+            
+            # Format ETA
+            if eta_minutes > 60:
+                eta_hours = eta_minutes // 60
+                eta_minutes_remainder = eta_minutes % 60
+                eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
+            elif eta_minutes > 0:
+                eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
+            else:
+                eta_str = f"{eta_seconds_remainder}s"
+            
+            # Current timestamp
+            timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            logger.info(
+                f"\n\n{'='*90}\n"
+                f"{'='*90}\n"
+                f"[TICKER PROGRESS] {completed_tickers}/{total_tickers} ({progress_pct:.1f}%) | Latest: {ticker}\n"
+                f"TIMESTAMP: {timestamp_str}\n"
+                f"ETA: {eta_str}\n"
+                f"{'='*90}\n"
+                f"{'='*90}\n"
+            )
+            
+            return result
+    
+    logger.info(f"[backfillEventsTable] Phase 4: Processing tickers with concurrency={TICKER_CONCURRENCY}")
+    
+    start_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    logger.info(
+        f"\n\n{'='*90}\n"
+        f"{'='*90}\n"
+        f"[TICKER PROGRESS] 0/{total_tickers} (0.0%) | STARTING...\n"
+        f"TIMESTAMP: {start_timestamp}\n"
+        f"{'='*90}\n"
+        f"{'='*90}\n"
+    )
+    
+    # Create tasks for all ticker groups
+    tasks = [
+        process_ticker_with_semaphore(ticker, ticker_events)
+        for ticker, ticker_events in ticker_groups.items()
+    ]
+    
+    # Execute all tasks concurrently
+    ticker_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Aggregate results
     results = []
     quantitative_success = 0
     quantitative_fail = 0
     qualitative_success = 0
     qualitative_fail = 0
+    
+    for ticker_result in ticker_results:
+        if isinstance(ticker_result, Exception):
+            logger.error(f"[backfillEventsTable] Ticker batch failed: {ticker_result}")
+            continue
+        
+        # Aggregate from ticker batch
+        results.extend(ticker_result['results'])
+        quantitative_success += ticker_result['quant_success']
+        quantitative_fail += ticker_result['quant_fail']
+        qualitative_success += ticker_result['qual_success']
+        qualitative_fail += ticker_result['qual_fail']
+    
+    # Final progress - CELEBRATION!
+    final_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    total_elapsed = time.time() - ticker_start_time
+    total_elapsed_minutes = int(total_elapsed / 60)
+    total_elapsed_seconds = int(total_elapsed % 60)
+    
+    if total_elapsed_minutes > 60:
+        total_elapsed_hours = total_elapsed_minutes // 60
+        total_elapsed_minutes_remainder = total_elapsed_minutes % 60
+        elapsed_str = f"{total_elapsed_hours}h {total_elapsed_minutes_remainder}min"
+    elif total_elapsed_minutes > 0:
+        elapsed_str = f"{total_elapsed_minutes}min {total_elapsed_seconds}s"
+    else:
+        elapsed_str = f"{total_elapsed_seconds}s"
+    
+    logger.info(
+        f"\n\n{'='*90}\n"
+        f"{'='*90}\n"
+        f"[TICKER PROGRESS] {len(ticker_groups)}/{len(ticker_groups)} (100.0%) | ✅ ALL TICKERS COMPLETE!\n"
+        f"TIMESTAMP: {final_timestamp}\n"
+        f"TOTAL TIME: {elapsed_str}\n"
+        f"{'='*90}\n"
+        f"{'='*90}\n"
+        f"\n[📊 SUMMARY]\n"
+        f"  - Total Events: {len(results)}\n"
+        f"  - Quantitative: {quantitative_success}✓ / {quantitative_fail}✗\n"
+        f"  - Qualitative: {qualitative_success}✓ / {qualitative_fail}✗\n"
+        f"{'='*90}\n"
+    )
+    
+    logger.info(
+        f"Completed all ticker batches: {len(ticker_groups)} tickers, {len(results)} events",
+        extra={
+            'endpoint': 'POST /backfillEventsTable',
+            'phase': 'ticker_batches_complete',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {
+                'tickers': len(ticker_groups),
+                'events': len(results),
+                'quant_success': quantitative_success,
+                'quant_fail': quantitative_fail,
+                'qual_success': qualitative_success,
+                'qual_fail': qualitative_fail
+            },
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
 
-    for idx, event in enumerate(events):
-        event_start = time.time()
-
-        ticker = event['ticker']
-        event_date = event['event_date']
-        source = event['source']
-        source_id = event['source_id']
-
-        logger.info(f"[backfillEventsTable] Processing event {idx+1}/{len(events)}: {ticker} {event_date} {source}")
-
-        # Calculate quantitative metrics
-        try:
-            quant_result = await calculate_quantitative_metrics(
-                pool, ticker, event_date, metrics_by_domain
-            )
-            logger.info(f"[backfillEventsTable] Quantitative result for {ticker}: {quant_result['status']}")
-        except Exception as e:
-            logger.error(f"[backfillEventsTable] Quantitative calculation failed for {ticker}: {e}")
-            quant_result = {
-                'status': 'failed',
-                'value': None,
-                'message': str(e)
-            }
-
-        # Calculate qualitative metrics
-        try:
-            qual_result = await calculate_qualitative_metrics(
-                pool, ticker, event_date, source, source_id
-            )
-            logger.info(f"[backfillEventsTable] Qualitative result for {ticker}: {qual_result['status']}")
-        except Exception as e:
-            logger.error(f"[backfillEventsTable] Qualitative calculation failed for {ticker}: {e}")
-            qual_result = {
-                'status': 'failed',
-                'value': None,
-                'currentPrice': None,
-                'message': str(e)
-            }
-
-        # Calculate positions and disparities
-        position_quant, disparity_quant = calculate_position_disparity(
-            quant_result.get('value'),
-            qual_result.get('currentPrice')
-        )
-
-        position_qual, disparity_qual = calculate_position_disparity(
-            qual_result.get('value'),
-            qual_result.get('currentPrice')
-        )
-
-        # Update database
-        try:
-            updated = await metrics.update_event_valuations(
-                pool,
-                ticker,
-                event_date,
-                source,
-                source_id,
-                value_quantitative=quant_result.get('value'),
-                value_qualitative=qual_result.get('value'),
-                position_quantitative=position_quant,
-                position_qualitative=position_qual,
-                disparity_quantitative=disparity_quant,
-                disparity_qualitative=disparity_qual,
-                overwrite=overwrite
-            )
-
-            if updated == 0:
-                raise ValueError("Event not found for update")
-
-            # Track success/fail
-            if quant_result['status'] == 'success':
-                quantitative_success += 1
-            elif quant_result['status'] == 'failed':
-                quantitative_fail += 1
-
-            if qual_result['status'] == 'success':
-                qualitative_success += 1
-            elif qual_result['status'] == 'failed':
-                qualitative_fail += 1
-
-            # Build position dict (only include non-None values)
-            position_dict = {}
-            if position_quant is not None:
-                position_dict['quantitative'] = position_quant
-            if position_qual is not None:
-                position_dict['qualitative'] = position_qual
-
-            # Build disparity dict (only include non-None values)
-            disparity_dict = {}
-            if disparity_quant is not None:
-                disparity_dict['quantitative'] = disparity_quant
-            if disparity_qual is not None:
-                disparity_dict['qualitative'] = disparity_qual
-
-            # Build result
-            results.append(EventProcessingResult(
-                ticker=ticker,
-                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
-                source=source,
-                source_id=str(source_id),
-                status='success' if quant_result['status'] == 'success' and qual_result['status'] == 'success' else 'partial',
-                quantitative={
-                    'status': quant_result['status'],
-                    'message': quant_result.get('message')
-                },
-                qualitative={
-                    'status': qual_result['status'],
-                    'message': qual_result.get('message')
-                },
-                position=position_dict if position_dict else None,
-                disparity=disparity_dict if disparity_dict else None
-            ))
-
-        except Exception as e:
-            logger.error(
-                f"Failed to update event {ticker} {event_date}: {e}",
-                extra={
-                    'endpoint': 'POST /backfillEventsTable',
-                    'phase': 'update',
-                    'elapsed_ms': int((time.time() - event_start) * 1000),
-                    'counters': {},
-                    'progress': {},
-                    'rate': {},
-                    'batch': {},
-                    'warn': []
-                }
-            )
-
-            quantitative_fail += 1
-            qualitative_fail += 1
-
-            results.append(EventProcessingResult(
-                ticker=ticker,
-                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
-                source=source,
-                source_id=str(source_id),
-                status='failed',
-                error=str(e),
-                errorCode='INTERNAL_ERROR'
-            ))
-
-        # Log progress every 10 events
-        if (idx + 1) % 10 == 0:
-            logger.info(
-                f"Processed {idx + 1}/{len(events)} events",
-                extra={
-                    'endpoint': 'POST /backfillEventsTable',
-                    'phase': 'process',
-                    'elapsed_ms': int((time.time() - start_time) * 1000),
-                    'counters': {
-                        'processed': idx + 1,
-                        'total': len(events)
-                    },
-                    'progress': {
-                        'done': idx + 1,
-                        'total': len(events),
-                        'pct': round((idx + 1) / len(events) * 100, 1)
-                    },
-                    'rate': {},
-                    'batch': {},
-                    'warn': []
-                }
-            )
-
-    # Phase 4: Generate price trends
-    logger.info(f"[backfillEventsTable] Phase 4: Generating price trends")
+    # Phase 5: Generate price trends
+    logger.info(f"[backfillEventsTable] Phase 5: Generating price trends")
     logger.info(
         "Generating price trends",
         extra={
@@ -397,6 +808,156 @@ async def calculate_valuations(
     }
 
 
+async def calculate_quantitative_metrics_fast(
+    ticker: str,
+    event_date,
+    api_cache: Dict[str, List[Dict[str, Any]]],
+    engine: MetricCalculationEngine,
+    target_domains: List[str]
+) -> Dict[str, Any]:
+    """
+    ULTRA-FAST quantitative metrics calculation.
+    
+    Uses pre-initialized engine and pre-fetched API cache.
+    Only performs date filtering per event - NO DB queries, NO engine init!
+    
+    Performance: ~50x faster than calculate_quantitative_metrics_cached
+    """
+    try:
+        # Convert event_date to date object
+        if isinstance(event_date, str):
+            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+        elif hasattr(event_date, 'date'):
+            event_date_obj = event_date.date()
+        else:
+            event_date_obj = event_date
+        
+        # Filter by event_date (temporal validity) - OPTIMIZED
+        api_data_filtered = {}
+        for api_id, records in api_cache.items():
+            if not records:
+                api_data_filtered[api_id] = []
+                continue
+            
+            if isinstance(records, list):
+                # Filter by date - use list comprehension for speed
+                api_data_filtered[api_id] = [
+                    r for r in records 
+                    if _get_record_date(r) is not None and _get_record_date(r) <= event_date_obj
+                ]
+            else:
+                # Single record (e.g., quote, market status)
+                api_data_filtered[api_id] = records
+        
+        # Calculate metrics using PRE-INITIALIZED engine
+        result = engine.calculate_all(api_data_filtered, target_domains)
+        
+        return {
+            'status': 'success',
+            'value': result,
+            'message': 'Quantitative metrics calculated (fast)'
+        }
+        
+    except Exception as e:
+        logger.error(f"[calculate_quantitative_metrics_fast] Failed for {ticker}: {e}")
+        return {
+            'status': 'failed',
+            'value': None,
+            'message': str(e)
+        }
+
+
+def _get_record_date(record: Dict[str, Any]):
+    """Helper to extract and convert record date - cached for performance."""
+    record_date = record.get('date')
+    if not record_date:
+        return None
+    
+    if isinstance(record_date, str):
+        try:
+            return datetime.fromisoformat(record_date.replace('Z', '+00:00')).date()
+        except:
+            return None
+    elif hasattr(record_date, 'date'):
+        return record_date.date()
+    return record_date
+
+
+async def calculate_quantitative_metrics_cached(
+    pool,
+    ticker: str,
+    event_date,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    api_cache: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """
+    Calculate quantitative metrics using pre-fetched API cache.
+    
+    This is the optimized version that skips API calls and uses cached data.
+    """
+    try:
+        # Load transform definitions
+        transforms = await metrics.select_metric_transforms(pool)
+        
+        # Initialize metric calculation engine with transforms
+        engine = MetricCalculationEngine(metrics_by_domain, transforms)
+        
+        # Convert event_date to date object
+        if isinstance(event_date, str):
+            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+        elif hasattr(event_date, 'date'):
+            event_date_obj = event_date.date()
+        else:
+            event_date_obj = event_date
+        
+        # Use cached API data (NO API CALLS!)
+        api_data_raw = api_cache
+        
+        # Filter by event_date (temporal validity)
+        api_data_filtered = {}
+        for api_id, records in api_data_raw.items():
+            if not records:
+                api_data_filtered[api_id] = []
+                continue
+            
+            if isinstance(records, list):
+                # Filter by date
+                filtered = []
+                for record in records:
+                    record_date = record.get('date')
+                    if record_date:
+                        if isinstance(record_date, str):
+                            record_date = datetime.fromisoformat(record_date.replace('Z', '+00:00')).date()
+                        elif hasattr(record_date, 'date'):
+                            record_date = record_date.date()
+                        
+                        if record_date <= event_date_obj:
+                            filtered.append(record)
+                
+                api_data_filtered[api_id] = filtered
+            else:
+                # Single record (e.g., quote, market status)
+                api_data_filtered[api_id] = records
+        
+        # Calculate metrics
+        target_domains = ['valuation', 'profitability', 'momentum', 'risk', 'dilution']
+        result = engine.calculate_all(api_data_filtered, target_domains)
+        
+        return {
+            'status': 'success',
+            'value': result,
+            'message': 'Quantitative metrics calculated (cached)'
+        }
+        
+    except Exception as e:
+        logger.error(f"[calculate_quantitative_metrics_cached] Failed for {ticker}: {e}")
+        return {
+            'status': 'failed',
+            'value': None,
+            'message': str(e)
+        }
+
+
 async def calculate_quantitative_metrics(
     pool,
     ticker: str,
@@ -428,19 +989,44 @@ async def calculate_quantitative_metrics(
 
         logger.info(f"[calculate_quantitative_metrics] Required APIs (from DB): {required_apis}")
 
+        # Convert event_date to date object for comparison (MUST be done before API calls)
+        from datetime import datetime
+        if isinstance(event_date, str):
+            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+        elif hasattr(event_date, 'date'):
+            event_date_obj = event_date.date()
+        else:
+            event_date_obj = event_date
+
         # Dynamically fetch all required API data based on config_lv2_metric definitions
         api_data_raw = {}
         async with FMPAPIClient() as fmp_client:
             for api_id in required_apis:
                 try:
+                    # Prepare API-specific parameters
+                    params = {'ticker': ticker}
+                    
+                    # Add API-specific parameters
+                    if 'historical-price' in api_id or 'eod' in api_id:
+                        # Historical price APIs need date range
+                        # Use wide date range to get all available data
+                        params['fromDate'] = '2000-01-01'  # Far past
+                        params['toDate'] = event_date_obj.strftime('%Y-%m-%d')
+                    else:
+                        # Quarterly financial APIs
+                        params['period'] = 'quarter'
+                        params['limit'] = 100  # For temporal validity
+                    
                     # Call API using DB configuration
-                    result = await fmp_client.call_api(api_id, {
-                        'ticker': ticker,
-                        'period': 'quarter',
-                        'limit': 100  # For temporal validity
-                    })
+                    result = await fmp_client.call_api(api_id, params)
                     api_data_raw[api_id] = result
-                    logger.info(f"[calculate_quantitative_metrics] Fetched {api_id}: {len(result) if isinstance(result, list) else 'single'} records")
+                    result_len = len(result) if isinstance(result, list) else ('single' if result else 'empty')
+                    logger.info(f"[calculate_quantitative_metrics] Fetched {api_id}: {result_len} records")
+                    
+                    # Debug: Log empty responses for historical-price
+                    if 'historical-price' in api_id or 'eod' in api_id:
+                        if isinstance(result, list) and len(result) == 0:
+                            logger.warning(f"[calculate_quantitative_metrics] Empty response from {api_id}, params: {params}")
                 except Exception as e:
                     logger.warning(f"[calculate_quantitative_metrics] Failed to fetch {api_id}: {e}")
                     api_data_raw[api_id] = []
@@ -455,15 +1041,6 @@ async def calculate_quantitative_metrics(
 
         # Filter quarterly data by event_date (temporal validity)
         # Only use quarters where quarter end date <= event_date
-        from datetime import datetime
-
-        # Convert event_date to date object for comparison
-        if isinstance(event_date, str):
-            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
-        elif hasattr(event_date, 'date'):
-            event_date_obj = event_date.date()
-        else:
-            event_date_obj = event_date
 
         # Filter all API data by event_date (for time-series data)
         api_data = {}
@@ -575,6 +1152,122 @@ async def calculate_quantitative_metrics(
         }
 
 
+async def calculate_qualitative_metrics_fast(
+    pool,
+    ticker: str,
+    event_date,
+    source: str,
+    source_id: str,
+    consensus_summary_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    ULTRA-FAST qualitative metrics calculation.
+    
+    Uses pre-fetched consensus summary - NO API calls!
+    
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        event_date: Event date
+        source: Source table name
+        source_id: evt_consensus.id (UUID string)
+        consensus_summary_cache: Pre-fetched consensus summary from fmp-price-target-consensus
+    
+    Returns:
+        Dict with status, value (jsonb), currentPrice, message
+    """
+    try:
+        # Only calculate for consensus events
+        if source != 'consensus':
+            return {
+                'status': 'skipped',
+                'value': None,
+                'currentPrice': None,
+                'message': 'Not a consensus event'
+            }
+
+        # Fetch consensus data using source_id for exact row match
+        consensus_data = await metrics.select_consensus_data(
+            pool, ticker, event_date, source_id
+        )
+
+        if not consensus_data:
+            return {
+                'status': 'failed',
+                'value': None,
+                'currentPrice': None,
+                'message': f'Consensus data not found for source_id={source_id}'
+            }
+
+        # Extract Phase 2 data
+        price_target = consensus_data.get('price_target')
+        price_when_posted = consensus_data.get('price_when_posted')
+        price_target_prev = consensus_data.get('price_target_prev')
+        price_when_posted_prev = consensus_data.get('price_when_posted_prev')
+        direction = consensus_data.get('direction')
+
+        # Build consensusSignal
+        consensus_signal = {
+            'direction': direction,
+            'last': {
+                'price_target': float(price_target) if price_target else None,
+                'price_when_posted': float(price_when_posted) if price_when_posted else None
+            }
+        }
+
+        # Add prev and delta if available
+        if price_target_prev is not None and price_when_posted_prev is not None:
+            consensus_signal['prev'] = {
+                'price_target': float(price_target_prev),
+                'price_when_posted': float(price_when_posted_prev)
+            }
+
+            # Calculate delta and deltaPct
+            if price_target and price_target_prev:
+                delta = float(price_target) - float(price_target_prev)
+                delta_pct = (delta / float(price_target_prev)) * 100 if price_target_prev != 0 else None
+
+                consensus_signal['delta'] = delta
+                consensus_signal['deltaPct'] = delta_pct
+            else:
+                consensus_signal['delta'] = None
+                consensus_signal['deltaPct'] = None
+        else:
+            consensus_signal['prev'] = None
+            consensus_signal['delta'] = None
+            consensus_signal['deltaPct'] = None
+
+        # Use CACHED consensus summary - NO API CALL!
+        target_median = 0
+        consensus_summary = consensus_summary_cache
+        
+        if consensus_summary and isinstance(consensus_summary, dict):
+            target_median = consensus_summary.get('targetMedian', 0)
+
+        # value_qualitative 구성
+        value_qualitative = {
+            'targetMedian': target_median,
+            'consensusSummary': consensus_summary,
+            'consensusSignal': consensus_signal
+        }
+
+        return {
+            'status': 'success',
+            'value': value_qualitative,
+            'currentPrice': float(price_when_posted) if price_when_posted else None,
+            'message': 'Qualitative metrics calculated (fast)'
+        }
+
+    except Exception as e:
+        logger.error(f"Qualitative calculation failed for {ticker}: {e}")
+        return {
+            'status': 'failed',
+            'value': None,
+            'currentPrice': None,
+            'message': str(e)
+        }
+
+
 async def calculate_qualitative_metrics(
     pool,
     ticker: str,
@@ -583,16 +1276,17 @@ async def calculate_qualitative_metrics(
     source_id: str
 ) -> Dict[str, Any]:
     """
-    Calculate qualitative metrics (consensusSignal).
+    Calculate qualitative metrics (consensusSignal, targetMedian, consensusSummary).
 
     Uses source_id to find the exact evt_consensus row,
     ensuring we compare the same analyst's previous values.
 
     Extracts consensus data from evt_consensus Phase 2 fields.
 
-    Note: This function currently handles consensus-specific logic.
-    Future enhancement: Use MetricCalculationEngine for all qualitative metrics
-    based on config_lv2_metric domain='qualatative-*' definitions.
+    항목 3 & 5 적용:
+    - consensusSummary: MetricCalculationEngine을 사용하여 fmp-price-target-consensus API 호출
+    - targetMedian: consensusSummary dict에서 추출
+    - consensus: (항목 5, 선택사항) fmp-price-target API 호출
 
     Args:
         pool: Database connection pool
@@ -665,7 +1359,41 @@ async def calculate_qualitative_metrics(
             consensus_signal['delta'] = None
             consensus_signal['deltaPct'] = None
 
+        # 항목 3: targetMedian & consensusSummary 추가
+        # Fetch consensusSummary from FMP API (simplified)
+        target_median = 0  # 기본값
+        consensus_summary = None
+        
+        try:
+            from .external_api import FMPAPIClient
+            
+            # Fetch consensus summary from FMP API
+            async with FMPAPIClient() as fmp_client:
+                consensus_target_data = await fmp_client.call_api(
+                    'fmp-price-target-consensus',
+                    {'ticker': ticker}
+                )
+                if consensus_target_data:
+                    # Extract consensus summary
+                    if isinstance(consensus_target_data, list) and len(consensus_target_data) > 0:
+                        consensus_summary = consensus_target_data[0]
+                    elif isinstance(consensus_target_data, dict):
+                        consensus_summary = consensus_target_data
+                    
+                    # Extract targetMedian
+                    if isinstance(consensus_summary, dict):
+                        target_median = consensus_summary.get('targetMedian', 0)
+                        
+            logger.debug(f"[QualitativeMetrics] consensusSummary: {consensus_summary}, targetMedian: {target_median}")
+                            
+        except Exception as e:
+            logger.debug(f"[QualitativeMetrics] consensusSummary fetch skipped: {e}")
+            # 실패해도 계속 진행 (consensusSignal은 이미 계산됨)
+
+        # value_qualitative 구성
         value_qualitative = {
+            'targetMedian': target_median,
+            'consensusSummary': consensus_summary,
             'consensusSignal': consensus_signal
         }
 

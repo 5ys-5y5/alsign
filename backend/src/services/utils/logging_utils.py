@@ -14,6 +14,16 @@ class StructuredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record into structured 1-line format."""
+        # Check if this log has structured data
+        has_structured_data = hasattr(record, 'endpoint') and record.endpoint != 'N/A'
+        
+        # If no structured data, use simple format (for debug/detail logs)
+        if not has_structured_data:
+            message = record.getMessage()
+            # Add to request context for detailed logs
+            add_detailed_log(message)
+            return message
+        
         # Extract custom attributes with defaults
         endpoint = getattr(record, 'endpoint', 'N/A')
         phase = getattr(record, 'phase', 'N/A')

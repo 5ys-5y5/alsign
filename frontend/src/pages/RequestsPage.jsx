@@ -917,6 +917,12 @@ export default function RequestsPage() {
           path="/sourceData"
           queryFields={[
             {
+              key: 'overwrite',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+            },
+            {
               key: 'mode',
               type: 'string',
               control: 'input',
@@ -988,6 +994,12 @@ export default function RequestsPage() {
           path="/backfillEventsTable"
           queryFields={[
             {
+              key: 'overwrite',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+            },
+            {
               key: 'from',
               label: 'From Date',
               type: 'date',
@@ -1030,6 +1042,14 @@ export default function RequestsPage() {
           title="POST /fillAnalyst"
           method="POST"
           path="/fillAnalyst"
+          queryFields={[
+            {
+              key: 'overwrite',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+            },
+          ]}
           bodyFields={[
             {
               key: '__body__',

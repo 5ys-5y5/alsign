@@ -219,6 +219,139 @@ async def select_consensus_data(
         return dict(row) if row else None
 
 
+async def batch_update_event_valuations(
+    pool: asyncpg.Pool,
+    updates: List[Dict[str, Any]],
+    overwrite: bool = False
+) -> int:
+    """
+    Batch update event valuations in txn_events.
+    
+    Args:
+        pool: Database connection pool
+        updates: List of update dictionaries, each containing:
+            - ticker: Ticker symbol
+            - event_date: Event date
+            - source: Source table name
+            - source_id: Source record ID
+            - value_quantitative: Quantitative metrics jsonb
+            - value_qualitative: Qualitative metrics jsonb
+            - position_quantitative: Position signal
+            - position_qualitative: Position signal
+            - disparity_quantitative: Quantitative disparity
+            - disparity_qualitative: Qualitative disparity
+        overwrite: If False, partial update (NULL only). If True, full replace.
+    
+    Returns:
+        Number of rows updated
+    """
+    if not updates:
+        return 0
+    
+    async with pool.acquire() as conn:
+        # Prepare batch data
+        records = [
+            (
+                upd['ticker'],
+                upd['event_date'],
+                upd['source'],
+                upd['source_id'],
+                json.dumps(upd.get('value_quantitative')) if upd.get('value_quantitative') else None,
+                json.dumps(upd.get('value_qualitative')) if upd.get('value_qualitative') else None,
+                upd.get('position_quantitative'),
+                upd.get('position_qualitative'),
+                upd.get('disparity_quantitative'),
+                upd.get('disparity_qualitative')
+            )
+            for upd in updates
+        ]
+        
+        if overwrite:
+            # Full replace mode using temp table
+            query = """
+                WITH batch_data AS (
+                    SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[],
+                                       $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
+                                       $9::numeric[], $10::numeric[])
+                    AS t(ticker, event_date, source, source_id, 
+                         value_quantitative, value_qualitative,
+                         position_quantitative, position_qualitative,
+                         disparity_quantitative, disparity_qualitative)
+                )
+                UPDATE txn_events e
+                SET value_quantitative = b.value_quantitative,
+                    value_qualitative = b.value_qualitative,
+                    position_quantitative = b.position_quantitative::position,
+                    position_qualitative = b.position_qualitative::position,
+                    disparity_quantitative = b.disparity_quantitative,
+                    disparity_qualitative = b.disparity_qualitative
+                FROM batch_data b
+                WHERE e.ticker = b.ticker
+                  AND e.event_date = b.event_date
+                  AND e.source = b.source
+                  AND e.source_id = b.source_id
+            """
+        else:
+            # Partial update mode - only update NULL values
+            query = """
+                WITH batch_data AS (
+                    SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[],
+                                       $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
+                                       $9::numeric[], $10::numeric[])
+                    AS t(ticker, event_date, source, source_id,
+                         value_quantitative, value_qualitative,
+                         position_quantitative, position_qualitative,
+                         disparity_quantitative, disparity_qualitative)
+                )
+                UPDATE txn_events e
+                SET value_quantitative = CASE
+                        WHEN e.value_quantitative IS NULL THEN b.value_quantitative
+                        ELSE e.value_quantitative
+                    END,
+                    value_qualitative = CASE
+                        WHEN e.value_qualitative IS NULL THEN b.value_qualitative
+                        ELSE e.value_qualitative
+                    END,
+                    position_quantitative = COALESCE(e.position_quantitative, b.position_quantitative::position),
+                    position_qualitative = COALESCE(e.position_qualitative, b.position_qualitative::position),
+                    disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
+                    disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative)
+                FROM batch_data b
+                WHERE e.ticker = b.ticker
+                  AND e.event_date = b.event_date
+                  AND e.source = b.source
+                  AND e.source_id = b.source_id
+            """
+        
+        # Unzip records into column arrays
+        tickers, event_dates, sources, source_ids = [], [], [], []
+        val_quants, val_quals, pos_quants, pos_quals = [], [], [], []
+        disp_quants, disp_quals = [], []
+        
+        for rec in records:
+            tickers.append(rec[0])
+            event_dates.append(rec[1])
+            sources.append(rec[2])
+            source_ids.append(rec[3])
+            val_quants.append(rec[4])
+            val_quals.append(rec[5])
+            pos_quants.append(rec[6])
+            pos_quals.append(rec[7])
+            disp_quants.append(rec[8])
+            disp_quals.append(rec[9])
+        
+        result = await conn.execute(
+            query,
+            tickers, event_dates, sources, source_ids,
+            val_quants, val_quals, pos_quants, pos_quals,
+            disp_quants, disp_quals
+        )
+        
+        # Parse result (format: "UPDATE N")
+        updated_count = int(result.split()[-1]) if result else 0
+        return updated_count
+
+
 async def update_event_valuations(
     pool: asyncpg.Pool,
     ticker: str,

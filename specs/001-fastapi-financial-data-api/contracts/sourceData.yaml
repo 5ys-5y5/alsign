@@ -21,6 +21,17 @@ paths:
       tags:
         - Data Collection
       parameters:
+        - name: overwrite
+          in: query
+          required: false
+          description: |
+            Controls data update strategy:
+            - false (default): Update only NULL values
+            - true: Overwrite existing data
+          schema:
+            type: boolean
+            default: false
+
         - name: mode
           in: query
           required: false

@@ -21,6 +21,18 @@ paths:
         Uses generated keys (analyst_name_key, analyst_company_key) for handling NULL values.
       tags:
         - Analytics
+      parameters:
+        - name: overwrite
+          in: query
+          required: false
+          description: |
+            Controls analyst performance data update strategy:
+            - false (default): Update only NULL values in analyst performance data
+            - true: Recalculate all metrics
+          schema:
+            type: boolean
+            default: false
+
       requestBody:
         description: Empty JSON body (endpoint accepts no input payload)
         required: false

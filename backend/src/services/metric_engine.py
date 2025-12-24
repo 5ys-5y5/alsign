@@ -88,7 +88,7 @@ class MetricCalculationEngine:
             dependencies = self._extract_dependencies(metric)
             self.dependency_graph[metric_name] = dependencies
 
-        logger.info(f"[MetricEngine] Built dependency graph with {len(self.dependency_graph)} metrics")
+        logger.debug(f"[MetricEngine] Built dependency graph with {len(self.dependency_graph)} metrics")
 
     def _extract_dependencies(self, metric: Dict[str, Any]) -> List[str]:
         """
@@ -141,7 +141,7 @@ class MetricCalculationEngine:
         Raises:
             ValueError: If circular dependency detected
         """
-        logger.info(f"[MetricEngine] Starting topological sort for {len(self.dependency_graph)} metrics")
+        logger.debug(f"[MetricEngine] Starting topological sort for {len(self.dependency_graph)} metrics")
 
         # Kahn's algorithm for topological sort
         # in_degree[A] = number of metrics that A depends on
@@ -155,7 +155,7 @@ class MetricCalculationEngine:
             if metric_name not in in_degree:
                 in_degree[metric_name] = 0
 
-        logger.info(f"[MetricEngine] Building reverse graph...")
+        logger.debug(f"[MetricEngine] Building reverse graph...")
 
         # Calculate in-degrees and build reverse graph
         # If A depends on [B, C], then:
@@ -173,7 +173,7 @@ class MetricCalculationEngine:
         # Start with metrics that have no dependencies (in_degree == 0)
         # These are base metrics like api_field metrics
         zero_deps = [name for name, degree in in_degree.items() if degree == 0]
-        logger.info(f"[MetricEngine] Found {len(zero_deps)} metrics with no dependencies (starting nodes)")
+        logger.debug(f"[MetricEngine] Found {len(zero_deps)} metrics with no dependencies (starting nodes)")
 
         queue = deque(zero_deps)
         result = []
@@ -196,9 +196,9 @@ class MetricCalculationEngine:
             raise ValueError("Circular dependency detected in metrics")
 
         self.calculation_order = result
-        logger.info(f"[MetricEngine] Topological sort completed: {len(result)} metrics in order")
-        logger.info(f"[MetricEngine] First 10 metrics: {result[:10]}")
-        logger.info(f"[MetricEngine] Last 10 metrics: {result[-10:]}")
+        logger.debug(f"[MetricEngine] Topological sort completed: {len(result)} metrics in order")
+        logger.debug(f"[MetricEngine] First 10 metrics: {result[:10]}")
+        logger.debug(f"[MetricEngine] Last 10 metrics: {result[-10:]}")
         return result
 
     def calculate_all(
@@ -255,12 +255,25 @@ class MetricCalculationEngine:
                     continue
 
             try:
-                value = self._calculate_metric(metric, api_data, calculated_values)
+                value, failure_reason = self._calculate_metric_with_reason(metric, api_data, calculated_values)
                 calculated_values[metric_name] = value
                 if value is not None:
-                    logger.info(f"[MetricEngine] ✓ {metric_name} = {str(value)[:50]} (source: {metric.get('source')})")
+                    # Smart formatting: show first item + count for lists, full value for scalars
+                    if isinstance(value, list) and len(value) > 0:
+                        first_item = value[0]
+                        value_str = f"[{first_item}, ...] ({len(value)} items)"
+                    else:
+                        value_str = str(value)
+                    
+                    # Truncate only if still too long (for safety)
+                    if len(value_str) > 150:
+                        value_str = value_str[:150] + "..."
+                    
+                    logger.debug(f"[MetricEngine] ✓ {metric_name} = {value_str} (source: {metric.get('source')})")
                 else:
-                    logger.info(f"[MetricEngine] ✗ {metric_name} = None (source: {metric.get('source')})")
+                    # Include failure reason for debugging
+                    reason_str = f" | reason: {failure_reason}" if failure_reason else ""
+                    logger.debug(f"[MetricEngine] ✗ {metric_name} = None (source: {metric.get('source')}){reason_str}")
             except Exception as e:
                 logger.error(f"[MetricEngine] Failed to calculate {metric_name}: {e}")
                 calculated_values[metric_name] = None
@@ -269,6 +282,62 @@ class MetricCalculationEngine:
         result = self._group_by_domain(calculated_values, target_domains)
         return result
 
+    def _calculate_metric_with_reason(
+        self,
+        metric: Dict[str, Any],
+        api_data: Dict[str, List[Dict[str, Any]]],
+        calculated_values: Dict[str, Any]
+    ) -> tuple:
+        """
+        Calculate a single metric with failure reason tracking.
+
+        Returns:
+            Tuple of (value, failure_reason)
+        """
+        source = metric.get('source')
+        metric_name = metric.get('name')
+
+        if source == 'api_field':
+            value = self._calculate_api_field(metric, api_data)
+            if value is None:
+                api_list_id = metric.get('api_list_id')
+                if not api_list_id:
+                    return None, "Missing api_list_id"
+                elif api_list_id not in api_data or not api_data.get(api_list_id):
+                    return None, f"No data from API '{api_list_id}'"
+                else:
+                    return None, f"Field extraction failed from '{api_list_id}'"
+            return value, None
+            
+        elif source == 'aggregation':
+            value = self._calculate_aggregation(metric, api_data, calculated_values)
+            if value is None:
+                base_metric = metric.get('base_metric')
+                transform_id = metric.get('transform')
+                if not base_metric:
+                    return None, "Missing base_metric"
+                elif base_metric not in calculated_values:
+                    return None, f"Base metric '{base_metric}' not calculated"
+                elif calculated_values.get(base_metric) is None:
+                    return None, f"Base metric '{base_metric}' is None"
+                else:
+                    return None, f"Transform '{transform_id}' returned None"
+            return value, None
+            
+        elif source == 'expression':
+            value = self._calculate_expression(metric, calculated_values)
+            if value is None:
+                dependencies = metric.get('dependencies', [])
+                missing = [d for d in dependencies if d not in calculated_values or calculated_values.get(d) is None]
+                if missing:
+                    return None, f"Missing dependencies: {', '.join(missing)}"
+                else:
+                    return None, "Expression evaluation returned None"
+            return value, None
+            
+        else:
+            return None, f"Unknown source type '{source}'"
+
     def _calculate_metric(
         self,
         metric: Dict[str, Any],
@@ -276,7 +345,7 @@ class MetricCalculationEngine:
         calculated_values: Dict[str, Any]
     ) -> Any:
         """
-        Calculate a single metric.
+        Calculate a single metric (backward compatibility).
 
         Routes to appropriate calculator based on metric source type.
 
@@ -288,17 +357,8 @@ class MetricCalculationEngine:
         Returns:
             Calculated metric value
         """
-        source = metric.get('source')
-
-        if source == 'api_field':
-            return self._calculate_api_field(metric, api_data)
-        elif source == 'aggregation':
-            return self._calculate_aggregation(metric, api_data, calculated_values)
-        elif source == 'expression':
-            return self._calculate_expression(metric, calculated_values)
-        else:
-            logger.warning(f"[MetricEngine] Unknown source type '{source}' for metric {metric.get('name')}")
-            return None
+        value, _ = self._calculate_metric_with_reason(metric, api_data, calculated_values)
+        return value
 
     def _convert_value(self, value: Any) -> Any:
         """
@@ -383,25 +443,19 @@ class MetricCalculationEngine:
         # Example: {"low": "low", "high": "high", "open": "open", "close": "close"}
         # Maps output field name to API response field name
         if isinstance(field_key, dict):
-            if metric.get('name') == 'priceEodOHLC':
-                logger.warning(f"[priceEodOHLC] Dict response_key processing: field_key={field_key}, api_response type={type(api_response)}, len={len(api_response) if isinstance(api_response, list) else 'N/A'}")
             # Extract multiple fields from API response
             if isinstance(api_response, list):
                 # For time-series data, extract dict for each record
                 result_list = []
-                for record in api_response:
+                for idx, record in enumerate(api_response):
                     record_dict = {}
                     for output_key, api_key in field_key.items():
                         value = record.get(api_key)
                         if value is not None:
                             record_dict[output_key] = self._convert_value(value)
+                    
                     if record_dict:  # Only add if at least one field was found
                         result_list.append(record_dict)
-
-                if metric.get('name') == 'priceEodOHLC':
-                    logger.warning(f"[priceEodOHLC] Extracted {len(result_list)} dicts from {len(api_response)} records")
-                    if len(result_list) > 0:
-                        logger.warning(f"[priceEodOHLC] First result: {result_list[0]}")
 
                 # Return scalar dict if single record, else list of dicts
                 if len(result_list) == 1:
@@ -409,8 +463,7 @@ class MetricCalculationEngine:
                 elif len(result_list) > 1:
                     return result_list
                 else:
-                    if metric.get('name') == 'priceEodOHLC':
-                        logger.warning(f"[priceEodOHLC] Returning None: result_list is empty")
+                    logger.debug(f"[MetricEngine] No fields extracted from {api_list_id} for {metric.get('name')}")
                     return None
             elif isinstance(api_response, dict):
                 # For snapshot data, extract dict from single record
@@ -517,6 +570,8 @@ class MetricCalculationEngine:
             return self._qoq_from_quarter(base_values, aggregation_params)
         elif aggregation_kind == 'yoyFromQuarter':
             return self._yoy_from_quarter(base_values, aggregation_params)
+        elif aggregation_kind == 'leadPairFromList':
+            return self._lead_pair_from_list(base_values, aggregation_params)
         else:
             logger.warning(f"[MetricEngine] Unknown aggregation_kind '{aggregation_kind}' for {metric.get('name')}")
             return None
@@ -777,7 +832,7 @@ class MetricCalculationEngine:
             logger.debug(f"[MetricEngine] Division by zero in {metric.get('name')}")
             return None
         except Exception as e:
-            logger.warning(f"[MetricEngine] Failed to evaluate expression for {metric.get('name')}: {e}")
+            logger.debug(f"[MetricEngine] Failed to evaluate expression for {metric.get('name')}: {e}")
             logger.debug(f"[MetricEngine] Formula: {formula}")
             return None
 
@@ -887,3 +942,126 @@ class MetricCalculationEngine:
                 }
 
         return result
+
+    def _lead_pair_from_list(
+        self,
+        base_values: List[Dict[str, Any]],
+        params: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find previous record for the same partition and attach lead (previous) values.
+
+        This aggregation is used for consensusSignal to track analyst's previous predictions.
+
+        Workflow:
+        1. Partition records by (ticker, analyst_name, analyst_company)
+        2. Sort each partition by event_date (desc)
+        3. For the most recent record, find the previous record
+        4. Attach prev values from previous record
+
+        Args:
+            base_values: List of consensus records from evt_consensus
+            params: {
+                "partitionBy": ["ticker", "analyst_name", "analyst_company"],
+                "orderBy": [{"event_date": "desc"}],
+                "leadFields": [
+                    {"field": "price_target", "as": "price_target_prev"},
+                    {"field": "price_when_posted", "as": "price_when_posted_prev"}
+                ],
+                "emitPrevRow": true  # If true, also emit prev values
+            }
+
+        Returns:
+            Dict with current record + prev field values, or None if no records
+        """
+        if not base_values:
+            logger.warning("[MetricEngine] leadPairFromList: No base_values provided")
+            return None
+
+        # Ensure base_values is a list
+        if not isinstance(base_values, list):
+            base_values = [base_values]
+
+        # Extract parameters
+        partition_by = params.get('partitionBy', [])
+        order_by = params.get('orderBy', [])
+        lead_fields = params.get('leadFields', [])
+
+        if not partition_by or not order_by or not lead_fields:
+            logger.warning(
+                f"[MetricEngine] leadPairFromList: Missing required params "
+                f"(partitionBy={bool(partition_by)}, orderBy={bool(order_by)}, leadFields={bool(lead_fields)})"
+            )
+            return None
+
+        # Group records by partition
+        from collections import defaultdict
+        partitions = defaultdict(list)
+
+        for record in base_values:
+            if not isinstance(record, dict):
+                continue
+
+            # Build partition key
+            partition_key = tuple(record.get(field) for field in partition_by)
+            partitions[partition_key].append(record)
+
+        # Sort each partition
+        for partition_key, records in partitions.items():
+            # Extract sort field and direction from orderBy
+            if order_by:
+                sort_config = order_by[0]  # Use first sort config
+                sort_field = list(sort_config.keys())[0]
+                sort_direction = sort_config[sort_field]  # 'asc' or 'desc'
+
+                records.sort(
+                    key=lambda r: r.get(sort_field, ''),
+                    reverse=(sort_direction == 'desc')
+                )
+
+        # Find the most recent record (first record in first partition after sorting)
+        if not partitions:
+            logger.warning("[MetricEngine] leadPairFromList: No partitions created")
+            return None
+
+        # Get first partition (arbitrary, should be configured to select specific partition)
+        first_partition_key = next(iter(partitions))
+        sorted_records = partitions[first_partition_key]
+
+        if len(sorted_records) == 0:
+            logger.warning("[MetricEngine] leadPairFromList: No records in partition")
+            return None
+
+        # Most recent record
+        current_record = sorted_records[0].copy()
+
+        # Find previous record (if exists)
+        if len(sorted_records) > 1:
+            prev_record = sorted_records[1]
+
+            # Attach lead fields from previous record
+            for lead_config in lead_fields:
+                source_field = lead_config.get('field')
+                target_field = lead_config.get('as', f"{source_field}_prev")
+
+                prev_value = prev_record.get(source_field)
+                current_record[target_field] = prev_value
+
+            # Optionally include prev record as nested dict
+            if params.get('emitPrevRow', False):
+                current_record['_prev'] = prev_record
+        else:
+            # No previous record - set prev fields to None
+            for lead_config in lead_fields:
+                target_field = lead_config.get('as', f"{lead_config.get('field')}_prev")
+                current_record[target_field] = None
+
+            if params.get('emitPrevRow', False):
+                current_record['_prev'] = None
+
+        logger.info(
+            f"[MetricEngine] leadPairFromList: Processed {len(sorted_records)} records, "
+            f"attached {len(lead_fields)} lead fields"
+        )
+
+        return current_record

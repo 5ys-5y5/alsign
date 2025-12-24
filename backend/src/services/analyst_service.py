@@ -114,12 +114,15 @@ def calculate_statistics_from_db_metrics(
     return stats
 
 
-async def aggregate_analyst_performance() -> Dict[str, Any]:
+async def aggregate_analyst_performance(overwrite: bool = False) -> Dict[str, Any]:
     """
     Aggregate analyst performance metrics from consensus events.
 
     Groups events by (analyst_name, analyst_company), calculates return
     distributions per dayOffset, and upserts to config_lv3_analyst.
+
+    Args:
+        overwrite: If False, update only NULL values. If True, recalculate all metrics.
 
     Returns:
         Dict with summary and per-group results

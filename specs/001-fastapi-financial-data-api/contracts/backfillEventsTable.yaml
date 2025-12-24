@@ -33,6 +33,36 @@ paths:
             type: boolean
             default: false
 
+        - name: from
+          in: query
+          required: false
+          description: |
+            Start date for filtering events by event_date. If not specified, no lower bound is applied.
+          schema:
+            type: string
+            format: date
+          example: "2025-01-01"
+
+        - name: to
+          in: query
+          required: false
+          description: |
+            End date for filtering events by event_date. If not specified, no upper bound is applied.
+          schema:
+            type: string
+            format: date
+          example: "2025-12-31"
+
+        - name: tickers
+          in: query
+          required: false
+          description: |
+            Comma-separated list of ticker symbols to process. If not specified, processes all tickers.
+          schema:
+            type: string
+            pattern: ^[A-Z0-9]+(,[A-Z0-9]+)*$
+          example: "AAPL,MSFT,GOOGL"
+
       requestBody:
         description: Empty JSON body (endpoint accepts no input payload)
         required: false

@@ -66,7 +66,7 @@ async def get_source_data(
                         'warn': []
                     }
                 )
-                result = await source_data_service.get_holidays()
+                result = await source_data_service.get_holidays(overwrite=params.overwrite)
                 results['holiday'] = result
                 total_success += result['counters'].success
                 total_fail += result['counters'].fail
@@ -85,7 +85,7 @@ async def get_source_data(
                         'warn': []
                     }
                 )
-                result = await source_data_service.get_targets()
+                result = await source_data_service.get_targets(overwrite=params.overwrite)
                 results['target'] = result
                 total_success += result['counters'].success
                 total_fail += result['counters'].fail
@@ -105,6 +105,7 @@ async def get_source_data(
                     }
                 )
                 result = await source_data_service.get_consensus(
+                    overwrite=params.overwrite,
                     calc_mode=params.calc_mode,
                     calc_scope=params.calc_scope,
                     tickers_param=params.tickers,
@@ -130,7 +131,7 @@ async def get_source_data(
                         'warn': []
                     }
                 )
-                result = await source_data_service.get_earning(past=params.past)
+                result = await source_data_service.get_earning(overwrite=params.overwrite, past=params.past)
                 results['earning'] = result
                 total_success += result['counters'].success
                 total_fail += result['counters'].fail

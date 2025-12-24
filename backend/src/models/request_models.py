@@ -14,6 +14,11 @@ class SourceDataQueryParams(BaseModel):
 
     model_config = ConfigDict(extra='forbid', populate_by_name=True)
 
+    overwrite: bool = Field(
+        default=False,
+        description="If false, update only NULL values. If true, overwrite existing data."
+    )
+
     mode: Optional[str] = Field(
         default=None,
         description="Comma-separated list of modes: holiday, target, consensus, earning. If unspecified, executes all in default order."
@@ -258,3 +263,14 @@ class BackfillEventsTableQueryParams(BaseModel):
         ticker_list = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
 
         return ticker_list if ticker_list else None
+
+
+class FillAnalystQueryParams(BaseModel):
+    """Query parameters for POST /fillAnalyst endpoint."""
+
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
+
+    overwrite: bool = Field(
+        default=False,
+        description="If false, update only NULL values in analyst performance data. If true, recalculate all metrics."
+    )

@@ -16,9 +16,12 @@ from ..models.response_models import Counters, PhaseCounters
 logger = logging.getLogger("alsign")
 
 
-async def get_targets() -> Dict[str, Any]:
+async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
     """
     Fetch and upsert company targets from FMP screener.
+
+    Args:
+        overwrite: If False, update only NULL values. If True, truncate and insert all data.
 
     Returns:
         Dict with elapsedMs, counters, warn, dbWrites
@@ -122,9 +125,12 @@ async def get_targets() -> Dict[str, Any]:
     }
 
 
-async def get_holidays() -> Dict[str, Any]:
+async def get_holidays(overwrite: bool = False) -> Dict[str, Any]:
     """
     Fetch and upsert market holidays from FMP API.
+
+    Args:
+        overwrite: If False, update only NULL values. If True, overwrite existing data.
 
     Returns:
         Dict with elapsedMs, counters, warn, dbWrites
@@ -169,6 +175,7 @@ async def get_holidays() -> Dict[str, Any]:
 
 
 async def get_consensus(
+    overwrite: bool = False,
     calc_mode: str = None,
     calc_scope: str = None,
     tickers_param: str = None,
@@ -400,7 +407,7 @@ async def determine_phase2_partitions(
     return []
 
 
-async def get_earning(past: bool = False) -> Dict[str, Any]:
+async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, Any]:
     """
     Fetch and insert earning calendar data.
 
@@ -416,6 +423,7 @@ async def get_earning(past: bool = False) -> Dict[str, Any]:
       - Batch: 7-day chunks
 
     Args:
+        overwrite: If False, update only NULL values. If True, overwrite existing data.
         past: If True, also fetch past 5 years (backfill mode). Default: future only.
 
     Returns:
