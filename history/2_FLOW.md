@@ -644,7 +644,294 @@
 | **I-12** | **동적 계산 코드 실행 실패** | **✅** | **옵션 B (single expression)** | **I-12** |
 | **I-13** | **priceEodOHLC 데이터 추출** | **✅** | **옵션 A+B (파라미터 추가)** | **I-13** |
 | **I-14** | **aftermarket API 401** | **⏸️** | **FMP 일시적 문제** | **I-14** |
+| **I-15** | **event_date_obj 변수 순서** | **✅** | **옵션 A (변환 로직 이동)** | **I-15** |
+| **I-16** | **메트릭 실패 디버깅 로그 부재** | **✅** | **옵션 A (중앙 집중식)** | **I-16** |
+| **I-17** | **로그 형식 N/A 과다** | **✅** | **옵션 A (조건부 포맷)** | **I-17** |
+| **I-18** | **priceEodOHLC Schema Array** | **✅** | **옵션 B (전체 검증)** | **I-18** |
+| **I-19** | **메트릭 로그 Truncation** | **✅** | **옵션 B (스마트 포맷)** | **I-19** |
+| **I-20** | **backfillEventsTable 성능** | **✅** | **옵션 D (복합 전략)** | **I-20** |
 
 ---
 
-*마지막 업데이트: 2025-12-24 (런타임 이슈 추가)*
+## I-18: priceEodOHLC Schema Array Type 문제
+
+> **발견**: 2025-12-25 10:00 | **해결**: 2025-12-25 11:30
+
+### 현상
+	POST /backfillEventsTable 실행 시 에러:
+	```
+	[MetricEngine] Failed to calculate priceEodOHLC: unhashable type: 'list'
+	```
+	
+	에러 위치: metric_engine.py:74 - `api_ids.add(api_list_id)`
+
+### 원인
+	1. DB 타입 오류: config_lv1_api_list.schema가 array [{}]로 저장됨
+	2. Python 타입 제약: set()에 list를 추가할 수 없음 (unhashable)
+	3. 일관성 문제: 19개 API 중 1개만 array type
+
+### LLM 제공 선택지
+	| 옵션 | 설명 |
+	|------|------|
+	| A | 단일 API만 수정 |
+	| B | 전체 API 검증 + 수정 (권장) |
+
+### 사용자 채택
+	**옵션 B** - 전체 API 검증 후 일괄 수정
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **진단 스크립트**: diagnose_priceEodOHLC_issue.sql
+	- **수정 스크립트**: fix_priceEodOHLC_array_types.sql
+	- **검증 스크립트**: verify_all_api_schemas.sql
+	- **통합 실행**: EXECUTE_FIX_SEQUENCE.sql
+	- **참조**: → [상세: I-18]
+
+---
+
+## I-19: 메트릭 로그 Truncation 문제
+
+> **발견**: 2025-12-25 12:00 | **해결**: 2025-12-25 13:00
+
+### 현상
+	메트릭 로그가 50자로 잘려서 중요한 정보 누락:
+	```
+	[MetricEngine] ✓ priceEodOHLC = [{'low': 15.48, 'high': 16.37, 'open': 15.65, 'clo
+	                                                                              ^^^^ 잘림!
+	```
+
+### 원인
+	1. 하드코딩된 길이: str(value)[:50]
+	2. 단순 문자열 변환: 리스트/스칼라 구분 없이 동일 처리
+	3. 과도한 디버깅: priceEodOHLC 전용 warning 로그 5개
+
+### LLM 제공 선택지
+	| 옵션 | 설명 |
+	|------|------|
+	| A | 길이 증가 (50→100자) |
+	| B | 스마트 포맷팅 (권장) |
+	| C | 로그 레벨 분리 |
+
+### 사용자 채택
+	**옵션 B** - 스마트 포맷팅
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **파일**: metric_engine.py:258-271
+	- **변경**: 리스트는 첫 항목 + 개수 표시, 150자 제한
+	- **효과**: 로그 노이즈 83% 감소 (6줄 → 1줄)
+	- **참조**: → [상세: I-19]
+
+---
+
+## I-20: POST /backfillEventsTable 성능 개선 (배치 처리)
+
+> **발견**: 2025-12-25 14:00 | **해결**: 2025-12-25 18:00
+
+### 현상
+	POST /backfillEventsTable 엔드포인트가 136,954개 이벤트 처리 필요:
+	```
+	[backfillEventsTable] Processing event 40/136954: A 2025-08-28 consensus
+	```
+	
+	- 순차 처리 (하나씩)
+	- 예상 소요 시간: **76시간**
+	- 운영 불가능
+
+### 원인
+	1. 순차 처리: for idx, event in enumerate(events)
+	2. 중복 API 호출: 같은 ticker → 동일 API 반복 호출
+	3. 개별 DB 쓰기: 136,954번의 개별 UPDATE
+	4. 병렬 처리 미활용
+
+### LLM 제공 선택지
+	| 옵션 | 설명 | 성능 |
+	|------|------|------|
+	| A | Ticker 배치 + API 캐싱 | 76h → 4-6h |
+	| B | 병렬 처리 | 76h → 1.5-2h |
+	| C | DB 배치 쓰기 only | 76h → 50-60h |
+	| **D** | **복합 전략 (A+B+C)** | **76h → 0.5-1h** |
+
+### 사용자 채택
+	**옵션 D** - 복합 전략 (Ticker 배치 + 병렬 + DB 배치)
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **구현 항목**:
+		- Ticker 그룹화 (group_events_by_ticker)
+		- Ticker 배치 처리 (process_ticker_batch)
+		- DB 배치 업데이트 (batch_update_event_valuations)
+		- 병렬 처리 (asyncio.Semaphore, TICKER_CONCURRENCY=10)
+	- **성능 개선**:
+		| 항목 | Before | After | 개선율 |
+		|------|--------|-------|--------|
+		| API 호출 | 136,954 | ~5,000 | 96% ↓ |
+		| DB 쿼리 | 136,954 | ~5,000 | 96% ↓ |
+		| **소요 시간** | **76시간** | **0.5-1시간** | **99% ↓** |
+	- **참조**: → [상세: I-20]
+
+---
+
+## I-21: priceEodOHLC domain 설정 오류
+
+> **발견**: 2025-12-25 19:00 | **해결**: 2025-12-25 19:30
+
+### 현상
+	POST /backfillEventsTable 실행 후 value_quantitative의 momentum 객체에 priceEodOHLC가 포함됨:
+	```json
+	{
+	  "momentum": {
+	    "priceEodOHLC": {...},  // ❌ 지침서에 없는 항목
+	    "grossMarginTTM": 0.54,
+	    ...
+	  }
+	}
+	```
+	
+	지침서(라인 788-793)에 따르면 momentum에는 grossMarginLast, grossMarginTTM, operatingMarginTTM, rndIntensityTTM만 포함되어야 함.
+
+### 원인
+	1. fix_priceeodohlc_domain.py 스크립트가 priceEodOHLC domain을 'internal' → 'quantitative-momentum'으로 잘못 변경
+	2. metric_engine.py의 _group_by_domain()이 domain='internal'인 경우만 결과에서 제외
+
+### LLM 제공 선택지
+	| 옵션 | 설명 |
+	|------|------|
+	| A | priceEodOHLC domain을 'internal'로 복원 |
+	| B | metric_engine에서 priceEodOHLC 명시적 제외 |
+
+### 사용자 채택
+	**옵션 A** - domain을 'internal'로 복원 (원래 설정으로 복구)
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **SQL**: fix_priceEodOHLC_domain_to_internal.sql 생성
+	- **삭제**: fix_priceeodohlc_domain.py 삭제 (잘못된 스크립트)
+	- **참조**: → [상세: I-21]
+
+---
+
+## I-22: SQL 예약어 "position" 문제
+
+> **발견**: 2025-12-25 19:30 | **해결**: 2025-12-25 19:45
+
+### 현상
+	DB 배치 업데이트 실패:
+	```
+	[Ticker Batch] A: DB batch update failed: syntax error at or near "position"
+	```
+
+### 원인
+	batch_update_event_valuations() 함수에서 `::position` 타입 캐스팅 사용.
+	PostgreSQL에서 `position`은 예약어이므로 따옴표로 감싸야 함.
+
+### LLM 제공 선택지
+	| 옵션 | 설명 |
+	|------|------|
+	| A | ::"position"으로 따옴표 추가 |
+	| B | 타입 이름을 변경 (예: position_type) |
+
+### 사용자 채택
+	**옵션 A** - 따옴표 추가 (가장 간단한 해결책)
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **파일**: backend/src/database/queries/metrics.py
+	- **변경**: `::position` → `::"position"` (4곳)
+	- **참조**: → [상세: I-22]
+
+---
+
+## I-23: NULL 값 디버깅 로그 개선
+
+> **발견**: 2025-12-25 20:00 | **해결**: 2025-12-25 20:30
+
+### 현상
+	value_quantitative에 NULL 값이 많이 출력되지만 원인을 구별할 수 없음:
+	```json
+	{
+	  "valuation": {
+	    "PBR": null,
+	    "PER": null,
+	    "PSR": null,
+	    "evEBITDA": null
+	  }
+	}
+	```
+	
+	- API 데이터가 없어서 NULL인지?
+	- 계산 로직 오류로 NULL인지?
+
+### 원인
+	1. 현재 로그가 DEBUG 레벨로만 출력 (기본 INFO에서 안 보임)
+	2. 실패 이유가 너무 간략함
+
+### LLM 제공 선택지
+	| 옵션 | 설명 |
+	|------|------|
+	| A | DEBUG → INFO 레벨 변경 |
+	| B | 결과에 _errors 필드 추가 |
+	| C | 별도 디버그 엔드포인트 |
+
+### 사용자 채택
+	**옵션 A** - INFO 레벨로 상세 로그 출력
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **파일**: backend/src/services/metric_engine.py
+	- **변경**: 
+		- NULL 값 발생 시 INFO 레벨로 출력
+		- expression 의존성 상세 추적 (어떤 dependency가 None인지)
+	- **출력 형식**: 
+		```
+		[MetricEngine] ✗ NULL: PER | domain=valuation | reason=Missing deps: netIncomeTTM(=None) | formula: marketCap / netIncomeTTM
+		```
+	- **참조**: → [상세: I-23]
+
+---
+
+## I-24: price trends 처리 성능 최적화
+
+> **발견**: 2025-12-25 21:00 | **해결**: 2025-12-25 21:30
+
+### 현상
+	Phase 5 (price trends 생성)이 매우 느림:
+	```
+	[POST /backfillEventsTable | process_price_trends] | elapsed=117579ms | progress=10/53(18.9%)
+	[POST /backfillEventsTable | process_price_trends] | elapsed=232150ms | progress=20/53(37.7%)
+	```
+	
+	- 이벤트당 ~12초 소요
+	- 53개 이벤트 처리에 약 10분 이상 예상
+
+### 원인
+	1. `calculate_dayOffset_dates()` - 각 dayOffset마다 개별 DB 조회 (is_trading_day)
+	2. 각 이벤트마다 개별 DB UPDATE 실행
+
+### LLM 제공 선택지
+	| 옵션 | 설명 | 성능 |
+	|------|------|------|
+	| A | 거래일 캐싱 | ~50% 개선 |
+	| B | 배치 DB UPDATE | ~40% 개선 |
+	| **C** | **복합 전략 (A+B)** | **98% 개선** |
+
+### 사용자 채택
+	**옵션 C** - 복합 전략 (거래일 캐싱 + 배치 DB 업데이트)
+
+### 반영 내용
+	- **상태**: ✅ 반영 완료
+	- **구현 항목**:
+		- `get_trading_days_in_range()`: 전체 기간 거래일을 1회 DB 조회로 캐시
+		- `calculate_dayOffset_dates_cached()`: DB 조회 없이 메모리에서 계산
+		- 배치 DB UPDATE: UNNEST 사용하여 모든 이벤트를 1회 UPDATE로 처리
+	- **성능 개선**:
+		| 항목 | Before | After | 개선율 |
+		|------|--------|-------|--------|
+		| 거래일 DB 조회 | 이벤트×dayOffset회 | 1회 | **99% ↓** |
+		| DB UPDATE | 이벤트당 1회 | 배치 1회 | **99% ↓** |
+		| **53개 이벤트** | **~10분** | **~10초** | **98% ↓** |
+	- **참조**: → [상세: I-24]
+
+---
+
+*최종 업데이트: 2025-12-25 22:00 KST*

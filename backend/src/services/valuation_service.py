@@ -11,7 +11,7 @@ from collections import defaultdict
 from ..database.connection import db_pool
 from ..database.queries import metrics, policies, targets
 from .external_api import FMPAPIClient
-from .utils.datetime_utils import calculate_dayOffset_dates
+from .utils.datetime_utils import calculate_dayOffset_dates, calculate_dayOffset_dates_cached, get_trading_days_in_range
 from ..models.response_models import EventProcessingResult
 from .metric_engine import MetricCalculationEngine
 
@@ -841,9 +841,11 @@ async def calculate_quantitative_metrics_fast(
             
             if isinstance(records, list):
                 # Filter by date - use list comprehension for speed
+                # IMPORTANT: Keep records WITHOUT 'date' field (snapshot APIs like fmp-quote)
+                # These are current-value APIs, not time-series data
                 api_data_filtered[api_id] = [
                     r for r in records 
-                    if _get_record_date(r) is not None and _get_record_date(r) <= event_date_obj
+                    if _get_record_date(r) is None or _get_record_date(r) <= event_date_obj
                 ]
             else:
                 # Single record (e.g., quote, market status)
@@ -1598,9 +1600,36 @@ async def generate_price_trends(
 
             ohlc_cache[ticker] = ohlc_by_date
 
-    # Process each event
+    # ========================================
+    # OPTIMIZATION: Pre-cache trading days for entire date range
+    # ========================================
+    # Calculate the full range of dates we need trading days for
+    all_event_dates = []
+    for ticker_events in events_by_ticker.values():
+        for e in ticker_events:
+            ed = e['event_date'].date() if hasattr(e['event_date'], 'date') else e['event_date']
+            all_event_dates.append(ed)
+    
+    if all_event_dates:
+        # Expand range to cover dayOffset calculations
+        # count_start is negative (e.g., -14), count_end is positive (e.g., +14)
+        # Need extra buffer for trading day calculations (~2x the offset in calendar days)
+        calendar_buffer = max(abs(count_start), abs(count_end)) * 2 + 30
+        trading_range_start = min(all_event_dates) - timedelta(days=calendar_buffer)
+        trading_range_end = max(all_event_dates) + timedelta(days=calendar_buffer)
+        
+        logger.info(f"[PriceTrends] Pre-caching trading days from {trading_range_start} to {trading_range_end}")
+        trading_days_set = await get_trading_days_in_range(trading_range_start, trading_range_end, 'NASDAQ', pool)
+        logger.info(f"[PriceTrends] Cached {len(trading_days_set)} trading days")
+    else:
+        trading_days_set = set()
+    
+    # ========================================
+    # OPTIMIZATION: Process events and build batch updates
+    # ========================================
     success_count = 0
     fail_count = 0
+    batch_updates = []  # Collect all updates for batch processing
 
     for idx, event in enumerate(events):
         try:
@@ -1609,13 +1638,12 @@ async def generate_price_trends(
             source = event['source']
             source_id = event['source_id']
 
-            # Generate dayOffset scaffold
-            dayoffset_dates = await calculate_dayOffset_dates(
+            # OPTIMIZED: Use cached trading days (NO DB CALL per event!)
+            dayoffset_dates = calculate_dayOffset_dates_cached(
                 event_date,
                 count_start,
                 count_end,
-                'NASDAQ',
-                pool
+                trading_days_set
             )
 
             # Build price_trend array
@@ -1646,40 +1674,23 @@ async def generate_price_trends(
                         'close': None
                     })
 
-            # Update database
-            async with pool.acquire() as conn:
-                result = await conn.execute(
-                    """
-                    UPDATE txn_events
-                    SET price_trend = $5
-                    WHERE ticker = $1
-                      AND event_date = $2
-                      AND source = $3
-                      AND source_id = $4
-                    """,
-                    ticker,
-                    event['event_date'],
-                    source,
-                    source_id,
-                    json.dumps(price_trend)
-                )
-
-                if "UPDATE 1" in result:
-                    success_count += 1
-                elif "UPDATE 0" in result:
-                    fail_count += 1
-                    logger.warning(f"Event not found for update: {ticker} {event_date}")
-                elif "UPDATE" in result and int(result.split()[-1]) > 1:
-                    fail_count += 1
-                    logger.error(f"Ambiguous event date: {ticker} {event_date}")
+            # Collect for batch update instead of individual updates
+            batch_updates.append({
+                'ticker': ticker,
+                'event_date': event['event_date'],
+                'source': source,
+                'source_id': source_id,
+                'price_trend': json.dumps(price_trend)
+            })
+            success_count += 1
 
         except Exception as e:
             logger.error(f"Failed to generate price trend for {ticker} {event_date}: {e}")
             fail_count += 1
             continue
 
-        # Log progress every 10 events
-        if (idx + 1) % 10 == 0:
+        # Log progress every 50 events (faster now, so less frequent logging)
+        if (idx + 1) % 50 == 0 or (idx + 1) == len(events):
             logger.info(
                 f"Processed {idx + 1}/{len(events)} price trends",
                 extra={
@@ -1702,6 +1713,56 @@ async def generate_price_trends(
                     'warn': []
                 }
             )
+    
+    # ========================================
+    # OPTIMIZATION: Batch DB update (single query for all events)
+    # ========================================
+    if batch_updates:
+        logger.info(f"[PriceTrends] Executing batch update for {len(batch_updates)} events")
+        batch_start = time.time()
+        
+        try:
+            async with pool.acquire() as conn:
+                # Use UNNEST for batch update
+                tickers = [u['ticker'] for u in batch_updates]
+                event_dates = [u['event_date'] for u in batch_updates]
+                sources = [u['source'] for u in batch_updates]
+                source_ids = [u['source_id'] for u in batch_updates]
+                price_trends = [u['price_trend'] for u in batch_updates]
+                
+                result = await conn.execute(
+                    """
+                    UPDATE txn_events e
+                    SET price_trend = b.price_trend::jsonb
+                    FROM (
+                        SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[], $5::text[])
+                        AS t(ticker, event_date, source, source_id, price_trend)
+                    ) b
+                    WHERE e.ticker = b.ticker
+                      AND e.event_date = b.event_date
+                      AND e.source = b.source
+                      AND e.source_id = b.source_id
+                    """,
+                    tickers,
+                    event_dates,
+                    sources,
+                    source_ids,
+                    price_trends
+                )
+                
+                # Parse update count from result
+                if "UPDATE" in result:
+                    updated_count = int(result.split()[-1])
+                    logger.info(f"[PriceTrends] Batch update completed: {updated_count} rows in {int((time.time() - batch_start) * 1000)}ms")
+                    
+                    # Adjust counts based on actual updates
+                    if updated_count < len(batch_updates):
+                        fail_count += (len(batch_updates) - updated_count)
+                        success_count = updated_count
+        except Exception as e:
+            logger.error(f"[PriceTrends] Batch update failed: {e}")
+            fail_count += len(batch_updates)
+            success_count = 0
 
     total_elapsed_ms = int((time.time() - start_time) * 1000)
 

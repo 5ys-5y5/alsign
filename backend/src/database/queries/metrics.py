@@ -281,8 +281,8 @@ async def batch_update_event_valuations(
                 UPDATE txn_events e
                 SET value_quantitative = b.value_quantitative,
                     value_qualitative = b.value_qualitative,
-                    position_quantitative = b.position_quantitative::position,
-                    position_qualitative = b.position_qualitative::position,
+                    position_quantitative = b.position_quantitative::"position",
+                    position_qualitative = b.position_qualitative::"position",
                     disparity_quantitative = b.disparity_quantitative,
                     disparity_qualitative = b.disparity_qualitative
                 FROM batch_data b
@@ -312,8 +312,8 @@ async def batch_update_event_valuations(
                         WHEN e.value_qualitative IS NULL THEN b.value_qualitative
                         ELSE e.value_qualitative
                     END,
-                    position_quantitative = COALESCE(e.position_quantitative, b.position_quantitative::position),
-                    position_qualitative = COALESCE(e.position_qualitative, b.position_qualitative::position),
+                    position_quantitative = COALESCE(e.position_quantitative, b.position_quantitative::"position"),
+                    position_qualitative = COALESCE(e.position_qualitative, b.position_qualitative::"position"),
                     disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
                     disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative)
                 FROM batch_data b

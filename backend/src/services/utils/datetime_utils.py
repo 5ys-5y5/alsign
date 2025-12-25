@@ -157,6 +157,105 @@ async def previous_trading_day(start_date: date, exchange: str, pool: asyncpg.Po
     raise RuntimeError(f"Could not find trading day within 30 days before {start_date}")
 
 
+async def get_trading_days_in_range(
+    start_date: date,
+    end_date: date,
+    exchange: str,
+    pool: asyncpg.Pool
+) -> set:
+    """
+    Get all trading days within a date range (inclusive) as a set.
+    
+    This is optimized to fetch all holidays in one query for fast lookup.
+    
+    Args:
+        start_date: Start of range
+        end_date: End of range
+        exchange: Exchange identifier
+        pool: Database connection pool
+    
+    Returns:
+        Set of trading days (date objects)
+    """
+    # Fetch all holidays in range in ONE query
+    holidays = await pool.fetch(
+        """
+        SELECT date FROM config_lv3_market_holidays 
+        WHERE exchange = $1 
+          AND date >= $2 
+          AND date <= $3 
+          AND is_fully_closed = true
+        """,
+        exchange,
+        start_date,
+        end_date
+    )
+    holiday_set = {h['date'] for h in holidays}
+    
+    # Generate all trading days (weekdays that are not holidays)
+    trading_days = set()
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 5 and current not in holiday_set:  # weekday and not holiday
+            trading_days.add(current)
+        current += timedelta(days=1)
+    
+    return trading_days
+
+
+def calculate_dayOffset_dates_cached(
+    event_date: date,
+    count_start: int,
+    count_end: int,
+    trading_days_set: set
+) -> List[Tuple[int, date]]:
+    """
+    Generate (dayOffset, targetDate) pairs using pre-cached trading days.
+    
+    NO DB CALLS - uses pre-fetched trading_days_set for fast calculation.
+    
+    Args:
+        event_date: Event date (may be non-trading day)
+        count_start: Starting dayOffset (typically negative, e.g., -14)
+        count_end: Ending dayOffset (typically positive, e.g., +14)
+        trading_days_set: Pre-fetched set of trading days
+    
+    Returns:
+        List of (dayOffset, targetDate) tuples sorted by dayOffset
+    """
+    # Convert set to sorted list for binary search-like operations
+    trading_days_sorted = sorted(trading_days_set)
+    
+    # Find base_date (first trading day on or after event_date)
+    base_date = None
+    for td in trading_days_sorted:
+        if td >= event_date:
+            base_date = td
+            break
+    
+    if base_date is None:
+        # Fallback: use event_date itself
+        base_date = event_date
+    
+    # Find index of base_date in sorted trading days
+    try:
+        base_idx = trading_days_sorted.index(base_date)
+    except ValueError:
+        # base_date not in trading days (shouldn't happen, but handle gracefully)
+        return [(0, event_date)]
+    
+    results = []
+    
+    # Generate all offsets from count_start to count_end
+    for offset in range(count_start, count_end + 1):
+        target_idx = base_idx + offset
+        if 0 <= target_idx < len(trading_days_sorted):
+            results.append((offset, trading_days_sorted[target_idx]))
+        # else: out of range, skip this offset
+    
+    return results
+
+
 async def calculate_dayOffset_dates(
     event_date: date,
     count_start: int,

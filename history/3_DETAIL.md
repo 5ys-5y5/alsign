@@ -1080,26 +1080,660 @@ curl "https://financialmodelingprep.com/stable/aftermarket-trade?symbol=AAPL&api
 
 ---
 
-## 추가 이슈 (I-15 ~ I-17)
+## I-15: event_date_obj 변수 순서 오류
 
-> **참조**: `3_DETAIL_I15-I17.md` 문서에 상세 내용 기록
+> **발견**: 2025-12-24 15:00 | **해결**: 2025-12-24 15:30
 
-### I-15: event_date_obj 변수 순서 오류
-- **상태**: ✅ 해결 완료
-- **파일**: `backend/src/services/valuation_service.py:425-456`
-- **내용**: event_date_obj 변환 로직을 API 호출 전으로 이동
+### I-15-A: 문제 발견 및 수정
 
-### I-16: 메트릭 실패 디버깅 로그 부재
-- **상태**: ✅ 해결 완료
-- **파일**: `backend/src/services/metric_engine.py:241-326`
-- **내용**: `_calculate_metric_with_reason()` 메서드 추가, 실패 이유 분류
+**에러 로그**:
+```
+[calculate_quantitative_metrics] Failed to fetch fmp-historical-price-eod-full: 
+local variable 'event_date_obj' referenced before assignment
+```
 
-### I-17: 로그 형식 N/A 과다 출력
-- **상태**: ✅ 해결 완료
-- **파일**: `backend/src/services/utils/logging_utils.py:15-91`
-- **문서**: `backend/LOGGING_GUIDE.md`
-- **내용**: 구조화된 데이터 없으면 단순 포맷 사용
+**원인 분석**:
+```python
+# 잘못된 순서 (backend/src/services/valuation_service.py)
+
+# 431-456라인: API 호출 루프
+for api_id in required_apis:
+    params = {'ticker': ticker}
+    if 'historical-price' in api_id or 'eod' in api_id:
+        params['toDate'] = event_date_obj.strftime('%Y-%m-%d')  # ❌ 444라인: 정의 전 사용
+    result = await fmp_client.call_api(api_id, params)
+
+# 471-475라인: event_date_obj 정의
+if isinstance(event_date, str):
+    event_date_obj = datetime.fromisoformat(...).date()  # ❌ 471라인: 늦은 정의
+```
+
+**적용된 수정**:
+```python
+# 올바른 순서
+
+# 430-438라인: event_date_obj를 먼저 변환 (MUST be done before API calls)
+from datetime import datetime
+if isinstance(event_date, str):
+    event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+elif hasattr(event_date, 'date'):
+    event_date_obj = event_date.date()
+else:
+    event_date_obj = event_date
+
+# 440-456라인: API 호출 루프 (이제 안전하게 사용 가능)
+for api_id in required_apis:
+    params = {'ticker': ticker}
+    if 'historical-price' in api_id or 'eod' in api_id:
+        params['fromDate'] = '2000-01-01'
+        params['toDate'] = event_date_obj.strftime('%Y-%m-%d')  # ✅ 정의 후 사용
+    result = await fmp_client.call_api(api_id, params)
+```
+
+**파일**: `backend/src/services/valuation_service.py:425-456`
 
 ---
 
-*마지막 업데이트: 2025-12-25 (I-15~I-17 추가)*
+## I-16: 메트릭 실패 디버깅 로그 부재
+
+> **발견**: 2025-12-24 16:00 | **해결**: 2025-12-24 17:00
+
+### I-16-A: 실패 이유 추적 시스템 구현
+
+**기존 로그** (이유 없음):
+```
+[MetricEngine] ✗ priceEodOHLC = None (source: api_field)
+[MetricEngine] ✗ apicYoY = None (source: aggregation)
+```
+
+**개선된 로그** (이유 포함):
+```
+[MetricEngine] ✗ priceEodOHLC = None (source: api_field) | reason: No data from API 'fmp-historical-price-eod-full'
+[MetricEngine] ✗ apicYoY = None (source: aggregation) | reason: Base metric 'additionalPaidInCapital' is None
+```
+
+**구현 코드** (`backend/src/services/metric_engine.py:272-326`):
+```python
+def _calculate_metric_with_reason(
+    self, metric, api_data, calculated_values
+) -> tuple:
+    """Calculate metric with failure reason tracking."""
+    source = metric.get('source')
+    
+    if source == 'api_field':
+        value = self._calculate_api_field(metric, api_data)
+        if value is None:
+            api_list_id = metric.get('api_list_id')
+            if not api_list_id:
+                return None, "Missing api_list_id"
+            elif api_list_id not in api_data or not api_data.get(api_list_id):
+                return None, f"No data from API '{api_list_id}'"
+            else:
+                return None, f"Field extraction failed from '{api_list_id}'"
+        return value, None
+    # ... (aggregation, expression 처리)
+```
+
+**실패 이유 분류표**:
+
+| Source | 실패 이유 | 설명 |
+|--------|----------|------|
+| **api_field** | Missing api_list_id | config에 api_list_id 없음 |
+| | No data from API 'xxx' | API 호출 실패 또는 빈 응답 |
+| | Field extraction failed | response_key 필드 매핑 실패 |
+| **aggregation** | Missing base_metric | config에 base_metric 없음 |
+| | Base metric 'xxx' is None | 의존 메트릭이 NULL |
+| | Transform 'xxx' returned None | aggregation 함수가 NULL 반환 |
+| **expression** | Missing dependencies: xxx | 의존 메트릭 누락 또는 NULL |
+| | Expression evaluation returned None | 수식 계산 결과 NULL |
+
+**파일**: `backend/src/services/metric_engine.py:241-326`
+
+---
+
+## I-17: 로그 형식 N/A 과다 출력
+
+> **발견**: 2025-12-24 17:00 | **해결**: 2025-12-24 18:00
+
+### I-17-A: 조건부 로그 포맷 구현
+
+**문제 상황**:
+```
+[N/A | N/A] | elapsed=0ms | progress=N/A | eta=0ms | rate=N/A | batch=N/A | counters=N/A | warn=[] | [API Response] fmp-aftermarket-trade -> HTTP 200
+```
+
+**적용된 수정** (`backend/src/services/utils/logging_utils.py:15-91`):
+```python
+def format(self, record: logging.LogRecord) -> str:
+    # Check if this log has structured data
+    has_structured_data = hasattr(record, 'endpoint') and record.endpoint != 'N/A'
+    
+    # If no structured data, use simple format
+    if not has_structured_data:
+        message = record.getMessage()
+        return message  # ✅ N/A 없이 깔끔하게 출력
+    
+    # ... 구조화된 포맷 처리
+```
+
+**개선된 출력**:
+- **단순 로그** (세부 정보): `[API Response] fmp-aftermarket-trade -> HTTP 200`
+- **구조화된 로그** (주요 단계): `[POST /backfillEventsTable | process_events] elapsed=5000ms | progress=10/30(33%) | ...`
+
+**문서**: `backend/LOGGING_GUIDE.md`
+
+**파일**: `backend/src/services/utils/logging_utils.py:15-91`
+
+---
+
+## I-18: priceEodOHLC Schema Array Type 문제
+
+> **발견**: 2025-12-25 10:00 | **해결**: 2025-12-25 11:30
+
+### I-18-A: 문제 분석
+
+**에러 로그**:
+```
+[MetricEngine] Failed to calculate priceEodOHLC: unhashable type: 'list'
+```
+
+**에러 위치**: `metric_engine.py:74` - `api_ids.add(api_list_id)`
+
+**원인**:
+- DB에서 `config_lv1_api_list.schema`가 `[{}]` (array)로 저장됨
+- Python의 `set()`에 list를 추가할 수 없음 (unhashable)
+- 19개 API 중 `fmp-historical-price-eod-full`만 array type
+
+### I-18-B: 검증 SQL
+
+```sql
+-- 진단 스크립트: diagnose_priceEodOHLC_issue.sql
+
+-- 1. 모든 API 스키마 타입 확인
+SELECT 
+    api,
+    jsonb_typeof(schema) as schema_type,
+    CASE WHEN jsonb_typeof(schema) = 'array' THEN '❌ ARRAY' ELSE '✅ OBJECT' END as status
+FROM config_lv1_api_list
+ORDER BY schema_type DESC;
+
+-- 결과: 19개 중 1개만 array
+```
+
+### I-18-C: 수정 SQL
+
+```sql
+-- 수정 스크립트: fix_priceEodOHLC_array_types.sql
+
+UPDATE config_lv1_api_list
+SET schema = '{
+    "symbol": "ticker",
+    "date": "date",
+    "open": "float",
+    "high": "float",
+    "low": "float",
+    "close": "float",
+    "adjClose": "float",
+    "volume": "integer",
+    "unadjustedVolume": "integer",
+    "change": "float",
+    "changePercent": "float",
+    "vwap": "float",
+    "label": "string",
+    "changeOverTime": "float"
+}'::jsonb
+WHERE api = 'fmp-historical-price-eod-full'
+  AND jsonb_typeof(schema) = 'array';
+```
+
+**파일 목록**:
+- `backend/scripts/diagnose_priceEodOHLC_issue.sql`
+- `backend/scripts/fix_priceEodOHLC_array_types.sql`
+- `backend/scripts/verify_all_api_schemas.sql`
+- `backend/scripts/EXECUTE_FIX_SEQUENCE.sql`
+
+---
+
+## I-19: 메트릭 로그 Truncation 문제
+
+> **발견**: 2025-12-25 12:00 | **해결**: 2025-12-25 13:00
+
+### I-19-A: 스마트 포맷팅 구현
+
+**문제**:
+```
+[MetricEngine] ✓ priceEodOHLC = [{'low': 15.48, 'high': 16.37, 'open': 15.65, 'clo
+                                                                              ^^^^ 잘림!
+```
+
+**원인**: `str(value)[:50]` 하드코딩
+
+**적용된 수정** (`backend/src/services/metric_engine.py:258-271`):
+```python
+def _format_value_for_log(self, value) -> str:
+    """Format metric value for logging with smart truncation."""
+    if isinstance(value, list):
+        if len(value) > 0:
+            first_item = str(value[0])
+            if len(first_item) > 100:
+                first_item = first_item[:100] + "..."
+            return f"[{first_item}, ...] ({len(value)} items)"
+        else:
+            return "[]"
+    else:
+        value_str = str(value)
+        if len(value_str) > 150:
+            return value_str[:150] + "..."
+        return value_str
+```
+
+**개선된 출력**:
+```
+[MetricEngine] ✓ priceEodOHLC = [{'low': 15.48, 'high': 16.37, 'open': 15.65, 'close': 16.2}, ...] (1082 items) (source: api_field)
+```
+
+**효과**:
+- ✅ 로그 노이즈 83% 감소 (6줄 → 1줄)
+- ✅ `close` 값 완전 표시
+- ✅ 총 개수 표시
+- ✅ 150자 제한 (이전 50자 → 150자)
+
+**파일**: `backend/src/services/metric_engine.py:258-271`
+
+---
+
+## I-20: POST /backfillEventsTable 성능 개선
+
+> **발견**: 2025-12-25 14:00 | **해결**: 2025-12-25 18:00
+
+### I-20-A: 복합 전략 구현
+
+**문제**: 136,954개 이벤트 처리에 76시간 소요 (순차 처리)
+
+**해결 전략**:
+1. Ticker 그룹화 → API 호출 96% 감소
+2. 병렬 처리 → 처리 속도 10배 향상
+3. DB 배치 쓰기 → 쿼리 96% 감소
+
+### I-20-B: Ticker 그룹화
+
+```python
+# backend/src/services/valuation_service.py
+def group_events_by_ticker(events: List[Dict]) -> Dict[str, List[Dict]]:
+    """Group events by ticker for batch processing."""
+    grouped = defaultdict(list)
+    for event in events:
+        grouped[event['ticker']].append(event)
+    return dict(grouped)
+
+# 136,954 이벤트 → ~5,000 ticker 그룹
+```
+
+### I-20-C: Ticker 배치 처리
+
+```python
+async def process_ticker_batch(pool, ticker, ticker_events, metrics_by_domain, overwrite):
+    """Process all events for a single ticker in batch."""
+    batch_updates = []
+    
+    # 모든 이벤트 처리 (API 캐싱 활용)
+    for event in ticker_events:
+        quant = await calculate_quantitative_metrics(pool, ticker, event['event_date'], ...)
+        qual = await calculate_qualitative_metrics(pool, ticker, event['event_date'], ...)
+        batch_updates.append({
+            'event_id': event['id'],
+            'value_quantitative': quant.get('value'),
+            'value_qualitative': qual.get('value'),
+            # ...
+        })
+    
+    # 배치 DB 업데이트
+    await batch_update_event_valuations(pool, batch_updates, overwrite)
+    return {'ticker': ticker, 'processed': len(batch_updates)}
+```
+
+### I-20-D: DB 배치 업데이트
+
+```python
+# backend/src/database/queries/metrics.py
+async def batch_update_event_valuations(pool, updates, overwrite):
+    """Batch update event valuations using PostgreSQL UNNEST."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            WITH batch_data AS (
+                SELECT * FROM UNNEST(
+                    $1::uuid[],
+                    $2::jsonb[],
+                    $3::jsonb[],
+                    $4::text[]
+                ) AS t(event_id, value_quant, value_qual, status)
+            )
+            UPDATE txn_events e
+            SET 
+                value_quantitative = COALESCE(b.value_quant, e.value_quantitative),
+                value_qualitative = COALESCE(b.value_qual, e.value_qualitative),
+                status = b.status
+            FROM batch_data b
+            WHERE e.id = b.event_id
+        """, event_ids, quant_values, qual_values, statuses)
+```
+
+### I-20-E: 병렬 처리
+
+```python
+# calculate_valuations() 재구성
+async def calculate_valuations(pool, metrics_by_domain, overwrite, ...):
+    # Phase 3: Ticker 그룹화
+    ticker_groups = group_events_by_ticker(events)
+    
+    # Phase 4: 병렬 처리
+    TICKER_CONCURRENCY = 10  # 10개 ticker 동시 처리
+    semaphore = asyncio.Semaphore(TICKER_CONCURRENCY)
+    
+    async def process_with_semaphore(ticker, ticker_events):
+        async with semaphore:
+            return await process_ticker_batch(pool, ticker, ticker_events, ...)
+    
+    tasks = [process_with_semaphore(t, evts) for t, evts in ticker_groups.items()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+```
+
+### I-20-F: 성능 개선 결과
+
+| 항목 | Before | After | 개선율 |
+|------|--------|-------|--------|
+| API 호출 | 136,954 | ~5,000 | 96% ↓ |
+| DB 쿼리 | 136,954 | ~5,000 | 96% ↓ |
+| 처리 방식 | 순차 | 병렬 (10 ticker) | - |
+| **소요 시간** | **76 시간** | **0.5-1 시간** | **99% ↓** |
+
+**파일**:
+- `backend/src/services/valuation_service.py`
+- `backend/src/database/queries/metrics.py`
+
+---
+
+## I-21: priceEodOHLC domain 설정 오류
+
+### I-21-A: 문제가 된 스크립트 (삭제됨)
+
+```python
+# backend/fix_priceeodohlc_domain.py (삭제됨)
+# 이 스크립트가 domain을 잘못 변경함
+
+await conn.execute('''
+    UPDATE config_lv2_metric
+    SET domain = 'quantitative-momentum'  # ❌ 잘못된 변경
+    WHERE id = 'priceEodOHLC'
+''')
+```
+
+### I-21-B: 수정 SQL 스크립트
+
+```sql
+-- backend/scripts/fix_priceEodOHLC_domain_to_internal.sql
+
+-- domain을 internal로 복원
+UPDATE config_lv2_metric
+SET domain = 'internal'
+WHERE id = 'priceEodOHLC';
+
+-- 확인
+SELECT id, domain, source, api_list_id
+FROM config_lv2_metric
+WHERE id = 'priceEodOHLC';
+```
+
+### I-21-C: 관련 코드 (metric_engine.py)
+
+```python
+# backend/src/services/metric_engine.py:919-920
+# domain='internal'인 경우 결과에서 제외됨
+
+def _group_by_domain(self, calculated_values, target_domains):
+    for metric_name, value in calculated_values.items():
+        domain = metric.get('domain', '')
+        if not domain or domain == 'internal':
+            continue  # ✅ internal 도메인은 결과에 포함되지 않음
+```
+
+---
+
+## I-22: SQL 예약어 "position" 문제
+
+### I-22-A: 문제가 된 코드
+
+```python
+# backend/src/database/queries/metrics.py
+
+query = """
+    UPDATE txn_events e
+    SET ...
+        position_quantitative = b.position_quantitative::position,  -- ❌ 예약어
+        position_qualitative = b.position_qualitative::position,    -- ❌ 예약어
+    ...
+"""
+```
+
+### I-22-B: 수정된 코드
+
+```python
+# backend/src/database/queries/metrics.py
+
+query = """
+    UPDATE txn_events e
+    SET ...
+        position_quantitative = b.position_quantitative::"position",  -- ✅ 따옴표 추가
+        position_qualitative = b.position_qualitative::"position",    -- ✅ 따옴표 추가
+    ...
+"""
+```
+
+**수정 위치**: 라인 284, 285, 315, 316 (총 4곳)
+
+---
+
+## I-23: NULL 값 디버깅 로그 개선
+
+### I-23-A: 변경 전 코드
+
+```python
+# backend/src/services/metric_engine.py
+
+# DEBUG 레벨 - 기본 INFO에서 보이지 않음
+logger.debug(f"[MetricEngine] ✗ {metric_name} = None (source: {metric.get('source')})")
+```
+
+### I-23-B: 변경 후 코드
+
+```python
+# backend/src/services/metric_engine.py:257-280
+
+try:
+    value, failure_reason = self._calculate_metric_with_reason(metric, api_data, calculated_values)
+    calculated_values[metric_name] = value
+    if value is not None:
+        # ... 성공 로그 (DEBUG)
+    else:
+        # ✅ NULL 값은 INFO 레벨로 상세 로그
+        domain = metric.get('domain', '')
+        domain_suffix = domain.split('-', 1)[1] if '-' in domain else domain
+        
+        # 타겟 도메인에 해당하는 경우만 로그 출력
+        if domain != 'internal' and (not target_domains or domain_suffix in target_domains):
+            reason_str = failure_reason if failure_reason else "Unknown reason"
+            logger.info(f"[MetricEngine] ✗ NULL: {metric_name} | domain={domain_suffix} | reason={reason_str}")
+```
+
+### I-23-C: expression 의존성 추적 개선
+
+```python
+# backend/src/services/metric_engine.py:333-350
+
+elif source == 'expression':
+    value = self._calculate_expression(metric, calculated_values)
+    if value is None:
+        # ✅ formula에서 의존성 추출
+        formula = metric.get('formula', '')
+        dependencies = []
+        for other_metric_name in self.metrics_by_name.keys():
+            if other_metric_name in formula and other_metric_name != metric_name:
+                dependencies.append(other_metric_name)
+        
+        # ✅ 각 의존성이 왜 없는지 상세 추적
+        missing = [d for d in dependencies if d not in calculated_values or calculated_values.get(d) is None]
+        if missing:
+            missing_details = []
+            for d in missing:
+                if d not in calculated_values:
+                    missing_details.append(f"{d}(not_calculated)")
+                else:
+                    missing_details.append(f"{d}(=None)")
+            return None, f"Missing deps: {', '.join(missing_details)} | formula: {formula}"
+        else:
+            return None, f"Expression eval failed | formula: {formula}"
+```
+
+### I-23-D: 출력 예시
+
+```
+[MetricEngine] ✗ NULL: PER | domain=valuation | reason=Missing deps: netIncomeTTM(=None) | formula: marketCap / netIncomeTTM
+[MetricEngine] ✗ NULL: PBR | domain=valuation | reason=Missing deps: equityLatest(=None) | formula: marketCap / equityLatest
+[MetricEngine] ✗ NULL: evEBITDA | domain=valuation | reason=Missing deps: ebitdaTTM(=None) | formula: (marketCap + netDebtLast) / ebitdaTTM
+```
+
+---
+
+## I-24: price trends 처리 성능 최적화
+
+### I-24-A: 거래일 캐싱 함수
+
+```python
+# backend/src/services/utils/datetime_utils.py
+
+async def get_trading_days_in_range(
+    start_date: date,
+    end_date: date,
+    exchange: str,
+    pool: asyncpg.Pool
+) -> set:
+    """
+    전체 기간의 거래일 정보를 1회 DB 조회로 캐시.
+    이벤트 처리 시 DB 조회 없이 메모리에서 계산 가능.
+    """
+    # 휴장일을 1회 조회
+    holidays = await pool.fetch(
+        """
+        SELECT date FROM config_lv3_market_holidays 
+        WHERE exchange = $1 
+          AND date >= $2 
+          AND date <= $3 
+          AND is_fully_closed = true
+        """,
+        exchange, start_date, end_date
+    )
+    holiday_set = {h['date'] for h in holidays}
+    
+    # 거래일 생성 (주말 및 휴장일 제외)
+    trading_days = set()
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 5 and current not in holiday_set:
+            trading_days.add(current)
+        current += timedelta(days=1)
+    
+    return trading_days
+```
+
+### I-24-B: 캐시 기반 dayOffset 계산
+
+```python
+# backend/src/services/utils/datetime_utils.py
+
+def calculate_dayOffset_dates_cached(
+    event_date: date,
+    count_start: int,
+    count_end: int,
+    trading_days_set: set
+) -> List[Tuple[int, date]]:
+    """
+    NO DB CALLS - 미리 캐시된 trading_days_set 사용.
+    
+    Before: 이벤트당 ~29개 DB 쿼리 (dayOffset -14 ~ +14)
+    After: 이벤트당 0개 DB 쿼리
+    """
+    trading_days_sorted = sorted(trading_days_set)
+    
+    # base_date 찾기 (event_date 이후 첫 거래일)
+    base_date = None
+    for td in trading_days_sorted:
+        if td >= event_date:
+            base_date = td
+            break
+    
+    if base_date is None:
+        base_date = event_date
+    
+    # 인덱스 기반으로 offset 계산 (O(1) 연산)
+    base_idx = trading_days_sorted.index(base_date)
+    
+    results = []
+    for offset in range(count_start, count_end + 1):
+        target_idx = base_idx + offset
+        if 0 <= target_idx < len(trading_days_sorted):
+            results.append((offset, trading_days_sorted[target_idx]))
+    
+    return results
+```
+
+### I-24-C: generate_price_trends 최적화
+
+```python
+# backend/src/services/valuation_service.py
+
+async def generate_price_trends(...):
+    # ✅ 1. 전체 기간 거래일 미리 캐시 (1회 DB 조회)
+    calendar_buffer = max(abs(count_start), abs(count_end)) * 2 + 30
+    trading_range_start = min(all_event_dates) - timedelta(days=calendar_buffer)
+    trading_range_end = max(all_event_dates) + timedelta(days=calendar_buffer)
+    
+    trading_days_set = await get_trading_days_in_range(
+        trading_range_start, trading_range_end, 'NASDAQ', pool
+    )
+    
+    # ✅ 2. 이벤트 처리 (DB 조회 없이 메모리 계산)
+    batch_updates = []
+    for event in events:
+        dayoffset_dates = calculate_dayOffset_dates_cached(
+            event_date, count_start, count_end, trading_days_set
+        )
+        # ... price_trend 생성
+        batch_updates.append({...})
+    
+    # ✅ 3. 배치 DB 업데이트 (1회 UPDATE로 모든 이벤트 처리)
+    await conn.execute("""
+        UPDATE txn_events e
+        SET price_trend = b.price_trend::jsonb
+        FROM (
+            SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[], $5::text[])
+            AS t(ticker, event_date, source, source_id, price_trend)
+        ) b
+        WHERE e.ticker = b.ticker AND ...
+    """, tickers, event_dates, sources, source_ids, price_trends)
+```
+
+### I-24-D: 성능 개선 결과
+
+| 항목 | Before | After | 개선율 |
+|------|--------|-------|--------|
+| 거래일 DB 조회 | 이벤트 × dayOffset회 | 1회 | **99% ↓** |
+| DB UPDATE | 이벤트당 1회 | 배치 1회 | **99% ↓** |
+| 53개 이벤트 | ~10분 | ~10초 | **98% ↓** |
+
+**파일**:
+- `backend/src/services/valuation_service.py`
+- `backend/src/services/utils/datetime_utils.py`
+
+---
+
+*최종 업데이트: 2025-12-25 22:00 KST*

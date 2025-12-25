@@ -271,9 +271,15 @@ class MetricCalculationEngine:
                     
                     logger.debug(f"[MetricEngine] ✓ {metric_name} = {value_str} (source: {metric.get('source')})")
                 else:
-                    # Include failure reason for debugging
-                    reason_str = f" | reason: {failure_reason}" if failure_reason else ""
-                    logger.debug(f"[MetricEngine] ✗ {metric_name} = None (source: {metric.get('source')}){reason_str}")
+                    # Log NULL values with reason at INFO level for visibility
+                    # This helps distinguish between: API data missing vs calculation failure
+                    domain = metric.get('domain', '')
+                    domain_suffix = domain.split('-', 1)[1] if '-' in domain else domain
+                    
+                    # Only log for target domains (not internal metrics)
+                    if domain != 'internal' and (not target_domains or domain_suffix in target_domains):
+                        reason_str = failure_reason if failure_reason else "Unknown reason"
+                        logger.info(f"[MetricEngine] ✗ NULL: {metric_name} | domain={domain_suffix} | reason={reason_str}")
             except Exception as e:
                 logger.error(f"[MetricEngine] Failed to calculate {metric_name}: {e}")
                 calculated_values[metric_name] = None
@@ -327,12 +333,26 @@ class MetricCalculationEngine:
         elif source == 'expression':
             value = self._calculate_expression(metric, calculated_values)
             if value is None:
-                dependencies = metric.get('dependencies', [])
+                # Extract dependencies from formula if not explicitly provided
+                formula = metric.get('formula', '')
+                dependencies = []
+                for other_metric_name in self.metrics_by_name.keys():
+                    if other_metric_name in formula and other_metric_name != metric_name:
+                        dependencies.append(other_metric_name)
+                
+                # Check which dependencies are missing or None
                 missing = [d for d in dependencies if d not in calculated_values or calculated_values.get(d) is None]
                 if missing:
-                    return None, f"Missing dependencies: {', '.join(missing)}"
+                    # Include why each dependency is None for debugging
+                    missing_details = []
+                    for d in missing:
+                        if d not in calculated_values:
+                            missing_details.append(f"{d}(not_calculated)")
+                        else:
+                            missing_details.append(f"{d}(=None)")
+                    return None, f"Missing deps: {', '.join(missing_details)} | formula: {formula}"
                 else:
-                    return None, "Expression evaluation returned None"
+                    return None, f"Expression eval failed | formula: {formula}"
             return value, None
             
         else:

@@ -361,6 +361,11 @@ async def stream_backfill_events_table(
                     )
 
                     # Send final result
+                    # Convert EventProcessingResult objects to dicts for JSON serialization
+                    results_serializable = [
+                        r.model_dump() if hasattr(r, 'model_dump') else (r.dict() if hasattr(r, 'dict') else r)
+                        for r in result['results']
+                    ]
                     await log_queue.put(json.dumps({
                         'type': 'result',
                         'data': {
@@ -368,7 +373,7 @@ async def stream_backfill_events_table(
                             'endpoint': 'POST /backfillEventsTable',
                             'overwrite': params.overwrite,
                             'summary': result['summary'],
-                            'results': result['results'],
+                            'results': results_serializable,
                             'statusCode': status_code
                         }
                     }))

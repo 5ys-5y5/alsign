@@ -1,244 +1,239 @@
 # 📋 AlSign 이슈 체크리스트
 
-> 이 문서는 서비스의 모든 이슈들의 반영 상태를 한눈에 파악할 수 있도록 정리한 체크리스트입니다.
+> **목적**: 서비스의 모든 이슈들의 반영 상태를 한눈에 파악
 > 
 > **범례**: ✅ 반영완료 | 🔄 부분반영 | ❌ 미반영 | ⏸️ 보류
 > 
-> **문서 연결**: 체크리스트 항목 → `2_FLOW.md` (흐름도) → `3_DETAIL.md` (상세도)
+> **문서 연결**: 체크리스트(여기) → `2_FLOW.md` (흐름도) → `3_DETAIL.md` (상세도)
 > 
-> **최종 DB 검증**: 2025-12-24 - `backend/scripts/verify_checklist_items.py` 실행 완료
+> **최종 업데이트**: 2025-12-25 21:30 KST
 
 ---
 
-## 1. Config & 메트릭 설정 이슈
+## 📊 전체 요약 테이블
 
-### I-01: consensusSignal 설정 불일치
-	- ✅ expression을 NULL로 변경 (DB 반영완료)
-	- ✅ aggregation 방식으로 변경 (DB 반영완료)
-	- ✅ aggregation_kind = 'leadPairFromList' (DB 반영완료)
-	- ✅ leadPairFromList aggregation 구현 (MetricCalculationEngine 코드 완료)
-	- ✅ _lead_pair_from_list() 메서드 추가 (metric_engine.py)
-	- ✅ 테스트 완료 (test_lead_pair_from_list.py 통과)
-	- ⏸️ db_field source 타입 구현 (선택사항, 현재 불필요)
-	- ⏸️ consensusRaw 메트릭 추가 (선택사항, 현재 불필요)
+| ID | 이슈명 | 상태 | 발견일 | 해결일 | DB | 흐름도 | 상세도 |
+|----|--------|------|--------|--------|-----|--------|--------|
+| I-01 | consensusSignal 설정 불일치 | ✅ | 2025-12-23 | 2025-12-24 | ✅ | #I-01 | #I-01 |
+| I-02 | priceEodOHLC dict response_key | ✅ | 2025-12-23 | 2025-12-23 | N/A | #I-02 | #I-02 |
+| I-03 | targetMedian & consensusSummary | ✅ | 2025-12-23 | 2025-12-23 | N/A | #I-03 | #I-03 |
+| I-04 | 짧은 이름 메트릭 | ⏸️ | 2025-12-23 | - | N/A | #I-04 | - |
+| I-05 | consensus 메트릭 추가 | ✅ | 2025-12-23 | 2025-12-24 | ✅ | #I-05 | #I-05 |
+| I-06 | consensusWithPrev | ✅ | 2025-12-23 | 2025-12-24 | N/A | #I-06 | - |
+| I-07 | source_id 파라미터 누락 | ✅ | 2025-12-23 | 2025-12-23 | N/A | #I-07 | #I-07 |
+| I-08 | 시간적 유효성 문제 | ✅ | 2025-12-23 | 2025-12-23 | N/A | #I-08 | #I-08 |
+| I-09 | Topological Sort 순서 오류 | ✅ | 2025-12-23 | 2025-12-23 | N/A | #I-09 | #I-09 |
+| I-10 | priceEodOHLC_dateRange 정책 | ✅ | 2025-12-24 | 2025-12-24 | ✅ | #I-10 | #I-10 |
+| I-11 | internal(qual) 메트릭 동적 | ✅ | 2025-12-24 | 2025-12-24 | ✅ | #I-11 | #I-11 |
+| I-12 | 동적 계산 코드 syntax 오류 | ✅ | 2025-12-24 | 2025-12-24 | ✅ | #I-12 | #I-12 |
+| I-13 | priceEodOHLC API 파라미터 누락 | ✅ | 2025-12-24 | 2025-12-24 | N/A | #I-13 | #I-13 |
+| I-14 | aftermarket API 401 오류 | ⏸️ | 2025-12-24 | - | N/A | #I-14 | #I-14 |
+| I-15 | event_date_obj 변수 순서 오류 | ✅ | 2025-12-24 | 2025-12-24 | N/A | #I-15 | #I-15 |
+| I-16 | 메트릭 실패 디버깅 로그 부재 | ✅ | 2025-12-24 | 2025-12-24 | N/A | #I-16 | #I-16 |
+| I-17 | 로그 형식 N/A 과다 출력 | ✅ | 2025-12-24 | 2025-12-24 | N/A | #I-17 | #I-17 |
+| I-18 | priceEodOHLC Schema Array Type | ✅ | 2025-12-25 | 2025-12-25 | ✅ | #I-18 | #I-18 |
+| I-19 | 메트릭 로그 Truncation 문제 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-19 | #I-19 |
+| I-20 | backfillEventsTable 성능 개선 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-20 | #I-20 |
+| I-21 | priceEodOHLC domain 설정 오류 | ✅ | 2025-12-25 | 2025-12-25 | ✅ | #I-21 | #I-21 |
+| I-22 | SQL 예약어 "position" 문제 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-22 | #I-22 |
+| I-23 | NULL 값 디버깅 로그 개선 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-23 | #I-23 |
+| I-24 | price trends 처리 성능 최적화 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-24 | #I-24 |
 
-### I-02: priceEodOHLC dict response_key
+---
+
+## 1. Config & 메트릭 설정 이슈 (I-01 ~ I-06)
+
+### I-01: consensusSignal 설정 불일치 ✅
+	발견: 2025-12-23 | 해결: 2025-12-24
+	- ✅ expression을 NULL로 변경 (DB)
+	- ✅ aggregation 방식으로 변경 (DB)
+	- ✅ aggregation_kind = 'leadPairFromList' (DB)
+	- ✅ _lead_pair_from_list() 메서드 구현 (Python)
+	- ⏸️ db_field source 타입 구현 (선택, 불필요)
+	- ⏸️ consensusRaw 메트릭 추가 (선택, 불필요)
+
+### I-02: priceEodOHLC dict response_key ✅
+	발견: 2025-12-23 | 해결: 2025-12-23
 	- ✅ dict response_key 지원 확인 (이미 구현됨)
-	- ✅ 조치 불필요 확인 (정상 작동)
+	- ✅ 조치 불필요 확인
 
-### I-03: targetMedian & consensusSummary 구현
-	- ✅ Python 코드 수정 완료 (calculate_qualitative_metrics)
-	- ✅ MetricCalculationEngine 사용하여 fmp-price-target-consensus API 호출
-	- ✅ value_qualitative에 targetMedian, consensusSummary, consensusSignal 포함
+### I-03: targetMedian & consensusSummary 구현 ✅
+	발견: 2025-12-23 | 해결: 2025-12-23
+	- ✅ calculate_qualitative_metrics() 수정
+	- ✅ MetricCalculationEngine 사용
+	- ✅ value_qualitative에 세 항목 포함
 
-### I-04: 짧은 이름 메트릭 (rnd, totalEquity, otherNCL)
+### I-04: 짧은 이름 메트릭 ⏸️
+	발견: 2025-12-23 | 보류
 	- ⏸️ 조치 보류 (현재 긴 이름으로 정상 작동)
 
-### I-05: consensus 메트릭 추가
-	- ✅ SQL 스크립트 작성 및 실행완료 (DB 반영완료)
-	- ✅ fmp-price-target API 설정 (DB 반영완료)
-	- ✅ response_key 12개 필드 매핑 (DB 반영완료)
+### I-05: consensus 메트릭 추가 ✅
+	발견: 2025-12-23 | 해결: 2025-12-24
+	- ✅ SQL 스크립트 작성 및 실행완료 (DB)
+	- ✅ fmp-price-target API 설정 (DB)
+	- ✅ response_key 12개 필드 매핑 (DB)
 
-### I-06: consensusWithPrev
+### I-06: consensusWithPrev ✅
+	발견: 2025-12-23 | 해결: 2025-12-24
 	- ✅ 조치 불필요 (I-01의 개선안으로 해결)
 
 ---
 
-## 2. 코드 품질 이슈
+## 2. 코드 품질 이슈 (I-07 ~ I-09)
 
-### I-07: source_id 파라미터 누락
-	- ✅ calculate_qualitative_metrics()에 source_id 파라미터 추가
-	- ✅ select_consensus_data()에 source_id 파라미터 추가
-	- ✅ 정확한 evt_consensus 행 조회 가능
+### I-07: source_id 파라미터 누락 ✅
+	발견: 2025-12-23 | 해결: 2025-12-23
+	- ✅ calculate_qualitative_metrics()에 source_id 추가
+	- ✅ select_consensus_data()에 source_id 추가
+	- ✅ 정확한 evt_consensus 행 조회
 
-### I-08: 시간적 유효성 (Temporal Validity)
+### I-08: 시간적 유효성 (Temporal Validity) ✅
+	발견: 2025-12-23 | 해결: 2025-12-23
 	- ✅ limit=100으로 충분한 과거 데이터 조회
 	- ✅ event_date 기준 필터링 구현
-	- ✅ _meta.date_range, calcType, count 기록
-	- ✅ no_valid_data 에러 처리
+	- ✅ _meta 정보 기록
 
-### I-09: Topological Sort 순서 오류
+### I-09: Topological Sort 순서 오류 ✅
+	발견: 2025-12-23 | 해결: 2025-12-23
 	- ✅ in-degree 계산 로직 수정
-	- ✅ 역방향 그래프 구축 로직 추가
-	- ✅ api_field 메트릭 먼저 계산되도록 수정
+	- ✅ 역방향 그래프 구축
+	- ✅ api_field 먼저 계산되도록 수정
 
 ---
 
-## 3. 동적 설정 항목
+## 3. 동적 설정 항목 (I-10 ~ I-11)
 
-### (동적 설정 - 반영완료)
-	- ✅ GET /sourceData - config_lv1_api_list, config_lv1_api_service 동적 사용
-	- ✅ POST /backfillEventsTable - quantitative/qualitative 메트릭 동적 처리
-	- ✅ POST /backfillEventsTable - fillPriceTrend_dateRange 정책 동적 로드
+### I-10: priceEodOHLC_dateRange 정책 ✅
+	발견: 2025-12-24 | 해결: 2025-12-24
+	- ✅ 별도 정책 추가 (DB)
+	- ✅ get_ohlc_date_range_policy() 구현
+	- ✅ valuation_service.py에서 정책 호출
 
-### I-10: priceEodOHLC_dateRange 정책 미사용
-	- ✅ 별도 정책 추가 완료 (DB 반영완료)
-	- ✅ get_ohlc_date_range_policy() 함수 구현 완료
-	- ✅ valuation_service.py에서 정책 호출 완료
-
-### I-11: internal(qual) 메트릭 동적 사용 미구현
-	- ✅ select_internal_qual_metrics() 함수 구현 완료
-	- ✅ calculate_statistics_from_db_metrics() 함수 구현 완료
-	- ✅ DB 메트릭 로드 및 동적 통계 계산 구현 완료
-	- ✅ DB에 7개 internal(qual) 메트릭 존재 (returnIQRByDayOffset 포함)
+### I-11: internal(qual) 메트릭 동적 사용 ✅
+	발견: 2025-12-24 | 해결: 2025-12-24
+	- ✅ select_internal_qual_metrics() 구현
+	- ✅ calculate_statistics_from_db_metrics() 구현
+	- ✅ 7개 internal(qual) 메트릭 존재 (DB)
 
 ---
 
-## 4. 데이터베이스 설정
+## 4. 런타임 이슈 - 2025-12-24 (I-12 ~ I-17)
 
-### (DB 설정 - 반영완료)
-	- ✅ Supabase 연결: DATABASE_URL, SSL, Connection Pool 설정
-	- ✅ 스키마 설정: setup_supabase.sql 실행완료 (11개 테이블)
-	- ✅ config_lv2_metric: 81개 메트릭 정의됨
-	- ✅ config_lv0_policy: 2개 정책 존재 (fillPriceTrend_dateRange, sourceData_dateRange)
-	- ✅ qualatative 도메인: 4개 메트릭 (consensus, consensusSignal, consensusSummary, priceQualitative)
+### I-12: 동적 계산 코드 실행 실패 ✅
+	발견: 2025-12-24 09:00 | 해결: 2025-12-24 10:30
+	- ✅ calculation 코드를 single expression으로 재작성
+	- ✅ avgFromQuarter, ttmFromQuarterSumOrScaled 등 수정
+	- ✅ SQL 스크립트: fix_calculation_single_expression.sql
 
----
+### I-13: priceEodOHLC 데이터 추출 실패 ✅
+	발견: 2025-12-24 09:00 | 해결: 2025-12-24 14:00
+	- ✅ 원인: API 호출 시 fromDate, toDate 파라미터 누락
+	- ✅ valuation_service.py 수정 (파라미터 추가)
+	- ✅ 전체 서비스 API 호출 점검 완료
 
-## 요약 테이블
-
-| ID | 이슈 | 상태 | DB 반영 | 흐름도 | 상세도 |
-|----|------|------|---------|--------|--------|
-| I-01 | consensusSignal 설정 불일치 | ✅ | ✅ 완료 | 2_FLOW.md#I-01 | 3_DETAIL.md#I-01 |
-| I-02 | priceEodOHLC dict response_key | ✅ | N/A | 2_FLOW.md#I-02 | 3_DETAIL.md#I-02 |
-| I-03 | targetMedian & consensusSummary | ✅ | N/A | 2_FLOW.md#I-03 | 3_DETAIL.md#I-03 |
-| I-04 | 짧은 이름 메트릭 | ⏸️ | N/A | 2_FLOW.md#I-04 | - |
-| I-05 | consensus 메트릭 추가 | ✅ | ✅ 완료 | 2_FLOW.md#I-05 | 3_DETAIL.md#I-05 |
-| I-06 | consensusWithPrev | ✅ | N/A | 2_FLOW.md#I-06 | - |
-| I-07 | source_id 파라미터 | ✅ | N/A | 2_FLOW.md#I-07 | 3_DETAIL.md#I-07 |
-| I-08 | 시간적 유효성 | ✅ | N/A | 2_FLOW.md#I-08 | 3_DETAIL.md#I-08 |
-| I-09 | Topological Sort | ✅ | N/A | 2_FLOW.md#I-09 | 3_DETAIL.md#I-09 |
-| I-10 | priceEodOHLC_dateRange 정책 | ✅ | ✅ 완료 | 2_FLOW.md#I-10 | 3_DETAIL.md#I-10 |
-| I-11 | internal(qual) 메트릭 | ✅ | ✅ 완료 | 2_FLOW.md#I-11 | 3_DETAIL.md#I-11 |
-
----
-
-## DB 검증 결과 (2025-12-24)
-
-### ✅ 성공적으로 반영됨
-- **I-01**: consensusSignal 설정
-  - source = 'aggregation' ✅
-  - expression = NULL ✅
-  - aggregation_kind = 'leadPairFromList' ✅
-
-- **I-05**: consensus 메트릭
-  - source = 'api_field' ✅
-  - api_list_id = 'fmp-price-target' ✅
-  - response_key: 12개 필드 매핑 ✅
-
-### ✅ 완료된 항목
-- **I-10**: priceEodOHLC_dateRange 정책 추가 (DB + Python) ✅
-- **I-11**: internal(qual) 메트릭 동적 처리 (Python 코드) ✅
-
-### ✅ 모든 권장 작업 완료!
-- **I-01**: leadPairFromList aggregation 로직 ✅
-- **I-10**: priceEodOHLC_dateRange 정책 추가 ✅
-- **I-11**: internal(qual) 메트릭 동적 처리 ✅
-
----
-
-## 다음 조치 필요 항목
-
-### 🟢 완료됨
-	1. ✅ I-10: priceEodOHLC_dateRange 정책 분리 구현
-		- ✅ DB: config_lv0_policy에 정책 추가
-		- ✅ Python: get_ohlc_date_range_policy() 함수 구현
-	2. ✅ I-11: internal(qual) 메트릭 동적 처리 구현
-		- ✅ Python: select_internal_qual_metrics() 함수 구현
-		- ✅ Python: calculate_statistics_from_db_metrics() 함수 구현
-		- ✅ DB: 7개 internal(qual) 메트릭 존재
-
-### ⚪ 선택 (장기 - 현재 불필요)
-	1. I-01: db_field source 타입 구현
-		- Python: MetricCalculationEngine 확장
-		- 현재 aggregation 방식으로 충분히 동작
-	2. I-01: consensusRaw 메트릭 추가
-		- DB: consensusRaw 메트릭 정의
-		- 현재 evt_consensus 테이블로 충분히 동작
-
----
-
-## 5. 런타임 이슈 (2025-12-24 발견)
-
-### I-12: 동적 계산 코드 실행 실패
-	- ✅ calculation 코드를 single expression으로 재작성 완료
-	- ✅ avgFromQuarter, ttmFromQuarterSumOrScaled, lastFromQuarter 수정
-	- ✅ qoqFromQuarter, yoyFromQuarter 수정
-	- ✅ SQL 스크립트: `backend/scripts/fix_calculation_single_expression.sql`
-
-### I-13: priceEodOHLC 데이터 추출 실패 ⚠️
-	- ✅ 원인 규명: API 호출 시 `fromDate`, `toDate` 파라미터 누락
-	- ✅ valuation_service.py 수정 완료 (파라미터 추가)
-	- ✅ FMP API 실제 응답 검증: 필드명 `low`, `high`, `open`, `close` 정확함
-	- ✅ 전체 서비스 API 호출 방식 점검 완료 (11개 위치)
-	- ✅ config_lv1_api_list 사용 원칙 준수 확인
-
-### I-14: fmp-aftermarket-trade API 401 오류
+### I-14: fmp-aftermarket-trade API 401 오류 ⏸️
+	발견: 2025-12-24 09:00 | 보류
 	- ⏸️ FMP 서비스의 일시적 문제로 판단
-	- ⏸️ 조치 불필요 (priceAfter 메트릭만 영향)
-	- ⏸️ 다른 메트릭들은 정상 작동
+	- ⏸️ priceAfter 메트릭만 영향 (다른 메트릭 정상)
 
-### I-15: event_date_obj 변수 순서 오류 ⚠️
-	- ❌ API 호출 시 event_date_obj 사용 (444라인)
-	- ❌ 실제 정의는 471라인 (순서 오류)
-	- ❌ 에러: `local variable 'event_date_obj' referenced before assignment`
+### I-15: event_date_obj 변수 순서 오류 ✅
+	발견: 2025-12-24 15:00 | 해결: 2025-12-24 15:30
 	- ✅ event_date_obj 변환 로직을 API 호출 전으로 이동
-	- ✅ valuation_service.py:425-438 수정 완료
+	- ✅ valuation_service.py:425-438 수정
 
-### I-16: 메트릭 실패 디버깅 로그 부재
-	- ❌ ✗ 표시만 있고 실패 이유 알 수 없음
+### I-16: 메트릭 실패 디버깅 로그 부재 ✅
+	발견: 2025-12-24 16:00 | 해결: 2025-12-24 17:00
 	- ✅ _calculate_metric_with_reason() 메서드 추가
 	- ✅ 실패 이유 분류 (api_field, aggregation, expression)
-	- ✅ 로그 출력 형식: `✗ metricName = None | reason: ...`
-	- ✅ metric_engine.py:241-326 수정 완료
 
-### I-17: 로그 형식 N/A 과다 출력
-	- ❌ 세부 로그에 불필요한 `[N/A | N/A] | ... | counters=N/A` 출력
-	- ✅ logging_utils.py: 구조화된 데이터 없으면 단순 포맷 사용
-	- ✅ API 호출/메트릭 계산 등 세부 로그는 단순 포맷
-	- ✅ 엔드포인트 주요 단계만 구조화된 로그
+### I-17: 로그 형식 N/A 과다 출력 ✅
+	발견: 2025-12-24 17:00 | 해결: 2025-12-24 18:00
+	- ✅ 구조화된 데이터 없으면 단순 포맷 사용
 	- ✅ LOGGING_GUIDE.md 문서 작성
 
-### I-18: priceEodOHLC Schema Array Type 문제 ⚠️
-	- ❌ 에러: `unhashable type: 'list'` 발생
-	- ❌ 원인: `config_lv1_api_list.schema`가 `[{}]` (array)로 저장됨
-	- ✅ SQL 스크립트: `backend/scripts/diagnose_priceEodOHLC_issue.sql` (진단)
-	- ✅ SQL 스크립트: `backend/scripts/fix_priceEodOHLC_array_types.sql` (수정)
-	- ✅ schema를 `{}` (object) 타입으로 변경
-	- ✅ verify_all_api_schemas.sql로 전체 API 검증
+---
 
-### I-19: 메트릭 로그 Truncation 문제
-	- ❌ priceEodOHLC 값이 50자로 잘림 (close 필드 미출력)
-	- ❌ 원인: `str(value)[:50]` 하드코딩
+## 5. 런타임 이슈 - 2025-12-25 (I-18 ~ I-20)
+
+### I-18: priceEodOHLC Schema Array Type 문제 ✅
+	발견: 2025-12-25 10:00 | 해결: 2025-12-25 11:30
+	- ✅ 에러: unhashable type: 'list'
+	- ✅ 원인: config_lv1_api_list.schema가 [{}] (array)로 저장
+	- ✅ schema를 {} (object) 타입으로 변경
+	- ✅ SQL 스크립트: fix_priceEodOHLC_array_types.sql
+	- ✅ 전체 API 스키마 검증: verify_all_api_schemas.sql
+
+### I-19: 메트릭 로그 Truncation 문제 ✅
+	발견: 2025-12-25 12:00 | 해결: 2025-12-25 13:00
+	- ✅ priceEodOHLC 값이 50자로 잘림
 	- ✅ 스마트 포맷팅 구현: 리스트는 첫 항목 + 개수 표시
-	- ✅ 안전장치: 150자 제한 (이전 50자 → 150자)
-	- ✅ 불필요한 디버그 로그 제거 (priceEodOHLC 전용 로그들)
-	- ✅ metric_engine.py:258-271 수정 완료
+	- ✅ 150자 제한 (이전 50자 → 150자)
+	- ✅ 불필요한 디버그 로그 제거
+
+### I-20: POST /backfillEventsTable 성능 개선 ✅
+	발견: 2025-12-25 14:00 | 해결: 2025-12-25 18:00
+	- ✅ Ticker 그룹화 함수 구현 (group_events_by_ticker)
+	- ✅ Ticker 배치 처리 함수 구현 (process_ticker_batch)
+	- ✅ DB 배치 업데이트 함수 구현 (batch_update_event_valuations)
+	- ✅ 병렬 처리 로직 구현 (asyncio.Semaphore)
+	- ✅ 동시성 제어 (TICKER_CONCURRENCY = 10)
+
+	**성능 개선 효과**:
+	| 항목 | Before | After | 개선율 |
+	|------|--------|-------|--------|
+	| API 호출 | 136,954 | ~5,000 | 96% ↓ |
+	| DB 쿼리 | 136,954 | ~5,000 | 96% ↓ |
+	| 소요 시간 | 76시간 | 0.5-1시간 | **99% ↓** |
+
+### I-21: priceEodOHLC domain 설정 오류 ✅
+	발견: 2025-12-25 19:00 | 해결: 2025-12-25 19:30
+	- ✅ 원인: priceEodOHLC domain이 'quantitative-momentum'으로 잘못 설정됨
+	- ✅ 문제: momentum 도메인에 priceEodOHLC가 포함되어 불필요한 값 출력
+	- ✅ 해결: domain을 'internal'로 복원 (SQL 스크립트)
+	- ✅ fix_priceeodohlc_domain.py 삭제 (잘못된 변경 스크립트)
+
+### I-22: SQL 예약어 "position" 문제 ✅
+	발견: 2025-12-25 19:30 | 해결: 2025-12-25 19:45
+	- ✅ 에러: syntax error at or near "position"
+	- ✅ 원인: ::position 캐스팅에서 position은 PostgreSQL 예약어
+	- ✅ 해결: ::"position" 으로 따옴표 추가
+
+### I-23: NULL 값 디버깅 로그 개선 ✅
+	발견: 2025-12-25 20:00 | 해결: 2025-12-25 20:30
+	- ✅ 문제: NULL 값 원인을 구별할 수 없음 (API 데이터 부재 vs 계산 오류)
+	- ✅ 해결: INFO 레벨로 NULL 원인 로그 출력
+	- ✅ 출력 형식: `[MetricEngine] ✗ NULL: PER | domain=valuation | reason=Missing deps: netIncomeTTM(=None)`
+	- ✅ expression 메트릭의 의존성 추적 개선
+
+### I-24: price trends 처리 성능 최적화 ✅
+	발견: 2025-12-25 21:00 | 해결: 2025-12-25 21:30
+	- ✅ 문제: 이벤트당 ~12초 소요 (53개 이벤트 처리에 10분 이상)
+	- ✅ 원인 1: calculate_dayOffset_dates()가 각 dayOffset마다 DB 조회
+	- ✅ 원인 2: 각 이벤트마다 개별 DB UPDATE 실행
+	- ✅ 해결 1: 거래일 정보 미리 캐시 (get_trading_days_in_range)
+	- ✅ 해결 2: 배치 DB 업데이트 (UNNEST 사용)
+	
+	**성능 개선 효과**:
+	| 항목 | Before | After | 개선율 |
+	|------|--------|-------|--------|
+	| 거래일 DB 조회 | 이벤트×dayOffset | 1회 | **99% ↓** |
+	| DB UPDATE | 이벤트당 1회 | 배치 1회 | **99% ↓** |
+	| 53개 이벤트 | ~10분 | ~10초 | **98% ↓** |
 
 ---
 
-## 요약 테이블 (업데이트)
+## 📈 통계
 
-| ID | 이슈 | 상태 | DB 반영 | 흐름도 | 상세도 |
-|----|------|------|---------|--------|--------|
-| I-01 | consensusSignal 설정 불일치 | ✅ | ✅ 완료 | 2_FLOW.md#I-01 | 3_DETAIL.md#I-01 |
-| I-02 | priceEodOHLC dict response_key | ✅ | N/A | 2_FLOW.md#I-02 | 3_DETAIL.md#I-02 |
-| I-03 | targetMedian & consensusSummary | ✅ | N/A | 2_FLOW.md#I-03 | 3_DETAIL.md#I-03 |
-| I-04 | 짧은 이름 메트릭 | ⏸️ | N/A | 2_FLOW.md#I-04 | - |
-| I-05 | consensus 메트릭 추가 | ✅ | ✅ 완료 | 2_FLOW.md#I-05 | 3_DETAIL.md#I-05 |
-| I-06 | consensusWithPrev | ✅ | N/A | 2_FLOW.md#I-06 | - |
-| I-07 | source_id 파라미터 | ✅ | N/A | 2_FLOW.md#I-07 | 3_DETAIL.md#I-07 |
-| I-08 | 시간적 유효성 | ✅ | N/A | 2_FLOW.md#I-08 | 3_DETAIL.md#I-08 |
-| I-09 | Topological Sort | ✅ | N/A | 2_FLOW.md#I-09 | 3_DETAIL.md#I-09 |
-| I-10 | priceEodOHLC_dateRange 정책 | ✅ | ✅ 완료 | 2_FLOW.md#I-10 | 3_DETAIL.md#I-10 |
-| I-11 | internal(qual) 메트릭 | ✅ | ✅ 완료 | 2_FLOW.md#I-11 | 3_DETAIL.md#I-11 |
-| **I-12** | **동적 계산 코드 실행 실패** | **✅** | **✅ 완료** | **2_FLOW.md#I-12** | **3_DETAIL.md#I-12** |
-| **I-13** | **priceEodOHLC 데이터 추출 실패** | **✅** | **✅ 완료** | **2_FLOW.md#I-13** | **3_DETAIL.md#I-13** |
-| **I-14** | **aftermarket API 401 오류** | **⏸️** | **N/A** | **2_FLOW.md#I-14** | **3_DETAIL.md#I-14** |
-| **I-15** | **event_date_obj 변수 순서 오류** | **✅** | **✅ 완료** | **2_FLOW.md#I-15** | **3_DETAIL.md#I-15** |
-| **I-16** | **메트릭 실패 디버깅 로그 부재** | **✅** | **✅ 완료** | **2_FLOW.md#I-16** | **3_DETAIL.md#I-16** |
-| **I-17** | **로그 형식 N/A 과다 출력** | **✅** | **✅ 완료** | **2_FLOW.md#I-17** | **3_DETAIL.md#I-17** |
+### 상태별 현황
+- ✅ **완료**: 22개 (92%)
+- ⏸️ **보류**: 2개 (8%)
+- ❌ **미반영**: 0개 (0%)
+
+### 일자별 이슈 처리
+- **2025-12-23**: I-01 ~ I-09 (9개 이슈 처리)
+- **2025-12-24**: I-10 ~ I-17 (8개 이슈 처리)
+- **2025-12-25**: I-18 ~ I-24 (7개 이슈 처리)
 
 ---
 
-*최종 업데이트: 2025-12-24 (런타임 이슈 추가)*
+*최종 업데이트: 2025-12-25 22:00 KST*
