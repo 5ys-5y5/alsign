@@ -199,13 +199,15 @@ async def select_consensus_data(
     Returns:
         Consensus data dictionary or None
     """
+    import json
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT id, ticker, event_date, analyst_name, analyst_company,
                    price_target, price_when_posted,
                    price_target_prev, price_when_posted_prev,
-                   direction, response_key
+                   direction, response_key, target_summary
             FROM evt_consensus
             WHERE id = $1
               AND ticker = $2
@@ -216,7 +218,22 @@ async def select_consensus_data(
             event_date
         )
 
-        return dict(row) if row else None
+        if not row:
+            return None
+
+        # Convert row to dict
+        result = dict(row)
+
+        # I-39: Parse target_summary from JSON string to dict
+        # asyncpg returns jsonb as string, need to parse it
+        if result.get('target_summary') and isinstance(result['target_summary'], str):
+            try:
+                result['target_summary'] = json.loads(result['target_summary'])
+            except (json.JSONDecodeError, TypeError):
+                # Keep as string if parsing fails
+                pass
+
+        return result
 
 
 async def batch_update_event_valuations(

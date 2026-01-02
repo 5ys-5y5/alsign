@@ -269,6 +269,173 @@ async def get_api_list():
         )
 
 
+class APIListUpdate(BaseModel):
+    """API list item update."""
+    api_service: Optional[str] = None
+    api: Optional[str] = None
+    schema: Optional[Union[Dict[str, Any], str]] = None
+    endpoint: Optional[str] = None
+    function2: Optional[str] = None
+
+
+class APITestResult(BaseModel):
+    """API test result."""
+    success: bool
+    status_code: Optional[int] = None
+    response_sample: Optional[Any] = None
+    response_keys: Optional[List[str]] = None
+    error: Optional[str] = None
+    elapsed_ms: Optional[int] = None
+
+
+@router.put("/apiList/{api_id}")
+async def update_api_list_item(api_id: str, update: APIListUpdate):
+    """
+    Update API list item configuration.
+    Only updates provided fields (partial update).
+    """
+    try:
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            # Build update query dynamically
+            updates = []
+            params = []
+            param_count = 1
+
+            if update.api_service is not None:
+                updates.append(f'api_service = ${param_count}')
+                params.append(update.api_service)
+                param_count += 1
+
+            if update.api is not None:
+                updates.append(f'api = ${param_count}')
+                params.append(update.api)
+                param_count += 1
+
+            if update.schema is not None:
+                updates.append(f'schema = ${param_count}::jsonb')
+                schema_val = json.dumps(update.schema) if isinstance(update.schema, dict) else update.schema
+                params.append(schema_val)
+                param_count += 1
+
+            if update.endpoint is not None:
+                updates.append(f'endpoint = ${param_count}')
+                params.append(update.endpoint)
+                param_count += 1
+
+            if update.function2 is not None:
+                updates.append(f'function2 = ${param_count}')
+                params.append(update.function2)
+                param_count += 1
+
+            if not updates:
+                raise HTTPException(status_code=400, detail="No fields to update")
+
+            params.append(api_id)
+
+            query = f"""
+                UPDATE config_lv1_api_list
+                SET {', '.join(updates)}
+                WHERE id = ${param_count}
+                RETURNING id
+            """
+
+            result = await conn.fetchval(query, *params)
+
+            if not result:
+                raise HTTPException(status_code=404, detail=f"API '{api_id}' not found")
+
+            logger.info(f"action=update_api_list status=success id={api_id}")
+            return {"status": "updated", "id": api_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"action=update_api_list status=error error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update API: {str(e)}")
+
+
+@router.post("/apiList/{api_id}/test", response_model=APITestResult)
+async def test_api_endpoint(api_id: str, test_params: Optional[Dict[str, Any]] = None):
+    """
+    Test an API endpoint and validate response keys.
+    
+    Args:
+        api_id: The API ID from config_lv1_api_list
+        test_params: Optional parameters to send with the API call (e.g., {"ticker": "AAPL"})
+    
+    Returns:
+        Test result with response sample and available keys.
+    """
+    import time
+    from ..services.external_api import FMPAPIClient
+    
+    try:
+        pool = await db_pool.get_pool()
+        
+        # Get API configuration
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM config_lv1_api_list WHERE id = $1",
+                api_id
+            )
+            
+            if not row:
+                raise HTTPException(status_code=404, detail=f"API '{api_id}' not found")
+        
+        # Prepare test parameters
+        params = test_params or {}
+        if 'ticker' not in params:
+            params['ticker'] = 'AAPL'  # Default test ticker
+        
+        # Call the API
+        start_time = time.time()
+        try:
+            api_client = FMPAPIClient()
+            response = await api_client.call_api(api_id, params)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            # Extract response keys
+            response_keys = []
+            response_sample = None
+            
+            if isinstance(response, list) and len(response) > 0:
+                response_sample = response[0] if len(response) == 1 else response[:2]
+                if isinstance(response[0], dict):
+                    response_keys = list(response[0].keys())
+            elif isinstance(response, dict):
+                response_sample = response
+                response_keys = list(response.keys())
+            
+            logger.info(f"action=test_api status=success id={api_id} elapsed_ms={elapsed_ms}")
+            
+            return APITestResult(
+                success=True,
+                status_code=200,
+                response_sample=response_sample,
+                response_keys=response_keys,
+                elapsed_ms=elapsed_ms
+            )
+            
+        except Exception as api_error:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            error_msg = str(api_error)
+            
+            logger.warning(f"action=test_api status=api_error id={api_id} error={error_msg}")
+            
+            return APITestResult(
+                success=False,
+                error=error_msg,
+                elapsed_ms=elapsed_ms
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"action=test_api status=error id={api_id} error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to test API: {str(e)}")
+
+
 @router.get("/metrics", response_model=List[MetricItem])
 async def get_metrics():
     """
@@ -334,6 +501,266 @@ async def get_metrics():
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch metrics: {str(e)}"
         )
+
+
+class MetricApiUpdate(BaseModel):
+    """Update api_list_id for a metric."""
+    api_list_id: str
+    required_keys: Optional[List[str]] = None  # Keys that must exist in API response
+
+
+class MetricApiUpdateResult(BaseModel):
+    """Result of metric API update."""
+    success: bool
+    metric_id: str
+    old_api_list_id: Optional[str]
+    new_api_list_id: str
+    validation_result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+@router.put("/metrics/{metric_id}/apiListId", response_model=MetricApiUpdateResult)
+async def update_metric_api_list_id(metric_id: str, update: MetricApiUpdate):
+    """
+    Update the api_list_id for a metric with validation.
+    
+    1. Tests the new API to ensure it returns valid data
+    2. Validates that required_keys exist in the API response
+    3. Updates config_lv2_metric if validation passes
+    
+    Args:
+        metric_id: The metric ID to update
+        update: Contains new api_list_id and optional required_keys for validation
+    
+    Returns:
+        Update result with validation details
+    """
+    import time
+    from ..services.external_api import FMPAPIClient
+    
+    try:
+        pool = await db_pool.get_pool()
+        
+        # Get current metric configuration
+        async with pool.acquire() as conn:
+            metric_row = await conn.fetchrow(
+                """SELECT id, api_list_id, response_key, response_path 
+                   FROM config_lv2_metric WHERE id = $1""",
+                metric_id
+            )
+            
+            if not metric_row:
+                raise HTTPException(status_code=404, detail=f"Metric '{metric_id}' not found")
+            
+            old_api_list_id = metric_row["api_list_id"]
+            
+            # Check if new API exists
+            api_row = await conn.fetchrow(
+                "SELECT id, schema FROM config_lv1_api_list WHERE id = $1",
+                update.api_list_id
+            )
+            
+            if not api_row:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"API '{update.api_list_id}' not found in config_lv1_api_list"
+                )
+        
+        # Test the new API
+        start_time = time.time()
+        try:
+            api_client = FMPAPIClient()
+            response = await api_client.call_api(update.api_list_id, {'ticker': 'AAPL'})
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            
+            # Extract response keys
+            response_keys = []
+            if isinstance(response, list) and len(response) > 0:
+                if isinstance(response[0], dict):
+                    response_keys = list(response[0].keys())
+            elif isinstance(response, dict):
+                response_keys = list(response.keys())
+            
+            # Validate required keys
+            required_keys = update.required_keys or []
+            missing_keys = [k for k in required_keys if k not in response_keys]
+            
+            validation_result = {
+                'api_tested': True,
+                'elapsed_ms': elapsed_ms,
+                'available_keys': response_keys,
+                'required_keys': required_keys,
+                'missing_keys': missing_keys,
+                'valid': len(missing_keys) == 0
+            }
+            
+            if missing_keys:
+                logger.warning(
+                    f"action=update_metric_api status=validation_failed "
+                    f"metric={metric_id} api={update.api_list_id} missing_keys={missing_keys}"
+                )
+                return MetricApiUpdateResult(
+                    success=False,
+                    metric_id=metric_id,
+                    old_api_list_id=old_api_list_id,
+                    new_api_list_id=update.api_list_id,
+                    validation_result=validation_result,
+                    error=f"Missing required keys: {missing_keys}"
+                )
+            
+            # Update metric with new api_list_id
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE config_lv2_metric SET api_list_id = $1 WHERE id = $2",
+                    update.api_list_id,
+                    metric_id
+                )
+            
+            logger.info(
+                f"action=update_metric_api status=success "
+                f"metric={metric_id} old_api={old_api_list_id} new_api={update.api_list_id}"
+            )
+            
+            return MetricApiUpdateResult(
+                success=True,
+                metric_id=metric_id,
+                old_api_list_id=old_api_list_id,
+                new_api_list_id=update.api_list_id,
+                validation_result=validation_result
+            )
+            
+        except Exception as api_error:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            error_msg = str(api_error)
+            
+            logger.warning(
+                f"action=update_metric_api status=api_error "
+                f"metric={metric_id} api={update.api_list_id} error={error_msg}"
+            )
+            
+            return MetricApiUpdateResult(
+                success=False,
+                metric_id=metric_id,
+                old_api_list_id=old_api_list_id,
+                new_api_list_id=update.api_list_id,
+                validation_result={
+                    'api_tested': True,
+                    'elapsed_ms': elapsed_ms,
+                    'error': error_msg
+                },
+                error=f"API test failed: {error_msg}"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"action=update_metric_api status=error error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update metric: {str(e)}")
+
+
+@router.get("/endpointApiConfig")
+async def get_endpoint_api_config():
+    """
+    Get endpoint-to-API mapping configuration.
+    
+    Returns a structured view of which APIs are used by each endpoint/mode.
+    """
+    try:
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            # Get all metrics with their api_list_id
+            metrics = await conn.fetch("""
+                SELECT id, api_list_id, domain, response_key, description
+                FROM config_lv2_metric
+                WHERE api_list_id IS NOT NULL
+                ORDER BY domain, id
+            """)
+            
+            # Get all available APIs
+            apis = await conn.fetch("""
+                SELECT id, api_service, api, endpoint
+                FROM config_lv1_api_list
+                ORDER BY api_service, id
+            """)
+        
+        # Build endpoint configuration
+        endpoint_config = {
+            'sourceData': {
+                'description': 'GET /sourceData - 외부 API 데이터 수집',
+                'modes': {
+                    'holiday': {
+                        'description': '시장 휴장일 수집',
+                        'apis': [{'id': 'fmp-market-holidays', 'required_keys': ['year', 'date', 'exchange']}]
+                    },
+                    'consensus': {
+                        'description': '애널리스트 컨센서스 수집',
+                        'apis': [{'id': 'fmp-price-target', 'required_keys': ['symbol', 'priceTarget', 'priceWhenPosted', 'analystName', 'analystCompany']}]
+                    },
+                    'earning': {
+                        'description': '실적 발표 수집',
+                        'apis': [{'id': 'fmp-earning-call-transcript', 'required_keys': ['symbol', 'date', 'content']}]
+                    }
+                }
+            },
+            'backfillEventsTable': {
+                'description': 'POST /backfillEventsTable - Valuation 메트릭 계산',
+                'phases': {
+                    'financial': {
+                        'description': '재무제표 메트릭 계산',
+                        'metrics': [],
+                        'apis': []
+                    },
+                    'market': {
+                        'description': '시장 데이터 메트릭 계산',
+                        'metrics': [],
+                        'apis': []
+                    },
+                    'price': {
+                        'description': '가격 추세 계산',
+                        'apis': [{'id': 'fmp-historical-price-eod-full', 'required_keys': ['date', 'open', 'high', 'low', 'close']}]
+                    }
+                }
+            }
+        }
+        
+        # Group metrics by their API
+        for metric in metrics:
+            api_id = metric['api_list_id']
+            domain = metric['domain'] or 'unknown'
+            
+            # Determine which phase this belongs to
+            if 'income' in api_id.lower() or 'balance' in api_id.lower() or 'cash' in api_id.lower():
+                phase_key = 'financial'
+            elif 'market' in api_id.lower() or 'quote' in api_id.lower():
+                phase_key = 'market'
+            else:
+                phase_key = 'financial'
+            
+            if phase_key in endpoint_config['backfillEventsTable']['phases']:
+                phase = endpoint_config['backfillEventsTable']['phases'][phase_key]
+                if api_id not in [a['id'] for a in phase['apis']]:
+                    phase['apis'].append({'id': api_id, 'required_keys': []})
+                phase['metrics'].append({
+                    'id': metric['id'],
+                    'api_list_id': api_id,
+                    'domain': domain
+                })
+        
+        # Add available APIs list
+        available_apis = [
+            {'id': api['id'], 'service': api['api_service'], 'name': api['api'], 'endpoint': api['endpoint']}
+            for api in apis
+        ]
+        
+        return {
+            'endpoints': endpoint_config,
+            'availableApis': available_apis,
+            'metricsWithApi': [dict(m) for m in metrics]
+        }
+    
+    except Exception as e:
+        logger.error(f"action=get_endpoint_api_config status=error error={str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/metricTransforms", response_model=List[MetricTransformItem])

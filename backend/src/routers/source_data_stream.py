@@ -271,8 +271,17 @@ async def stream_source_data(
 
                     # Check if it's a result or log
                     if log_line.startswith('{') and '"type"' in log_line:
-                        # JSON result
-                        yield f"event: result\ndata: {log_line}\n\n"
+                        # JSON result or error - distinguish by type
+                        try:
+                            data = json.loads(log_line)
+                            if data.get('type') == 'result':
+                                yield f"event: result\ndata: {log_line}\n\n"
+                            elif data.get('type') == 'error':
+                                yield f"event: error\ndata: {log_line}\n\n"
+                            else:
+                                yield f"event: log\ndata: {json.dumps({'log': log_line})}\n\n"
+                        except json.JSONDecodeError:
+                            yield f"event: log\ndata: {json.dumps({'log': log_line})}\n\n"
                     else:
                         # Regular log line
                         yield f"event: log\ndata: {json.dumps({'log': log_line})}\n\n"

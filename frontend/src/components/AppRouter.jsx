@@ -8,8 +8,51 @@
 import React, { useState, useEffect } from 'react';
 import ControlPage from '../pages/ControlPage';
 import RequestsPage from '../pages/RequestsPage';
+import SetRequestsPage from '../pages/SetRequestsPage';
 import ConditionGroupPage from '../pages/ConditionGroupPage';
 import DashboardPage from '../pages/DashboardPage';
+import BottomPanel from './BottomPanel';
+import { LogProvider, useLog } from '../contexts/LogContext';
+
+/**
+ * ContentWrapper - Common layout wrapper that adjusts for BottomPanel position.
+ * Applies consistent layout across all pages.
+ */
+function ContentWrapper({ children }) {
+  const { panelOpen, panelPosition, panelSize } = useLog();
+
+  const getWrapperStyle = () => {
+    const panelWidth = panelOpen ? panelSize : 48;
+
+    if (panelPosition === 'right') {
+      return {
+        marginRight: `${panelWidth}px`,
+        transition: 'margin 0.1s ease-out',
+        minHeight: '100vh',
+      };
+    } else {
+      return {
+        paddingBottom: panelOpen ? `${panelSize + 20}px` : '80px',
+        transition: 'padding 0.1s ease-out',
+      };
+    }
+  };
+
+  const getMainContentStyle = () => {
+    return {
+      padding: 'var(--space-4)',
+      width: '80%',
+      maxWidth: '1400px',
+      margin: '0 auto',
+    };
+  };
+
+  return (
+    <div style={getWrapperStyle()}>
+      <div style={getMainContentStyle()}>{children}</div>
+    </div>
+  );
+}
 
 /**
  * Route definitions following the design system contract.
@@ -17,6 +60,7 @@ import DashboardPage from '../pages/DashboardPage';
 const ROUTES = [
   { id: 'control', label: 'control', path: '#/control', component: ControlPage },
   { id: 'requests', label: 'requests', path: '#/requests', component: RequestsPage },
+  { id: 'setRequests', label: 'setRequests', path: '#/setRequests', component: SetRequestsPage },
   { id: 'conditionGroup', label: 'conditionGroup', path: '#/conditionGroup', component: ConditionGroupPage },
   { id: 'dashboard', label: 'dashboard', path: '#/dashboard', component: DashboardPage },
 ];
@@ -116,11 +160,30 @@ export default function AppRouter() {
   const CurrentComponent = currentRouteConfig?.component || DashboardPage;
 
   return (
+    <LogProvider>
+      <AppContent
+        currentRoute={currentRoute}
+        onNavigate={handleNavigate}
+        CurrentComponent={CurrentComponent}
+      />
+    </LogProvider>
+  );
+}
+
+/**
+ * AppContent - Inner component that uses LogContext.
+ * Separated to allow useLog() hook usage inside LogProvider.
+ */
+function AppContent({ currentRoute, onNavigate, CurrentComponent }) {
+  return (
     <div style={{ minHeight: '100vh', backgroundColor: 'var(--surface)' }}>
-      <Navigation currentRoute={currentRoute} onNavigate={handleNavigate} />
+      <Navigation currentRoute={currentRoute} onNavigate={onNavigate} />
       <main>
-        <CurrentComponent />
+        <ContentWrapper>
+          <CurrentComponent />
+        </ContentWrapper>
       </main>
+      <BottomPanel />
     </div>
   );
 }

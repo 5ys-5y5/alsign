@@ -315,6 +315,24 @@ curl "http://localhost:8000/sourceData?mode=target"
 curl "http://localhost:8000/sourceData?mode=consensus"
 ```
 
+#### Consensus Phase 2 Recalculation (calc_mode)
+
+If evt_consensus already has data but `price_target_prev`/`direction` are NULL, run Phase 2 calculation only (no API calls):
+
+```bash
+# Recalculate all partitions (API 호출 없이 2단계 계산만 수행)
+curl "http://localhost:8000/sourceData?mode=consensus&calc_mode=calculation&calc_scope=all"
+
+# Recalculate specific tickers
+curl "http://localhost:8000/sourceData?mode=consensus&calc_mode=calculation&calc_scope=ticker&tickers=RGTI,AAPL"
+```
+
+| calc_mode | Description |
+|-----------|-------------|
+| (unset) | Phase 1 (API fetch) + Phase 2 for affected partitions |
+| `maintenance` | Phase 1 + Phase 2 with custom scope |
+| `calculation` | **Phase 2 only** (skip API calls, use existing data) |
+
 ### 2. Explore API Endpoints
 
 Visit interactive docs: http://localhost:8000/docs

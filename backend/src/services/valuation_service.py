@@ -9,9 +9,10 @@ from datetime import datetime, date
 from collections import defaultdict
 
 from ..database.connection import db_pool
-from ..database.queries import metrics, policies, targets
+from ..database.queries import metrics, policies, targets, consensus
 from .external_api import FMPAPIClient
 from .utils.datetime_utils import calculate_dayOffset_dates, calculate_dayOffset_dates_cached, get_trading_days_in_range
+from .utils.response_formatter import format_value_quantitative, format_value_qualitative
 from ..models.response_models import EventProcessingResult
 from .metric_engine import MetricCalculationEngine
 
@@ -43,7 +44,8 @@ async def process_ticker_batch(
     metrics_by_domain: Dict[str, List[Dict[str, Any]]],
     overwrite: bool = False,
     total_events_count: int = 0,
-    completed_events_count: Dict[str, int] = None
+    completed_events_count: Dict[str, int] = None,
+    calc_fair_value: bool = False
 ) -> Dict[str, Any]:
     """
     Process all events for a single ticker (with REAL API caching).
@@ -97,8 +99,9 @@ async def process_ticker_batch(
                 try:
                     params = {'ticker': ticker}
                     
-                    if 'historical-price' in api_id or 'eod' in api_id:
+                    if 'historical-price' in api_id or 'eod' in api_id or 'historical-market-cap' in api_id:
                         # Wide date range to cover all events
+                        # I-25: fmp-historical-market-capitalization도 from/to 파라미터 필요
                         params['fromDate'] = '2000-01-01'
                         params['toDate'] = datetime.now().strftime('%Y-%m-%d')
                     else:
@@ -184,15 +187,41 @@ async def process_ticker_batch(
             )
             
             # Calculate positions and disparities
-            position_quant, disparity_quant = calculate_position_disparity(
-                quant_result.get('value'),
-                qual_result.get('currentPrice')
-            )
+            # I-36: If calc_fair_value is True, calculate sector-average-based fair value
+            if calc_fair_value:
+                fair_value_result = await calculate_fair_value_for_ticker(
+                    pool, ticker, event_date, 
+                    quant_result.get('value'),
+                    qual_result.get('currentPrice'),
+                    metrics_by_domain
+                )
+                position_quant = fair_value_result.get('position')
+                disparity_quant = fair_value_result.get('disparity')
+                
+                # Add fair value info to quantitative result
+                if quant_result.get('value') and fair_value_result.get('fair_value'):
+                    if 'valuation' not in quant_result['value']:
+                        quant_result['value']['valuation'] = {}
+                    quant_result['value']['valuation']['_fairValue'] = {
+                        'value': fair_value_result.get('fair_value'),
+                        'sectorAverages': fair_value_result.get('sector_averages'),
+                        'peerCount': fair_value_result.get('peer_count')
+                    }
+            else:
+                # Default: Quantitative position/disparity is always None (no target price)
+                position_quant, disparity_quant = calculate_position_disparity(
+                    quant_result.get('value'),
+                    qual_result.get('currentPrice')
+                )
             
             position_qual, disparity_qual = calculate_position_disparity(
                 qual_result.get('value'),
                 qual_result.get('currentPrice')
             )
+            
+            # Format values for better readability before storing
+            formatted_quant = format_value_quantitative(quant_result.get('value'))
+            formatted_qual = format_value_qualitative(qual_result.get('value'))
             
             # Prepare batch update
             batch_updates.append({
@@ -200,8 +229,8 @@ async def process_ticker_batch(
                 'event_date': event_date,
                 'source': source,
                 'source_id': source_id,
-                'value_quantitative': quant_result.get('value'),
-                'value_qualitative': qual_result.get('value'),
+                'value_quantitative': formatted_quant,
+                'value_qualitative': formatted_qual,
                 'position_quantitative': position_quant,
                 'position_qualitative': position_qual,
                 'disparity_quantitative': disparity_quant,
@@ -407,7 +436,11 @@ async def calculate_valuations(
     overwrite: bool = False,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
-    tickers: Optional[List[str]] = None
+    tickers: Optional[List[str]] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    calc_fair_value: bool = True,
+    metrics: Optional[List[str]] = None,
+    overwrite_metrics: bool = False
 ) -> Dict[str, Any]:
     """
     Calculate quantitative and qualitative valuations for all events in txn_events.
@@ -424,9 +457,20 @@ async def calculate_valuations(
         from_date: Optional start date for filtering events by event_date.
         to_date: Optional end date for filtering events by event_date.
         tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
+        cancel_event: Optional asyncio.Event for cancellation.
+        calc_fair_value: [DEPRECATED - I-41] If True, calculate sector-average-based fair value (I-36).
+        metrics: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
+        overwrite_metrics: If True, overwrite all specified metrics. If False, only update NULL values (I-41).
 
     Returns:
         Dict with summary and per-event results
+
+    Example:
+        # Update only priceQuantitative metric for NULL values
+        >>> await calculate_valuations(metrics=['priceQuantitative'], overwrite_metrics=False)
+
+        # Recalculate PER and PBR for all events (overwrite existing values)
+        >>> await calculate_valuations(metrics=['PER', 'PBR'], overwrite_metrics=True)
     """
     start_time = time.time()
     
@@ -589,10 +633,22 @@ async def calculate_valuations(
     
     async def process_ticker_with_semaphore(ticker: str, ticker_events: List[Dict[str, Any]]):
         nonlocal completed_tickers
+        
+        # Check for cancellation
+        if cancel_event and cancel_event.is_set():
+            logger.warning(f"[backfillEventsTable] Cancelled - skipping ticker {ticker}")
+            return {
+                'ticker': ticker,
+                'quantitative': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
+                'qualitative': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
+                'priceTrend': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
+                'dbUpdate': {'success': 0, 'fail': 0}
+            }
+        
         async with semaphore:
             result = await process_ticker_batch(
                 pool, ticker, ticker_events, metrics_by_domain, overwrite,
-                total_events_count, completed_events_count
+                total_events_count, completed_events_count, calc_fair_value
             )
             
             # Update progress
@@ -1009,8 +1065,9 @@ async def calculate_quantitative_metrics(
                     params = {'ticker': ticker}
                     
                     # Add API-specific parameters
-                    if 'historical-price' in api_id or 'eod' in api_id:
-                        # Historical price APIs need date range
+                    # I-25: fmp-historical-market-capitalization도 from/to 파라미터 필요
+                    if 'historical-price' in api_id or 'eod' in api_id or 'historical-market-cap' in api_id:
+                        # Historical price/market-cap APIs need date range
                         # Use wide date range to get all available data
                         params['fromDate'] = '2000-01-01'  # Far past
                         params['toDate'] = event_date_obj.strftime('%Y-%m-%d')
@@ -1239,18 +1296,53 @@ async def calculate_qualitative_metrics_fast(
             consensus_signal['delta'] = None
             consensus_signal['deltaPct'] = None
 
-        # Use CACHED consensus summary - NO API CALL!
-        target_median = 0
-        consensus_summary = consensus_summary_cache
+        # I-26: Check if event_date is historical (more than 7 days ago)
+        # FMP price-target-consensus API only provides current consensus, not historical
+        from datetime import timedelta
+        today = datetime.now().date()
         
-        if consensus_summary and isinstance(consensus_summary, dict):
-            target_median = consensus_summary.get('targetMedian', 0)
+        # Convert event_date to date object
+        if isinstance(event_date, str):
+            event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+        elif hasattr(event_date, 'date'):
+            event_date_obj = event_date.date()
+        else:
+            event_date_obj = event_date
+        
+        is_historical_event = event_date_obj < (today - timedelta(days=7))
+        
+        # Use CACHED consensus summary - NO API CALL!
+        # But only for recent events (within 7 days)
+        # Read targetSummary from evt_consensus.target_summary (pre-calculated by GET /sourceData Phase 3)
+        target_summary = consensus_data.get('target_summary')
+        
+        if target_summary:
+            # Extract targetMedian from the pre-calculated summary (I-37: use actual Median, not Avg)
+            target_median = target_summary.get('allTimeMedianPriceTarget')
+            target_average = target_summary.get('allTimeAvgPriceTarget')
+            consensus_meta = {
+                'dataAvailable': True,
+                'source': 'evt_consensus.target_summary',
+                'event_date': event_date_obj.isoformat()
+            }
+            logger.debug(f"[QualitativeMetrics] targetSummary read from evt_consensus for {ticker} at {event_date_obj}")
+        else:
+            # targetSummary not calculated yet - run GET /sourceData?mode=consensus first
+            target_median = None
+            consensus_meta = {
+                'dataAvailable': False,
+                'reason': 'targetSummary not calculated. Run GET /sourceData?mode=consensus first.',
+                'event_date': event_date_obj.isoformat()
+            }
+            logger.debug(f"[QualitativeMetrics] targetSummary not available for {ticker} at {event_date_obj} - run GET /sourceData first")
 
         # value_qualitative 구성
+        # targetSummary: 측정 당시(event_date 기준)의 price target 요약 (evt_consensus에서 계산)
         value_qualitative = {
             'targetMedian': target_median,
-            'consensusSummary': consensus_summary,
-            'consensusSignal': consensus_signal
+            'targetSummary': target_summary,  # 측정 당시의 요약 (replaced consensusSummary)
+            'consensusSignal': consensus_signal,
+            '_meta': consensus_meta
         }
 
         return {
@@ -1784,3 +1876,396 @@ async def generate_price_trends(
         'success': success_count,
         'fail': fail_count
     }
+
+
+# =============================================================================
+# I-36: 업종 평균 기반 적정가(Fair Value) 계산 함수들
+# =============================================================================
+
+async def get_peer_tickers(ticker: str) -> List[str]:
+    """
+    fmp-stock-peers API를 사용하여 동종 업종 티커 목록을 조회합니다.
+    
+    주의: fmp-stock-peers API는 현재 날짜 기준 데이터만 반환하므로,
+    symbol(ticker) 값만 사용하고 다른 값(price, mktCap 등)은 사용하지 않습니다. (I-36)
+    
+    Args:
+        ticker: 기준 티커
+    
+    Returns:
+        동종 업종 티커 목록 (기준 티커 제외)
+    """
+    try:
+        async with FMPAPIClient() as fmp_client:
+            response = await fmp_client.call_api('fmp-stock-peers', {'ticker': ticker})
+            
+            if not response or len(response) == 0:
+                logger.warning(f"[I-36] No peer tickers found for {ticker}")
+                return []
+            
+            # I-36: symbol(ticker) 값만 추출, 다른 값은 event_date와 무관하므로 사용하지 않음
+            peer_tickers = []
+            for item in response:
+                peer_list = item.get('peerTickers', [])
+                if isinstance(peer_list, list):
+                    for peer in peer_list:
+                        if isinstance(peer, dict) and 'symbol' in peer:
+                            peer_ticker = peer['symbol']
+                            if peer_ticker != ticker:  # 기준 티커 제외
+                                peer_tickers.append(peer_ticker)
+                        elif isinstance(peer, str):
+                            if peer != ticker:
+                                peer_tickers.append(peer)
+            
+            logger.debug(f"[I-36] Found {len(peer_tickers)} peer tickers for {ticker}: {peer_tickers[:5]}...")
+            return peer_tickers
+            
+    except Exception as e:
+        logger.error(f"[I-36] Failed to get peer tickers for {ticker}: {e}")
+        return []
+
+
+async def calculate_sector_average_metrics(
+    pool,
+    peer_tickers: List[str],
+    event_date,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    target_metrics: List[str] = ['PER', 'PBR']
+) -> Dict[str, float]:
+    """
+    동종 업종 티커들의 평균 PER, PBR 등을 계산합니다.
+    
+    Args:
+        pool: DB 연결 풀
+        peer_tickers: 동종 업종 티커 목록
+        event_date: 이벤트 날짜 (시간적 유효성 적용)
+        metrics_by_domain: 메트릭 정의
+        target_metrics: 계산할 메트릭 목록
+    
+    Returns:
+        {'PER': 25.5, 'PBR': 3.2, ...} 형태의 업종 평균
+    """
+    if not peer_tickers:
+        return {}
+    
+    # Transform 정의 로드
+    transforms = await metrics.select_metric_transforms(pool)
+    
+    # 메트릭 계산 엔진 초기화
+    engine = MetricCalculationEngine(metrics_by_domain, transforms)
+    engine.build_dependency_graph()
+    engine.topological_sort()
+    
+    # 필요한 API 목록
+    required_apis = engine.get_required_apis()
+    
+    # 각 peer 티커의 메트릭 수집
+    peer_metrics = {metric: [] for metric in target_metrics}
+    
+    async with FMPAPIClient() as fmp_client:
+        for peer_ticker in peer_tickers[:10]:  # 최대 10개 peer만 사용 (성능)
+            try:
+                # API 데이터 조회
+                peer_api_cache = {}
+                for api_id in required_apis:
+                    params = {'ticker': peer_ticker}
+                    
+                    # API별 파라미터 설정
+                    if 'income-statement' in api_id or 'balance-sheet' in api_id or 'cash-flow' in api_id:
+                        params['period'] = 'quarter'
+                        params['limit'] = 20
+                    elif 'historical-market-cap' in api_id:
+                        params['fromDate'] = '2000-01-01'
+                        if isinstance(event_date, str):
+                            params['toDate'] = event_date[:10]
+                        elif hasattr(event_date, 'strftime'):
+                            params['toDate'] = event_date.strftime('%Y-%m-%d')
+                        else:
+                            params['toDate'] = str(event_date)
+                    
+                    api_response = await fmp_client.call_api(api_id, params)
+                    if api_response:
+                        peer_api_cache[api_id] = api_response
+                
+                if not peer_api_cache:
+                    continue
+                
+                # event_date 기준 필터링 및 메트릭 계산
+                if isinstance(event_date, str):
+                    event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+                elif hasattr(event_date, 'date'):
+                    event_date_obj = event_date.date()
+                else:
+                    event_date_obj = event_date
+                
+                # 날짜 필터링
+                filtered_cache = {}
+                for api_id, records in peer_api_cache.items():
+                    if isinstance(records, list):
+                        filtered_cache[api_id] = [
+                            r for r in records 
+                            if _get_record_date(r) is None or _get_record_date(r) <= event_date_obj
+                        ]
+                    else:
+                        filtered_cache[api_id] = records
+                
+                # 메트릭 계산
+                result = engine.calculate_all(filtered_cache, ['valuation'])
+                
+                # 타겟 메트릭 수집
+                if 'valuation' in result:
+                    valuation = result['valuation']
+                    for metric in target_metrics:
+                        value = valuation.get(metric)
+                        if value is not None and isinstance(value, (int, float)) and value > 0:
+                            peer_metrics[metric].append(value)
+                
+            except Exception as e:
+                logger.debug(f"[I-36] Failed to calculate metrics for peer {peer_ticker}: {e}")
+                continue
+    
+    # 평균 계산
+    sector_averages = {}
+    for metric, values in peer_metrics.items():
+        if values:
+            # 이상치 제거 (IQR 방식)
+            values_sorted = sorted(values)
+            n = len(values_sorted)
+            if n >= 4:
+                q1 = values_sorted[n // 4]
+                q3 = values_sorted[3 * n // 4]
+                iqr = q3 - q1
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                filtered_values = [v for v in values if lower <= v <= upper]
+                if filtered_values:
+                    sector_averages[metric] = sum(filtered_values) / len(filtered_values)
+                else:
+                    sector_averages[metric] = sum(values) / len(values)
+            else:
+                sector_averages[metric] = sum(values) / len(values)
+            
+            logger.debug(f"[I-36] Sector average {metric}: {sector_averages[metric]:.2f} (from {len(values)} peers)")
+    
+    return sector_averages
+
+
+def calculate_fair_value_from_sector(
+    value_quantitative: Dict[str, Any],
+    sector_averages: Dict[str, float],
+    current_price: float
+) -> Optional[float]:
+    """
+    업종 평균 PER을 기반으로 적정가를 계산합니다.
+    
+    적정가 = (업종 평균 PER) × EPS
+    EPS = 현재 주가 / 현재 PER
+    
+    Args:
+        value_quantitative: Quantitative 메트릭 결과
+        sector_averages: 업종 평균 {'PER': 25.5, 'PBR': 3.2}
+        current_price: 현재 주가 (price_when_posted)
+    
+    Returns:
+        적정가 또는 None
+    """
+    if not value_quantitative or not sector_averages or not current_price:
+        return None
+    
+    try:
+        valuation = value_quantitative.get('valuation', {})
+        if isinstance(valuation, dict) and '_meta' in valuation:
+            # _meta 제외한 실제 값 추출
+            valuation = {k: v for k, v in valuation.items() if k != '_meta'}
+        
+        current_per = valuation.get('PER')
+        sector_avg_per = sector_averages.get('PER')
+        
+        if current_per and sector_avg_per and current_per != 0:
+            # EPS = 현재 주가 / 현재 PER
+            eps = current_price / current_per
+            # 적정가 = 업종 평균 PER × EPS
+            fair_value = sector_avg_per * eps
+            
+            logger.debug(
+                f"[I-36] Fair value calculation: "
+                f"current_price={current_price:.2f}, current_PER={current_per:.2f}, "
+                f"sector_avg_PER={sector_avg_per:.2f}, EPS={eps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value
+        
+        # PER이 없으면 PBR로 시도
+        current_pbr = valuation.get('PBR')
+        sector_avg_pbr = sector_averages.get('PBR')
+        
+        if current_pbr and sector_avg_pbr and current_pbr != 0:
+            # BPS = 현재 주가 / 현재 PBR
+            bps = current_price / current_pbr
+            # 적정가 = 업종 평균 PBR × BPS
+            fair_value = sector_avg_pbr * bps
+            
+            logger.debug(
+                f"[I-36] Fair value calculation (PBR): "
+                f"current_price={current_price:.2f}, current_PBR={current_pbr:.2f}, "
+                f"sector_avg_PBR={sector_avg_pbr:.2f}, BPS={bps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"[I-36] Failed to calculate fair value: {e}")
+        return None
+
+
+async def calculate_fair_value_for_ticker(
+    pool,
+    ticker: str,
+    event_date,
+    value_quantitative: Dict[str, Any],
+    current_price: float,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """
+    특정 티커의 업종 평균 기반 적정가를 계산합니다.
+    
+    Args:
+        pool: DB 연결 풀
+        ticker: 티커 심볼
+        event_date: 이벤트 날짜
+        value_quantitative: Quantitative 메트릭 결과
+        current_price: 현재 주가
+        metrics_by_domain: 메트릭 정의
+    
+    Returns:
+        {
+            'fair_value': 80.0,
+            'position': 'short',
+            'disparity': -0.20,
+            'sector_averages': {'PER': 20.0, 'PBR': 2.5},
+            'peer_count': 8
+        }
+    """
+    result = {
+        'fair_value': None,
+        'position': None,
+        'disparity': None,
+        'sector_averages': None,
+        'peer_count': 0
+    }
+    
+    try:
+        # 1. 동종 업종 티커 조회
+        peer_tickers = await get_peer_tickers(ticker)
+        if not peer_tickers:
+            logger.warning(f"[I-36] No peer tickers for {ticker}, skipping fair value calculation")
+            return result
+        
+        result['peer_count'] = len(peer_tickers)
+        
+        # 2. 업종 평균 PER/PBR 계산
+        sector_averages = await calculate_sector_average_metrics(
+            pool, peer_tickers, event_date, metrics_by_domain
+        )
+        if not sector_averages:
+            logger.warning(f"[I-36] Could not calculate sector averages for {ticker}")
+            return result
+        
+        result['sector_averages'] = sector_averages
+        
+        # 3. 적정가 계산
+        fair_value = calculate_fair_value_from_sector(
+            value_quantitative, sector_averages, current_price
+        )
+        if fair_value is None:
+            logger.warning(f"[I-36] Could not calculate fair value for {ticker}")
+            return result
+        
+        result['fair_value'] = round(fair_value, 2)
+        
+        # 4. Position, Disparity 계산
+        if fair_value > current_price:
+            result['position'] = 'long'
+        elif fair_value < current_price:
+            result['position'] = 'short'
+        else:
+            result['position'] = 'neutral'
+        
+        result['disparity'] = round((fair_value / current_price) - 1, 4) if current_price != 0 else None
+        
+        logger.info(
+            f"[I-36] Fair value for {ticker}: fair_value={result['fair_value']}, "
+            f"position={result['position']}, disparity={result['disparity']:.2%}"
+        )
+        
+        return result
+
+    except Exception as e:
+        logger.error(f"[I-36] Failed to calculate fair value for {ticker}: {e}")
+        return result
+
+
+# =============================================================================
+# I-41: priceQuantitative 메트릭 계산 (Metric System 통합)
+# =============================================================================
+
+async def calculate_price_quantitative_metric(
+    pool,
+    ticker: str,
+    event_date,
+    value_quantitative: Dict[str, Any],
+    current_price: float,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]]
+) -> Optional[float]:
+    """
+    priceQuantitative 메트릭을 계산합니다 (I-41).
+
+    이 함수는 calculate_fair_value_for_ticker를 래핑하여
+    메트릭 시스템(custom source)과 통합합니다.
+
+    Args:
+        pool: DB 연결 풀
+        ticker: 티커 심볼
+        event_date: 이벤트 날짜
+        value_quantitative: Quantitative 메트릭 결과 (PER, PBR 포함)
+        current_price: 현재 주가
+        metrics_by_domain: 메트릭 정의
+
+    Returns:
+        적정가 (fair value) 또는 None
+
+    Example:
+        >>> price_quant = await calculate_price_quantitative_metric(
+        ...     pool, 'AAPL', '2025-12-31',
+        ...     {'valuation': {'PER': 28.5, 'PBR': 7.2}},
+        ...     180.0,
+        ...     metrics_by_domain
+        ... )
+        >>> # price_quant = 185.0
+
+    Note:
+        - Peer tickers 없으면 None 반환
+        - I-36에서 구현한 로직 재사용
+    """
+    try:
+        # I-36 함수 재사용
+        result = await calculate_fair_value_for_ticker(
+            pool, ticker, event_date, value_quantitative, current_price, metrics_by_domain
+        )
+
+        fair_value = result.get('fair_value')
+
+        if fair_value is not None:
+            logger.info(
+                f"[I-41] priceQuantitative for {ticker}: {fair_value} "
+                f"(peers: {result.get('peer_count', 0)}, "
+                f"sector_avg: {result.get('sector_averages')})"
+            )
+        else:
+            logger.debug(f"[I-41] priceQuantitative for {ticker}: NULL (no peer tickers or calculation failed)")
+
+        return fair_value
+
+    except Exception as e:
+        logger.error(f"[I-41] Failed to calculate priceQuantitative for {ticker}: {e}")
+        return None

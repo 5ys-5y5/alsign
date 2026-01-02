@@ -6,6 +6,7 @@
  */
 
 import React, { useState, useRef, useCallback } from 'react';
+import { useLog } from '../contexts/LogContext';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
@@ -65,6 +66,38 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
 
   const handleQueryChange = (key, value) => {
     setQueryParams((prev) => ({ ...prev, [key]: value }));
+  };
+
+  /**
+   * Check if a field should be visible based on showWhen condition
+   */
+  const isFieldVisible = (field) => {
+    if (!field.showWhen) return true;
+    const { field: depField, values } = field.showWhen;
+    const currentValue = queryParams[depField];
+    return values.includes(currentValue);
+  };
+
+  /**
+   * Check if a field is required based on requiredWhen condition
+   */
+  const isFieldRequired = (field) => {
+    if (field.required) return true;
+    if (!field.requiredWhen) return false;
+    const { field: depField, values } = field.requiredWhen;
+    const currentValue = queryParams[depField];
+    return values.includes(currentValue);
+  };
+
+  /**
+   * Get dynamic description based on current selections
+   */
+  const getFieldDescription = (field) => {
+    if (field.dynamicDescription) {
+      const desc = field.dynamicDescription(queryParams);
+      if (desc) return desc;
+    }
+    return field.description || '';
   };
 
   const handleBodyChange = (value) => {
@@ -181,7 +214,12 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
         setLoading(false);
       });
 
-      eventSource.onerror = () => {
+      eventSource.onerror = (e) => {
+        // Only handle if not already closed by result/error event
+        if (eventSource.readyState === EventSource.CLOSED) {
+          return;
+        }
+        
         const duration = Date.now() - startTime;
         const errorMsg = 'Connection error';
 
@@ -198,6 +236,11 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
 
         eventSource.close();
         setLoading(false);
+      };
+      
+      // Safety net: ensure loading is reset when stream ends
+      eventSource.onopen = () => {
+        // Stream opened successfully
       };
 
     } else {
@@ -316,53 +359,80 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
             >
               Query Parameters
             </h4>
-            {queryFields.map((field) => (
-              <div key={field.key} style={{ marginBottom: 'var(--space-2)' }}>
-                <label
-                  style={{
-                    display: 'block',
-                    fontSize: 'var(--text-sm)',
-                    marginBottom: 'var(--space-1)',
-                  }}
-                >
-                  {field.label || field.key}
-                  {field.required && <span style={{ color: 'var(--accent-danger)' }}>*</span>}
-                </label>
-                {field.control === 'checkbox' ? (
-                  <input
-                    type="checkbox"
-                    checked={queryParams[field.key] || false}
-                    onChange={(e) => handleQueryChange(field.key, e.target.checked)}
-                  />
-                ) : field.control === 'select' ? (
-                  <select
-                    value={queryParams[field.key] || ''}
-                    onChange={(e) => handleQueryChange(field.key, e.target.value)}
+            {queryFields.filter(isFieldVisible).map((field) => {
+              const required = isFieldRequired(field);
+              const description = getFieldDescription(field);
+              
+              return (
+                <div key={field.key} style={{ marginBottom: 'var(--space-2)' }}>
+                  <label
+                    style={{
+                      display: 'block',
+                      fontSize: 'var(--text-sm)',
+                      marginBottom: 'var(--space-1)',
+                      fontWeight: required ? 'var(--font-semibold)' : 'normal',
+                    }}
                   >
-                    <option value="">(unset)</option>
-                    {field.options?.map((opt) => (
-                      <option key={opt} value={opt}>
-                        {opt}
-                      </option>
-                    ))}
-                  </select>
-                ) : field.type === 'date' ? (
-                  <input
-                    type="date"
-                    value={queryParams[field.key] || ''}
-                    onChange={(e) => handleQueryChange(field.key, e.target.value)}
-                    placeholder={field.placeholder}
-                  />
-                ) : (
-                  <input
-                    type="text"
-                    value={queryParams[field.key] || ''}
-                    onChange={(e) => handleQueryChange(field.key, e.target.value)}
-                    placeholder={field.placeholder}
-                  />
-                )}
-              </div>
-            ))}
+                    {field.label || field.key}
+                    {required && <span style={{ color: 'var(--accent-danger)', marginLeft: '2px' }}>*</span>}
+                  </label>
+                  {field.control === 'checkbox' ? (
+                    <input
+                      type="checkbox"
+                      checked={queryParams[field.key] || false}
+                      onChange={(e) => handleQueryChange(field.key, e.target.checked)}
+                    />
+                  ) : field.control === 'select' ? (
+                    <select
+                      value={queryParams[field.key] || ''}
+                      onChange={(e) => handleQueryChange(field.key, e.target.value)}
+                      style={{
+                        borderColor: required && !queryParams[field.key] ? 'var(--accent-warning)' : undefined,
+                      }}
+                    >
+                      <option value="">(unset)</option>
+                      {field.options?.map((opt) => (
+                        <option key={opt} value={opt}>
+                          {opt}
+                        </option>
+                      ))}
+                    </select>
+                  ) : field.type === 'date' ? (
+                    <input
+                      type="date"
+                      value={queryParams[field.key] || ''}
+                      onChange={(e) => handleQueryChange(field.key, e.target.value)}
+                      placeholder={field.placeholder}
+                      style={{
+                        borderColor: required && !queryParams[field.key] ? 'var(--accent-warning)' : undefined,
+                      }}
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      value={queryParams[field.key] || ''}
+                      onChange={(e) => handleQueryChange(field.key, e.target.value)}
+                      placeholder={field.placeholder}
+                      style={{
+                        borderColor: required && !queryParams[field.key] ? 'var(--accent-warning)' : undefined,
+                      }}
+                    />
+                  )}
+                  {description && (
+                    <div
+                      style={{
+                        fontSize: 'var(--text-xs)',
+                        color: 'var(--text-secondary)',
+                        marginTop: '2px',
+                        fontStyle: 'italic',
+                      }}
+                    >
+                      {description}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 
@@ -439,476 +509,20 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
 }
 
 /**
- * BottomPanel - Status and LOG monitoring panel.
- */
-function BottomPanel({ requests, logs, isOpen, onToggle, onClear, onCancelRequest }) {
-  const [activeTab, setActiveTab] = useState('status');
-  const [selectedRequestId, setSelectedRequestId] = useState(null);
-  const logEndRef = useRef(null);
-  const detailsEndRef = useRef(null);
-
-  const scrollToBottom = useCallback(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, []);
-
-  React.useEffect(() => {
-    if (activeTab === 'logs') {
-      scrollToBottom();
-    }
-  }, [logs, activeTab, scrollToBottom]);
-
-  const formatTime = (timestamp) => {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString('en-US', { hour12: false });
-  };
-
-  const formatDuration = (ms) => {
-    if (ms < 1000) return `${ms}ms`;
-    return `${(ms / 1000).toFixed(2)}s`;
-  };
-
-  const getStatusBadge = (status) => {
-    const styles = {
-      pending: { backgroundColor: '#fef3c7', color: '#92400e' },
-      success: { backgroundColor: '#d1fae5', color: '#065f46' },
-      error: { backgroundColor: '#fee2e2', color: '#991b1b' },
-    };
-
-    return (
-      <span
-        style={{
-          ...styles[status],
-          padding: '2px var(--space-1)',
-          borderRadius: 'var(--rounded-lg)',
-          fontSize: 'var(--text-xs)',
-          fontWeight: 'var(--font-medium)',
-          textTransform: 'uppercase',
-        }}
-      >
-        {status}
-      </span>
-    );
-  };
-
-  const getLogLevelBadge = (level) => {
-    const styles = {
-      info: { backgroundColor: '#dbeafe', color: '#1e40af' },
-      success: { backgroundColor: '#d1fae5', color: '#065f46' },
-      error: { backgroundColor: '#fee2e2', color: '#991b1b' },
-    };
-
-    return (
-      <span
-        style={{
-          ...styles[level],
-          padding: '2px var(--space-1)',
-          borderRadius: 'var(--rounded-lg)',
-          fontSize: 'var(--text-xs)',
-          fontWeight: 'var(--font-medium)',
-          textTransform: 'uppercase',
-          minWidth: '60px',
-          display: 'inline-block',
-          textAlign: 'center',
-        }}
-      >
-        {level}
-      </span>
-    );
-  };
-
-  if (!isOpen) {
-    return (
-      <div
-        style={{
-          position: 'fixed',
-          bottom: 0,
-          left: 0,
-          right: 0,
-          backgroundColor: 'white',
-          borderTop: '2px solid var(--border)',
-          zIndex: 'var(--z-toolbar)',
-        }}
-      >
-        <div
-          style={{
-            padding: 'var(--space-2) var(--space-3)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            cursor: 'pointer',
-          }}
-          onClick={onToggle}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-            <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)' }}>
-              Status & Logs
-            </span>
-            <span
-              style={{
-                backgroundColor: 'var(--accent-primary)',
-                color: 'white',
-                padding: '2px var(--space-1)',
-                borderRadius: 'var(--rounded-lg)',
-                fontSize: 'var(--text-xs)',
-                fontWeight: 'var(--font-medium)',
-              }}
-            >
-              {requests.length} requests, {logs.length} logs
-            </span>
-          </div>
-          <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-dim)' }}>▲ Expand</span>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        bottom: 0,
-        left: 0,
-        right: 0,
-        height: '400px',
-        backgroundColor: 'white',
-        borderTop: '2px solid var(--border)',
-        zIndex: 'var(--z-toolbar)',
-        display: 'flex',
-        flexDirection: 'column',
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          padding: 'var(--space-2) var(--space-3)',
-          borderBottom: '1px solid var(--border)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-          <button
-            onClick={() => setActiveTab('status')}
-            className={activeTab === 'status' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
-          >
-            Status ({requests.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('logs')}
-            className={activeTab === 'logs' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
-          >
-            Logs ({logs.length})
-          </button>
-          <button
-            onClick={() => setActiveTab('details')}
-            className={activeTab === 'details' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
-          >
-            Log Details
-            {selectedRequestId && (
-              <span style={{ marginLeft: 'var(--space-1)', opacity: 0.7 }}>
-                (Selected)
-              </span>
-            )}
-          </button>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
-          <button onClick={onClear} className="btn btn-sm btn-outline">
-            Clear All
-          </button>
-          <button
-            onClick={onToggle}
-            style={{
-              background: 'none',
-              border: 'none',
-              cursor: 'pointer',
-              fontSize: 'var(--text-sm)',
-              color: 'var(--text-dim)',
-            }}
-          >
-            ▼ Collapse
-          </button>
-        </div>
-      </div>
-
-      {/* Content */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: 'var(--space-2)' }}>
-        {activeTab === 'status' && (
-          <div className="table-shell" style={{ height: '100%' }}>
-            <div className="scroll-y" style={{ maxHeight: '100%' }}>
-              <table>
-                <thead>
-                  <tr>
-                    <th style={{ width: '80px' }}>Time</th>
-                    <th style={{ width: '80px' }}>Method</th>
-                    <th>Path</th>
-                    <th style={{ width: '100px' }}>Status</th>
-                    <th style={{ width: '80px' }}>Code</th>
-                    <th style={{ width: '100px' }}>Duration</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {requests.length === 0 ? (
-                    <tr>
-                      <td colSpan="6" className="empty-state">
-                        No requests yet. Execute an API request to see status here.
-                      </td>
-                    </tr>
-                  ) : (
-                    requests.map((req) => (
-                      <tr key={req.id}>
-                        <td style={{ fontSize: 'var(--text-xs)', fontFamily: 'monospace' }}>
-                          {formatTime(req.startTime)}
-                        </td>
-                        <td>
-                          <span
-                            style={{
-                              fontSize: 'var(--text-xs)',
-                              fontWeight: 'var(--font-semibold)',
-                              fontFamily: 'monospace',
-                            }}
-                          >
-                            {req.method}
-                          </span>
-                        </td>
-                        <td style={{ fontFamily: 'monospace', fontSize: 'var(--text-sm)' }}>
-                          {req.path}
-                          {req.query && (
-                            <span style={{ color: 'var(--text-dim)' }}>?{req.query}</span>
-                          )}
-                        </td>
-                        <td>{getStatusBadge(req.status)}</td>
-                        <td style={{ fontFamily: 'monospace', fontSize: 'var(--text-sm)' }}>
-                          {req.statusCode || '-'}
-                        </td>
-                        <td style={{ fontFamily: 'monospace', fontSize: 'var(--text-sm)' }}>
-                          {req.duration ? formatDuration(req.duration) : '-'}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        )}
-
-        {activeTab === 'logs' && (
-          <div style={{ fontFamily: 'monospace', fontSize: 'var(--text-xs)' }}>
-            {logs.length === 0 ? (
-              <div className="empty-state">
-                No logs yet. Execute an API request to see logs here.
-              </div>
-            ) : (
-              logs.map((log, index) => (
-                <div
-                  key={index}
-                  style={{
-                    padding: 'var(--space-1)',
-                    borderBottom: '1px solid var(--border)',
-                    display: 'flex',
-                    gap: 'var(--space-2)',
-                    alignItems: 'flex-start',
-                    cursor: log.requestId ? 'pointer' : 'default',
-                    backgroundColor: selectedRequestId === log.requestId ? 'var(--surface)' : 'transparent',
-                  }}
-                  onClick={() => {
-                    if (log.requestId) {
-                      setSelectedRequestId(log.requestId);
-                      setActiveTab('details');
-                    }
-                  }}
-                >
-                  <span style={{ color: 'var(--text-dim)', minWidth: '80px' }}>
-                    {formatTime(log.timestamp)}
-                  </span>
-                  {getLogLevelBadge(log.level)}
-                  <span style={{ flex: 1, color: 'var(--text)' }}>{log.message}</span>
-                  {log.requestId && (
-                    <span
-                      style={{
-                        color: 'var(--text-dim)',
-                        fontSize: '0.75em',
-                        padding: '2px 4px',
-                        backgroundColor: 'var(--surface)',
-                        borderRadius: 'var(--rounded-sm)',
-                      }}
-                    >
-                      Click for details →
-                    </span>
-                  )}
-                </div>
-              ))
-            )}
-            <div ref={logEndRef} />
-          </div>
-        )}
-
-        {activeTab === 'details' && (
-          <div style={{ fontFamily: 'monospace', fontSize: 'var(--text-xs)' }}>
-            {!selectedRequestId ? (
-              <div className="empty-state">
-                No request selected. Click on a log entry in the Logs tab to view detailed logs.
-              </div>
-            ) : (() => {
-              const selectedRequest = requests.find((req) => req.id === selectedRequestId);
-              if (!selectedRequest) {
-                return (
-                  <div className="empty-state">
-                    Selected request not found.
-                  </div>
-                );
-              }
-
-              const detailedLogs = selectedRequest.detailedLogs || [];
-
-              return (
-                <div>
-                  {/* Request Header */}
-                  <div
-                    style={{
-                      padding: 'var(--space-2)',
-                      backgroundColor: 'var(--surface)',
-                      borderBottom: '2px solid var(--border)',
-                      marginBottom: 'var(--space-2)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'var(--space-1)' }}>
-                      <div style={{ fontWeight: 'var(--font-semibold)' }}>
-                        {selectedRequest.method} {selectedRequest.path}
-                        {selectedRequest.query && `?${selectedRequest.query}`}
-                      </div>
-                      {selectedRequest.status === 'pending' && selectedRequest.eventSource && (
-                        <button
-                          onClick={() => onCancelRequest?.(selectedRequest.id)}
-                          className="btn btn-sm btn-outline"
-                          style={{ color: 'var(--accent-danger)', borderColor: 'var(--accent-danger)' }}
-                        >
-                          Cancel
-                        </button>
-                      )}
-                    </div>
-                    <div style={{ display: 'flex', gap: 'var(--space-2)', fontSize: 'var(--text-xs)' }}>
-                      <span>Status: {getStatusBadge(selectedRequest.status)}</span>
-                      <span>Code: {selectedRequest.statusCode || '-'}</span>
-                      <span>Duration: {selectedRequest.duration ? formatDuration(selectedRequest.duration) : '-'}</span>
-                      <span>Time: {formatTime(selectedRequest.startTime)}</span>
-                    </div>
-                  </div>
-
-                  {/* Detailed Logs */}
-                  {detailedLogs.length === 0 ? (
-                    <div className="empty-state">
-                      No detailed logs available for this request.
-                      <br />
-                      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
-                        (Backend must include 'detailedLogs' array in response)
-                      </span>
-                    </div>
-                  ) : (
-                    detailedLogs.map((logLine, index) => (
-                      <div
-                        key={index}
-                        style={{
-                          padding: 'var(--space-1) var(--space-2)',
-                          fontFamily: 'monospace',
-                          fontSize: 'var(--text-xs)',
-                          color: 'var(--text)',
-                        }}
-                      >
-                        {logLine}
-                      </div>
-                    ))
-                  )}
-                  <div ref={detailsEndRef} />
-                </div>
-              );
-            })()}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/**
  * RequestsPage component.
  */
 export default function RequestsPage() {
-  const [requests, setRequests] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [panelOpen, setPanelOpen] = useState(true);
-
-  const handleRequestStart = useCallback((request) => {
-    setRequests((prev) => [...prev, request]);
-  }, []);
-
-  const handleRequestComplete = useCallback((update) => {
-    setRequests((prev) =>
-      prev.map((req) => (req.id === update.id ? { ...req, ...update } : req))
-    );
-  }, []);
-
-  const handleLog = useCallback((level, message, requestId) => {
-    setLogs((prev) => [...prev, { timestamp: Date.now(), level, message, requestId }]);
-  }, []);
-
-  const handleClearAll = useCallback(() => {
-    setRequests([]);
-    setLogs([]);
-  }, []);
-
-  const handleCancelRequest = useCallback(async (requestId) => {
-    const request = requests.find((req) => req.id === requestId);
-    if (!request) return;
-
-    // Close EventSource if it exists
-    if (request.eventSource) {
-      request.eventSource.close();
-    }
-
-    // Determine cancel endpoint based on request path
-    let cancelEndpoint;
-    if (request.path === '/sourceData') {
-      cancelEndpoint = `${API_BASE_URL}/sourceData/cancel/${requestId}`;
-    } else if (request.path === '/setEventsTable') {
-      cancelEndpoint = `${API_BASE_URL}/setEventsTable/cancel/${requestId}`;
-    } else if (request.path === '/backfillEventsTable') {
-      cancelEndpoint = `${API_BASE_URL}/backfillEventsTable/cancel/${requestId}`;
-    }
-
-    // Call backend cancel endpoint
-    if (cancelEndpoint) {
-      try {
-        await fetch(cancelEndpoint, {
-          method: 'POST',
-        });
-      } catch (err) {
-        console.error('Failed to cancel request:', err);
-      }
-    }
-
-    // Update request status
-    setRequests((prev) =>
-      prev.map((req) =>
-        req.id === requestId
-          ? { ...req, status: 'error', error: 'Cancelled by user', eventSource: null }
-          : req
-      )
-    );
-
-    handleLog('error', 'Request cancelled by user', requestId);
-  }, [requests, handleLog]);
+  // Use global log context
+  const { handleRequestStart, handleRequestComplete, handleLog } = useLog();
 
   return (
     <>
-      <div style={{ padding: 'var(--space-4)', maxWidth: '1200px', margin: '0 auto', paddingBottom: panelOpen ? '420px' : '80px' }}>
-        <header style={{ marginBottom: 'var(--space-4)' }}>
-          <h1>Requests</h1>
-          <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
-            Execute backend API requests
-          </p>
-        </header>
+      <header style={{ marginBottom: 'var(--space-4)' }}>
+        <h1>Requests</h1>
+        <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
+          Execute backend API requests
+        </p>
+      </header>
 
         {/* GET /sourceData */}
         <RequestForm
@@ -939,8 +553,78 @@ export default function RequestsPage() {
               key: 'calc_mode',
               type: 'string',
               control: 'select',
-              options: ['maintenance'],
+              options: ['maintenance', 'calculation'],
               required: false,
+              dynamicDescription: (params) => {
+                if (params.calc_mode === 'maintenance') {
+                  return '✅ Phase 1 (API 호출) + Phase 2 (prev/direction 계산) - 사용자 지정 scope로 실행';
+                } else if (params.calc_mode === 'calculation') {
+                  return '✅ Phase 2만 실행 (API 호출 없음) - 기존 데이터로 prev/direction 계산';
+                }
+                return 'maintenance: Phase1+2 with scope, calculation: Phase2 only (no API calls)';
+              },
+            },
+            {
+              key: 'calc_scope',
+              type: 'string',
+              control: 'select',
+              options: ['all', 'ticker', 'event_date_range', 'partition_keys'],
+              required: false,
+              showWhen: { field: 'calc_mode', values: ['maintenance', 'calculation'] },
+              requiredWhen: { field: 'calc_mode', values: ['maintenance', 'calculation'] },
+              dynamicDescription: (params) => {
+                if (!params.calc_mode) return '';
+                if (params.calc_scope === 'all') {
+                  return '📊 전체 파티션 대상으로 계산 수행';
+                } else if (params.calc_scope === 'ticker') {
+                  return '🎯 특정 티커만 대상으로 계산 수행 → tickers 필드 입력 필요';
+                } else if (params.calc_scope === 'event_date_range') {
+                  return '📅 날짜 범위 내 이벤트 대상으로 계산 수행 → from/to 필드 입력 필요';
+                } else if (params.calc_scope === 'partition_keys') {
+                  return '🔑 지정된 파티션(ticker+analyst)만 대상으로 계산 수행 → partitions 필드 입력 필요';
+                }
+                return '⚠️ calc_mode가 설정되면 필수입니다';
+              },
+            },
+            {
+              key: 'tickers',
+              type: 'string',
+              control: 'input',
+              placeholder: 'RGTI,AAPL,MSFT',
+              required: false,
+              showWhen: { field: 'calc_scope', values: ['ticker'] },
+              requiredWhen: { field: 'calc_scope', values: ['ticker'] },
+              description: '쉼표로 구분된 티커 목록 (예: RGTI,AAPL,MSFT)',
+            },
+            {
+              key: 'from',
+              type: 'string',
+              control: 'input',
+              placeholder: '2023-01-01',
+              required: false,
+              showWhen: { field: 'calc_scope', values: ['event_date_range'] },
+              requiredWhen: { field: 'calc_scope', values: ['event_date_range'] },
+              description: '시작 날짜 (YYYY-MM-DD 형식)',
+            },
+            {
+              key: 'to',
+              type: 'string',
+              control: 'input',
+              placeholder: '2025-12-31',
+              required: false,
+              showWhen: { field: 'calc_scope', values: ['event_date_range'] },
+              requiredWhen: { field: 'calc_scope', values: ['event_date_range'] },
+              description: '종료 날짜 (YYYY-MM-DD 형식)',
+            },
+            {
+              key: 'partitions',
+              type: 'string',
+              control: 'input',
+              placeholder: '[{"ticker":"RGTI","analyst_name":"David Williams","analyst_company":"Williams Trading"}]',
+              required: false,
+              showWhen: { field: 'calc_scope', values: ['partition_keys'] },
+              requiredWhen: { field: 'calc_scope', values: ['partition_keys'] },
+              description: 'JSON 배열 형식의 파티션 목록',
             },
           ]}
           onRequestStart={handleRequestStart}
@@ -1070,16 +754,6 @@ export default function RequestsPage() {
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
         />
-      </div>
-
-      <BottomPanel
-        requests={requests}
-        logs={logs}
-        isOpen={panelOpen}
-        onToggle={() => setPanelOpen(!panelOpen)}
-        onClear={handleClearAll}
-        onCancelRequest={handleCancelRequest}
-      />
     </>
   );
 }

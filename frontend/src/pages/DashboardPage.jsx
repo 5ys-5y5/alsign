@@ -149,13 +149,7 @@ export default function DashboardPage() {
   }, [groupBy]);
 
   return (
-    <div
-      style={{
-        padding: 'var(--space-4)',
-        maxWidth: '1400px',
-        margin: '0 auto',
-      }}
-    >
+    <>
       {/* Page Header */}
       <header style={{ marginBottom: 'var(--space-4)' }}>
         <h1>Dashboard</h1>
@@ -253,6 +247,6 @@ export default function DashboardPage() {
           <DayOffsetTable data={dayOffsetData} loading={dayOffsetLoading} />
         )}
       </section>
-    </div>
+    </>
   );
 }

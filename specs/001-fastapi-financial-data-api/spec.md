@@ -56,10 +56,11 @@ Financial analysts need each event to be evaluated with quantitative financial m
 
 1. **Given** txn_events has events with ticker/event_date, **When** calling `POST /backfillEventsTable`, **Then** value_quantitative is populated with financial ratios (PER, PBR, ROE, etc.) grouped by domain
 2. **Given** evt_consensus has price target data, **When** calculating qualitative metrics, **Then** consensusSignal includes direction, last/prev values, delta, deltaPct
-3. **Given** quantitative metrics are calculated, **When** comparing priceQuantitative with current price, **Then** position_quantitative is set to "long" or "short"
+3. **Given** calcFairValue=true (default), **When** calling `POST /backfillEventsTable`, **Then** position_quantitative is calculated using sector-average-based fair value and set to "long", "short", or "neutral"
 4. **Given** qualitative metrics are calculated, **When** comparing priceQualitative with current price, **Then** position_qualitative is set to "long" or "short"
 5. **Given** overwrite=false, **When** calling `POST /backfillEventsTable`, **Then** only NULL values within jsonb fields are updated
 6. **Given** TTM calculation requires 4 quarters, **When** only 3 quarters available, **Then** system uses (Q0+Q1+Q2)/3 × 4 and records calcType as "TTM_partialQuarter"
+7. **Given** calcFairValue=true (default), **When** calculating valuations, **Then** system fetches peer tickers via fmp-stock-peers API and calculates sector-average PER/PBR for fair value estimation (I-36, I-38)
 
 ---
 

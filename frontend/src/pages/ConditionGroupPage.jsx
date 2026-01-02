@@ -90,7 +90,7 @@ export default function ConditionGroupPage() {
   };
 
   return (
-    <div style={{ padding: 'var(--space-4)', maxWidth: '1200px', margin: '0 auto' }}>
+    <>
       <header style={{ marginBottom: 'var(--space-4)' }}>
         <h1>Condition Group</h1>
         <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
@@ -191,6 +191,6 @@ export default function ConditionGroupPage() {
           )}
         </section>
       </div>
-    </div>
+    </>
   );
 }

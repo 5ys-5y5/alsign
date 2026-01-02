@@ -3,7 +3,8 @@
 import logging
 import time
 import json
-from typing import Dict, Any, List, Tuple
+import asyncio
+from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, date, timedelta
 
 from ..database.connection import db_pool
@@ -14,6 +15,11 @@ from .utils.datetime_utils import parse_to_utc, parse_date_only_to_utc
 from ..models.response_models import Counters, PhaseCounters
 
 logger = logging.getLogger("alsign")
+
+# Concurrency settings for API calls (considering FMP rate limits)
+API_CONCURRENCY = 5   # Max concurrent API calls (conservative for stability)
+API_BATCH_SIZE = 20   # Batch size for progress logging
+API_RETRY_COUNT = 2   # Number of retries for failed API calls
 
 
 async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
@@ -190,8 +196,11 @@ async def get_consensus(
     Phase 2: Calculate prev values and direction for target partitions
 
     Args:
-        calc_mode: 'maintenance' or None (default: affected partitions only)
-        calc_scope: 'all', 'ticker', 'event_date_range', 'partition_keys' (required if calc_mode=maintenance)
+        calc_mode: 
+            - None (default): Phase 1 + Phase 2 for affected partitions only
+            - 'maintenance': Phase 1 + Phase 2 with custom scope
+            - 'calculation': Phase 2 only (skip API calls, use existing data)
+        calc_scope: 'all', 'ticker', 'event_date_range', 'partition_keys' (required if calc_mode=maintenance or calculation)
         tickers_param: Comma-separated tickers (required if calc_scope=ticker)
         from_date: Start date (required if calc_scope=event_date_range)
         to_date: End date (required if calc_scope=event_date_range)
@@ -205,60 +214,193 @@ async def get_consensus(
 
     pool = await db_pool.get_pool()
 
-    # Phase 1: Raw Upsert
-    phase1_start = time.time()
+    # calc_mode=calculation: Skip Phase 1 (API calls), only run Phase 2
+    if calc_mode == 'calculation':
+        logger.info(
+            f"[get_consensus] calc_mode=calculation: Skipping Phase 1, running Phase 2 only",
+            extra={
+                'endpoint': 'GET /sourceData',
+                'phase': 'consensus-phase1-skip',
+                'elapsed_ms': 0,
+                'counters': {},
+                'progress': {'done': 0, 'total': 0, 'pct': 0},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        
+        phase1_elapsed = 0
+        phase1_counters = Counters()
+        affected_partitions = []
+        
+        # Phase 2 will use calc_scope to determine target partitions
+    else:
+        # Phase 1: Raw Upsert (Parallel API calls)
+        phase1_start = time.time()
 
-    # Get all tickers from targets
-    ticker_list = await targets.get_all_tickers(pool)
+        # Get all tickers from targets
+        ticker_list = await targets.get_all_tickers(pool)
 
-    if not ticker_list:
-        warn_codes.append("NO_TICKERS_IN_TARGETS")
-        return {
-            "executed": True,
-            "elapsedMs": 0,
-            "counters": Counters(),
-            "phase1": PhaseCounters(elapsedMs=0, counters=Counters()),
-            "phase2": {"partitionsProcessed": 0, "partitionsFailed": 0, "counters": Counters()},
-            "warn": warn_codes
-        }
+        if not ticker_list:
+            warn_codes.append("NO_TICKERS_IN_TARGETS")
+            return {
+                "executed": True,
+                "elapsedMs": 0,
+                "counters": Counters(),
+                "phase1": PhaseCounters(elapsedMs=0, counters=Counters()),
+                "phase2": {"partitionsProcessed": 0, "partitionsFailed": 0, "counters": Counters()},
+                "warn": warn_codes
+            }
 
-    # Fetch consensus for each ticker
-    all_consensus = []
-    async with FMPAPIClient() as fmp_client:
-        for ticker in ticker_list:
-            consensus_list = await fmp_client.get_price_target_consensus(ticker)
-            if consensus_list:
-                all_consensus.extend(consensus_list)
+        total_tickers = len(ticker_list)
+        logger.info(
+            f"[get_consensus] Phase 1: Fetching consensus for {total_tickers} tickers (parallel, concurrency={API_CONCURRENCY})",
+            extra={
+                'endpoint': 'GET /sourceData',
+                'phase': 'consensus-phase1-start',
+                'elapsed_ms': 0,
+                'counters': {},
+                'progress': {'done': 0, 'total': total_tickers, 'pct': 0},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
 
-    # Upsert Phase 1
-    phase1_result, affected_partitions = await consensus.upsert_consensus_phase1(pool, all_consensus)
+        # Parallel API calls with semaphore
+        all_consensus = []
+        completed_tickers = 0
+        failed_tickers = 0
+        semaphore = asyncio.Semaphore(API_CONCURRENCY)
+        results_lock = asyncio.Lock()
 
-    phase1_elapsed = int((time.time() - phase1_start) * 1000)
-    phase1_counters = Counters(
-        success=phase1_result.get("insert", 0) + phase1_result.get("update", 0),
-        fail=0,
-        skip=0,
-        update=phase1_result.get("update", 0),
-        insert=phase1_result.get("insert", 0),
-        conflict=0
-    )
+        async def fetch_ticker_consensus(fmp_client: FMPAPIClient, ticker: str):
+            nonlocal completed_tickers, failed_tickers
+            async with semaphore:
+                consensus_list = None
+                last_error = None
+                
+                # Retry logic
+                for attempt in range(API_RETRY_COUNT + 1):
+                    try:
+                        consensus_list = await fmp_client.get_price_target_consensus(ticker)
+                        break  # Success
+                    except Exception as e:
+                        last_error = e
+                        if attempt < API_RETRY_COUNT:
+                            await asyncio.sleep(1 * (attempt + 1))  # Backoff
+                        continue
+                
+                async with results_lock:
+                    if consensus_list is not None:
+                        if consensus_list:
+                            all_consensus.extend(consensus_list)
+                    elif last_error:
+                        failed_tickers += 1
+                        logger.warning(f"[Phase 1] Failed to fetch consensus for {ticker} after {API_RETRY_COUNT+1} attempts: {last_error}")
+                    
+                    completed_tickers += 1
+                    
+                    # Log progress every batch
+                    if completed_tickers % API_BATCH_SIZE == 0 or completed_tickers == total_tickers:
+                        progress_pct = (completed_tickers / total_tickers) * 100
+                        elapsed = time.time() - phase1_start
+                        rate = completed_tickers / elapsed if elapsed > 0 else 0
+                        remaining = total_tickers - completed_tickers
+                        eta_seconds = remaining / rate if rate > 0 else 0
+                        eta_str = f"{int(eta_seconds)}s" if eta_seconds < 60 else f"{int(eta_seconds/60)}m {int(eta_seconds%60)}s"
+                        
+                        logger.info(
+                            f"[Phase 1] progress={completed_tickers}/{total_tickers}({progress_pct:.1f}%) | rate={rate:.1f}/s | ETA: {eta_str}",
+                            extra={
+                                'endpoint': 'GET /sourceData',
+                                'phase': 'consensus-phase1',
+                                'elapsed_ms': int(elapsed * 1000),
+                                'counters': {'success': completed_tickers - failed_tickers, 'fail': failed_tickers},
+                                'progress': {'done': completed_tickers, 'total': total_tickers, 'pct': int(progress_pct)},
+                                'rate': {'per_second': rate},
+                                'batch': {},
+                                'warn': []
+                            }
+                        )
+
+        async with FMPAPIClient() as fmp_client:
+            tasks = [fetch_ticker_consensus(fmp_client, ticker) for ticker in ticker_list]
+            await asyncio.gather(*tasks)
+
+        # Upsert Phase 1
+        phase1_result, affected_partitions = await consensus.upsert_consensus_phase1(pool, all_consensus)
+
+        phase1_elapsed = int((time.time() - phase1_start) * 1000)
+        phase1_counters = Counters(
+            success=phase1_result.get("insert", 0) + phase1_result.get("update", 0),
+            fail=failed_tickers,
+            skip=0,
+            update=phase1_result.get("update", 0),
+            insert=phase1_result.get("insert", 0),
+            conflict=0
+        )
+        
+        logger.info(
+            f"[Phase 1] Complete: {len(all_consensus)} records from {completed_tickers} tickers in {phase1_elapsed}ms",
+            extra={
+                'endpoint': 'GET /sourceData',
+                'phase': 'consensus-phase1-complete',
+                'elapsed_ms': phase1_elapsed,
+                'counters': {'success': completed_tickers - failed_tickers, 'fail': failed_tickers},
+                'progress': {'done': total_tickers, 'total': total_tickers, 'pct': 100},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
 
     # Phase 2: Change Detection
     phase2_start = time.time()
 
     # Determine target partitions
-    if calc_mode == 'maintenance':
+    if calc_mode in ('maintenance', 'calculation'):
+        # maintenance/calculation mode: use calc_scope to determine partitions
         target_partitions = await determine_phase2_partitions(
             pool, calc_scope, tickers_param, from_date, to_date, partitions_param
         )
+        logger.info(
+            f"[get_consensus] Phase 2 starting: {len(target_partitions)} partitions (calc_mode={calc_mode}, calc_scope={calc_scope})",
+            extra={
+                'endpoint': 'GET /sourceData',
+                'phase': 'consensus-phase2-start',
+                'elapsed_ms': 0,
+                'counters': {},
+                'progress': {'done': 0, 'total': len(target_partitions), 'pct': 0},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
     else:
-        # Default mode: only affected partitions
+        # Default mode: only affected partitions from Phase 1
         target_partitions = affected_partitions
+        logger.info(
+            f"[get_consensus] Phase 2 starting: {len(target_partitions)} partitions from Phase 1 affected partitions",
+            extra={
+                'endpoint': 'GET /sourceData',
+                'phase': 'consensus-phase2-start',
+                'elapsed_ms': 0,
+                'counters': {},
+                'progress': {'done': 0, 'total': len(target_partitions), 'pct': 0},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
 
     # Process each partition
     phase2_updates = []
     partitions_processed = 0
     partitions_failed = 0
+    total_partitions = len(target_partitions)
+    partition_start_times = []
 
     for partition in target_partitions:
         ticker, analyst_name, analyst_company = partition
@@ -273,14 +415,19 @@ async def get_consensus(
                     # There is a previous event
                     prev_event = events[i + 1]
 
-                    price_target_prev = prev_event['price_target']
-                    price_when_posted_prev = prev_event['price_when_posted']
+                    # Convert Decimal to float for JSON serialization
+                    price_target_prev = float(prev_event['price_target']) if prev_event['price_target'] is not None else None
+                    price_when_posted_prev = float(prev_event['price_when_posted']) if prev_event['price_when_posted'] is not None else None
+                    current_price_target = float(event['price_target']) if event['price_target'] is not None else None
 
                     # Calculate direction
-                    if event['price_target'] > price_target_prev:
-                        direction = 'up'
-                    elif event['price_target'] < price_target_prev:
-                        direction = 'down'
+                    if current_price_target is not None and price_target_prev is not None:
+                        if current_price_target > price_target_prev:
+                            direction = 'up'
+                        elif current_price_target < price_target_prev:
+                            direction = 'down'
+                        else:
+                            direction = None
                     else:
                         direction = None
 
@@ -305,16 +452,177 @@ async def get_consensus(
                 })
 
             partitions_processed += 1
+            partition_start_times.append(time.time())
+
+            # Log progress every 5 partitions or on last partition
+            if partitions_processed % 5 == 0 or partitions_processed == total_partitions:
+                progress_pct = (partitions_processed / total_partitions) * 100 if total_partitions > 0 else 0
+                
+                # Calculate ETA
+                if len(partition_start_times) >= 2:
+                    recent_times = partition_start_times[-min(10, len(partition_start_times)):]
+                    if len(recent_times) >= 2:
+                        avg_time_per_partition = (recent_times[-1] - recent_times[0]) / (len(recent_times) - 1)
+                        remaining_partitions = total_partitions - partitions_processed
+                        eta_seconds = remaining_partitions * avg_time_per_partition
+                        
+                        if eta_seconds > 60:
+                            eta_str = f"{int(eta_seconds / 60)}min {int(eta_seconds % 60)}s"
+                        else:
+                            eta_str = f"{int(eta_seconds)}s"
+                    else:
+                        eta_str = "calculating..."
+                else:
+                    eta_str = "calculating..."
+                
+                elapsed = time.time() - phase2_start
+                rate = partitions_processed / elapsed if elapsed > 0 else 0
+                
+                logger.info(
+                    f"[Phase 2] progress={partitions_processed}/{total_partitions}({progress_pct:.1f}%) | rate={rate:.1f}/s | ETA: {eta_str}",
+                    extra={
+                        'endpoint': 'GET /sourceData',
+                        'phase': 'consensus-phase2',
+                        'elapsed_ms': int(elapsed * 1000),
+                        'counters': {'success': partitions_processed, 'fail': partitions_failed},
+                        'progress': {'done': partitions_processed, 'total': total_partitions, 'pct': int(progress_pct)},
+                        'rate': {'per_second': rate},
+                        'batch': {},
+                        'warn': []
+                    }
+                )
 
         except Exception as e:
             logger.error(f"Phase 2 failed for partition ({ticker}, {analyst_name}, {analyst_company}): {e}")
             partitions_failed += 1
+            partition_start_times.append(time.time())
             continue
 
     # Apply Phase 2 updates
     phase2_update_count = await consensus.update_consensus_phase2(pool, phase2_updates)
 
     phase2_elapsed = int((time.time() - phase2_start) * 1000)
+    
+    # Phase 2 complete log
+    logger.info(
+        f"[Phase 2] Complete: {partitions_processed} partitions, {phase2_update_count} events updated in {phase2_elapsed}ms",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'consensus-phase2-complete',
+            'elapsed_ms': phase2_elapsed,
+            'counters': {'success': partitions_processed, 'fail': partitions_failed, 'update': phase2_update_count},
+            'progress': {'done': total_partitions, 'total': total_partitions, 'pct': 100},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
+    # Phase 3: Calculate targetSummary for each event
+    phase3_start = time.time()
+    phase3_success = 0
+    phase3_fail = 0
+    phase3_skip = 0
+    
+    logger.info(
+        f"[get_consensus] Phase 3 starting: targetSummary calculation (overwrite={overwrite})",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'consensus-phase3-start',
+            'elapsed_ms': 0,
+            'counters': {},
+            'progress': {'done': 0, 'total': 0, 'pct': 0},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+    
+    # Get events needing targetSummary calculation
+    events_for_summary = await consensus.get_events_for_target_summary(
+        pool, overwrite, calc_scope, tickers_param, from_date, to_date
+    )
+    
+    total_events_phase3 = len(events_for_summary)
+    logger.info(f"[Phase 3] Found {total_events_phase3} events for targetSummary calculation")
+    
+    # Batch processing
+    BATCH_SIZE = 100
+    phase3_updates = []
+    
+    for idx, event in enumerate(events_for_summary):
+        try:
+            # Calculate targetSummary for this event
+            target_summary = await consensus.calculate_target_summary(
+                pool, event['ticker'], event['event_date']
+            )
+            
+            if target_summary:
+                phase3_updates.append({
+                    'id': event['id'],
+                    'target_summary': target_summary
+                })
+                phase3_success += 1
+            else:
+                phase3_skip += 1
+                # Log first few skips for debugging
+                if phase3_skip <= 5:
+                    logger.debug(
+                        f"[Phase 3] Skip: no target_summary for ticker={event['ticker']}, event_date={event['event_date']}, id={event['id']}"
+                    )
+            
+            # Log progress every 100 events
+            if (idx + 1) % 100 == 0 or (idx + 1) == total_events_phase3:
+                progress_pct = ((idx + 1) / total_events_phase3) * 100 if total_events_phase3 > 0 else 0
+                elapsed = time.time() - phase3_start
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                remaining = total_events_phase3 - (idx + 1)
+                eta_seconds = remaining / rate if rate > 0 else 0
+                eta_str = f"{int(eta_seconds)}s" if eta_seconds < 60 else f"{int(eta_seconds/60)}m {int(eta_seconds%60)}s"
+                
+                logger.info(
+                    f"[Phase 3] progress={idx + 1}/{total_events_phase3}({progress_pct:.1f}%) | rate={rate:.1f}/s | ETA: {eta_str}",
+                    extra={
+                        'endpoint': 'GET /sourceData',
+                        'phase': 'consensus-phase3',
+                        'elapsed_ms': int(elapsed * 1000),
+                        'counters': {'success': phase3_success, 'fail': phase3_fail, 'skip': phase3_skip},
+                        'progress': {'done': idx + 1, 'total': total_events_phase3, 'pct': int(progress_pct)},
+                        'rate': {'per_second': rate},
+                        'batch': {},
+                        'warn': []
+                    }
+                )
+            
+            # Batch update every BATCH_SIZE events
+            if len(phase3_updates) >= BATCH_SIZE:
+                await consensus.update_target_summary_batch(pool, phase3_updates)
+                phase3_updates = []
+                
+        except Exception as e:
+            logger.error(f"Phase 3 failed for event {event['id']}: {e}")
+            phase3_fail += 1
+    
+    # Final batch update
+    if phase3_updates:
+        await consensus.update_target_summary_batch(pool, phase3_updates)
+    
+    phase3_elapsed = int((time.time() - phase3_start) * 1000)
+    
+    # Phase 3 complete log
+    logger.info(
+        f"[Phase 3] Complete: {phase3_success} events updated, {phase3_skip} skipped, {phase3_fail} failed in {phase3_elapsed}ms",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'consensus-phase3-complete',
+            'elapsed_ms': phase3_elapsed,
+            'counters': {'success': phase3_success, 'fail': phase3_fail, 'skip': phase3_skip},
+            'progress': {'done': total_events_phase3, 'total': total_events_phase3, 'pct': 100},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
 
     total_elapsed = int((time.time() - start_time) * 1000)
 
@@ -322,10 +630,10 @@ async def get_consensus(
         "executed": True,
         "elapsedMs": total_elapsed,
         "counters": Counters(
-            success=phase1_counters.success + phase2_update_count,
-            fail=partitions_failed,
-            skip=0,
-            update=phase1_counters.update + phase2_update_count,
+            success=phase1_counters.success + phase2_update_count + phase3_success,
+            fail=partitions_failed + phase3_fail,
+            skip=phase3_skip,
+            update=phase1_counters.update + phase2_update_count + phase3_success,
             insert=phase1_counters.insert,
             conflict=0
         ),
@@ -334,6 +642,11 @@ async def get_consensus(
             "partitionsProcessed": partitions_processed,
             "partitionsFailed": partitions_failed,
             "counters": Counters(update=phase2_update_count, success=phase2_update_count, fail=partitions_failed)
+        },
+        "phase3": {
+            "eventsProcessed": total_events_phase3,
+            "elapsedMs": phase3_elapsed,
+            "counters": Counters(success=phase3_success, fail=phase3_fail, skip=phase3_skip, update=phase3_success)
         },
         "warn": warn_codes,
         "dbWrites": [
@@ -348,6 +661,12 @@ async def get_consensus(
                 "insert": 0,
                 "update": phase2_update_count,
                 "total": phase2_update_count
+            },
+            {
+                "table": "evt_consensus (Phase 3 - Target Summary)",
+                "insert": 0,
+                "update": phase3_success,
+                "total": phase3_success
             }
         ]
     }
@@ -478,15 +797,88 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
 
     logger.info(f"[get_earning] Found {len(valid_tickers_set)} valid tickers in config_lv3_targets")
 
-    # Fetch earnings for each range
+    # Fetch earnings for each range (Parallel API calls)
+    total_ranges = len(date_ranges)
+    logger.info(
+        f"[get_earning] Fetching earnings for {total_ranges} date ranges (parallel, concurrency={API_CONCURRENCY})",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'earning-fetch-start',
+            'elapsed_ms': 0,
+            'counters': {},
+            'progress': {'done': 0, 'total': total_ranges, 'pct': 0},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
     all_earnings = []
+    completed_ranges = 0
+    failed_ranges = 0
+    fetch_start = time.time()
+    semaphore = asyncio.Semaphore(API_CONCURRENCY)
+    results_lock = asyncio.Lock()
+
+    async def fetch_range_earnings(fmp_client: FMPAPIClient, from_dt: date, to_dt: date):
+        nonlocal completed_ranges, failed_ranges
+        async with semaphore:
+            earnings_data = None
+            last_error = None
+            
+            # Retry logic
+            for attempt in range(API_RETRY_COUNT + 1):
+                try:
+                    earnings_data = await fmp_client.get_earnings_calendar(
+                        from_dt.isoformat(),
+                        to_dt.isoformat()
+                    )
+                    break  # Success
+                except Exception as e:
+                    last_error = e
+                    if attempt < API_RETRY_COUNT:
+                        await asyncio.sleep(1 * (attempt + 1))  # Backoff
+                    continue
+            
+            async with results_lock:
+                if earnings_data is not None:
+                    if earnings_data:
+                        all_earnings.extend(earnings_data)
+                elif last_error:
+                    failed_ranges += 1
+                    logger.warning(f"[get_earning] Failed to fetch earnings for {from_dt} ~ {to_dt} after {API_RETRY_COUNT+1} attempts: {last_error}")
+                
+                completed_ranges += 1
+                
+                # Log progress every batch
+                if completed_ranges % API_BATCH_SIZE == 0 or completed_ranges == total_ranges:
+                    progress_pct = (completed_ranges / total_ranges) * 100
+                    elapsed = time.time() - fetch_start
+                    rate = completed_ranges / elapsed if elapsed > 0 else 0
+                    remaining = total_ranges - completed_ranges
+                    eta_seconds = remaining / rate if rate > 0 else 0
+                    eta_str = f"{int(eta_seconds)}s" if eta_seconds < 60 else f"{int(eta_seconds/60)}m {int(eta_seconds%60)}s"
+                    
+                    logger.info(
+                        f"[get_earning] progress={completed_ranges}/{total_ranges}({progress_pct:.1f}%) | records={len(all_earnings)} | ETA: {eta_str}",
+                        extra={
+                            'endpoint': 'GET /sourceData',
+                            'phase': 'earning-fetch',
+                            'elapsed_ms': int(elapsed * 1000),
+                            'counters': {'success': completed_ranges - failed_ranges, 'fail': failed_ranges},
+                            'progress': {'done': completed_ranges, 'total': total_ranges, 'pct': int(progress_pct)},
+                            'rate': {'per_second': rate},
+                            'batch': {},
+                            'warn': []
+                        }
+                    )
+
     async with FMPAPIClient() as fmp_client:
-        for from_date, to_date in date_ranges:
-            earnings_data = await fmp_client.get_earnings_calendar(
-                from_date.isoformat(),
-                to_date.isoformat()
-            )
-            all_earnings.extend(earnings_data)
+        tasks = [fetch_range_earnings(fmp_client, fr, to) for fr, to in date_ranges]
+        await asyncio.gather(*tasks)
+    
+    fetch_elapsed = int((time.time() - fetch_start) * 1000)
+    logger.info(f"[get_earning] Fetch complete: {len(all_earnings)} records from {completed_ranges} ranges in {fetch_elapsed}ms")
 
     # Filter earnings to only include tickers that exist in config_lv3_targets
     total_before_filter = len(all_earnings)

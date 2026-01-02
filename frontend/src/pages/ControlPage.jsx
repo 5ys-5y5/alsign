@@ -460,7 +460,7 @@ export default function ControlPage() {
   }, []);
 
   return (
-    <div style={{ padding: 'var(--space-4)', maxWidth: '1200px', margin: '0 auto' }}>
+    <>
       <header style={{ marginBottom: 'var(--space-4)' }}>
         <h1>Control</h1>
         <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
@@ -497,6 +497,6 @@ export default function ControlPage() {
           error={transformsError}
         />
       </section>
-    </div>
+    </>
   );
 }

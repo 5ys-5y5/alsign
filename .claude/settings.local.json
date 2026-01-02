@@ -80,7 +80,9 @@
       "Bash(cmd //c \"for %p in (12552 25840) do taskkill /F /PID %p 2>nul\")",
       "Bash(cmd //c \"taskkill /F /PID 15532 2>&1\")",
       "Bash(cmd //c \"taskkill /F /PID 15084 2>&1\")",
-      "Bash(cmd //c \"taskkill /F /PID 30040 2>&1\")"
+      "Bash(cmd //c \"taskkill /F /PID 30040 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 48932 2>&1\")",
+      "Bash(cmd //c \"for %p in \\(48932 52536\\) do taskkill /F /PID %p 2>nul\")"
     ]
   }
 }

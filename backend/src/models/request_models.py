@@ -31,12 +31,12 @@ class SourceDataQueryParams(BaseModel):
 
     calc_mode: Optional[str] = Field(
         default=None,
-        description="Consensus Phase 2 calculation mode: 'maintenance' for scope-based recalculation. If unset, only affected partitions."
+        description="Consensus calculation mode: 'maintenance' (Phase 1+2 with scope), 'calculation' (Phase 2 only, no API calls). If unset, Phase 1+2 for affected partitions."
     )
 
     calc_scope: Optional[str] = Field(
         default=None,
-        description="Required when calc_mode=maintenance. One of: all, ticker, event_date_range, partition_keys"
+        description="Required when calc_mode=maintenance or calculation. One of: all, ticker, event_date_range, partition_keys"
     )
 
     tickers: Optional[str] = Field(
@@ -81,8 +81,9 @@ class SourceDataQueryParams(BaseModel):
     @validator('calc_mode')
     def validate_calc_mode(cls, v):
         """Validate calc_mode parameter."""
-        if v is not None and v != 'maintenance':
-            raise ValueError("calc_mode must be 'maintenance' or unset")
+        allowed_modes = {'maintenance', 'calculation'}
+        if v is not None and v not in allowed_modes:
+            raise ValueError(f"calc_mode must be one of: {', '.join(allowed_modes)}")
         return v
 
     @validator('calc_scope')
@@ -90,13 +91,13 @@ class SourceDataQueryParams(BaseModel):
         """Validate calc_scope parameter."""
         calc_mode = values.get('calc_mode')
 
-        # calc_scope requires calc_mode=maintenance
-        if v is not None and calc_mode != 'maintenance':
-            raise ValueError("calc_scope requires calc_mode=maintenance")
+        # calc_scope requires calc_mode=maintenance or calculation
+        if v is not None and calc_mode not in ('maintenance', 'calculation'):
+            raise ValueError("calc_scope requires calc_mode=maintenance or calc_mode=calculation")
 
-        # If calc_mode=maintenance, calc_scope is required
-        if calc_mode == 'maintenance' and v is None:
-            raise ValueError("calc_scope is required when calc_mode=maintenance")
+        # If calc_mode=maintenance or calculation, calc_scope is required
+        if calc_mode in ('maintenance', 'calculation') and v is None:
+            raise ValueError(f"calc_scope is required when calc_mode={calc_mode}")
 
         # Validate allowed values
         if v is not None:
@@ -243,6 +244,20 @@ class BackfillEventsTableQueryParams(BaseModel):
         default=None,
         description="Comma-separated list of ticker symbols to process (e.g., 'AAPL,MSFT,GOOGL'). If not specified, processes all tickers."
     )
+    calc_fair_value: bool = Field(
+        default=True,
+        alias="calcFairValue",
+        description="[DEPRECATED - I-41] If true, calculate sector-average-based fair value for position_quantitative and disparity_quantitative. This requires additional API calls to fmp-stock-peers and peer financials. (I-36, I-38: default changed to True). Use 'metrics=priceQuantitative' instead."
+    )
+    metrics: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. Use this for selective metric updates. (I-41)"
+    )
+    overwrite_metrics: bool = Field(
+        default=False,
+        alias="overwriteMetrics",
+        description="If false, update only NULL metric values. If true, recalculate and overwrite all specified metrics. (I-41)"
+    )
 
     def get_ticker_list(self) -> Optional[List[str]]:
         """
@@ -263,6 +278,29 @@ class BackfillEventsTableQueryParams(BaseModel):
         ticker_list = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
 
         return ticker_list if ticker_list else None
+
+    def get_metrics_list(self) -> Optional[List[str]]:
+        """
+        Parse metrics parameter into a list of metric IDs.
+
+        Returns:
+            List of metric IDs, or None if metrics parameter is not provided
+
+        Example:
+            'priceQuantitative,PER,PBR' -> ['priceQuantitative', 'PER', 'PBR']
+        """
+        if self.metrics is None:
+            return None
+
+        # Remove brackets if present and split by comma
+        metrics_str = self.metrics.strip()
+        if metrics_str.startswith('[') and metrics_str.endswith(']'):
+            metrics_str = metrics_str[1:-1]
+
+        # Split by comma and clean up whitespace
+        metrics_list = [m.strip() for m in metrics_str.split(',') if m.strip()]
+
+        return metrics_list if metrics_list else None
 
 
 class FillAnalystQueryParams(BaseModel):

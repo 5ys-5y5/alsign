@@ -29,8 +29,8 @@ class FMPAPIClient:
     async def __aenter__(self):
         """Async context manager entry."""
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+            timeout=httpx.Timeout(60.0, connect=30.0),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
         )
         return self
 

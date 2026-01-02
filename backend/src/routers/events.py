@@ -130,9 +130,12 @@ async def backfill_events_table(
     # Parse ticker list
     ticker_list = params.get_ticker_list()
 
+    # Parse metrics list (I-41)
+    metrics_list = params.get_metrics_list()
+
     logger.info("=" * 80)
     logger.info(f"[ROUTER] POST /backfillEventsTable RECEIVED - reqId={req_id}")
-    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}")
+    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, calcFairValue={params.calc_fair_value}, metrics={metrics_list}, overwriteMetrics={params.overwrite_metrics}")
     logger.info("=" * 80)
 
     try:
@@ -141,7 +144,10 @@ async def backfill_events_table(
             overwrite=params.overwrite,
             from_date=params.from_date,
             to_date=params.to_date,
-            tickers=ticker_list
+            tickers=ticker_list,
+            calc_fair_value=params.calc_fair_value,
+            metrics=metrics_list,
+            overwrite_metrics=params.overwrite_metrics
         )
         logger.info(f"[ROUTER] valuation_service.calculate_valuations completed successfully")
 

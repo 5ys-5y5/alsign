@@ -52,6 +52,7 @@ class MetricCalculationEngine:
         self.dependency_graph = {}
         self.calculation_order = []
         self.transforms = transforms or {}  # Transform definitions from DB
+        self.metric_sources = {}  # I-30: Track source metadata for each metric
 
     def _flatten_metrics(self) -> List[Dict[str, Any]]:
         """Flatten metrics_by_domain into a single list."""
@@ -204,7 +205,8 @@ class MetricCalculationEngine:
     def calculate_all(
         self,
         api_data: Dict[str, List[Dict[str, Any]]],
-        target_domains: Optional[List[str]] = None
+        target_domains: Optional[List[str]] = None,
+        custom_values: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Calculate all metrics for target domains.
@@ -218,6 +220,8 @@ class MetricCalculationEngine:
                      }
             target_domains: List of domain suffixes to calculate (e.g., ['valuation', 'profitability'])
                            If None, calculates all domains.
+            custom_values: Pre-calculated values for custom metrics (I-41)
+                          Example: {'priceQuantitative': 185.0}
 
         Returns:
             Dict with calculated metrics grouped by domain
@@ -225,6 +229,7 @@ class MetricCalculationEngine:
                 'valuation': {
                     'PER': 25.5,
                     'PBR': 3.2,
+                    'priceQuantitative': 185.0,
                     '_meta': {'date_range': '...', 'calcType': 'TTM_fullQuarter', 'count': 4}
                 },
                 'profitability': {...}
@@ -235,8 +240,13 @@ class MetricCalculationEngine:
             self.build_dependency_graph()
             self.topological_sort()
 
+        # Initialize custom values (I-41)
+        if custom_values is None:
+            custom_values = {}
+
         # Calculate each metric in order
         calculated_values = {}
+        self.metric_sources = {}  # I-30: Reset sources for each calculation run
 
         for metric_name in self.calculation_order:
             metric = self.metrics_by_name[metric_name]
@@ -255,7 +265,7 @@ class MetricCalculationEngine:
                     continue
 
             try:
-                value, failure_reason = self._calculate_metric_with_reason(metric, api_data, calculated_values)
+                value, failure_reason = self._calculate_metric_with_reason(metric, api_data, calculated_values, custom_values)
                 calculated_values[metric_name] = value
                 if value is not None:
                     # Smart formatting: show first item + count for lists, full value for scalars
@@ -292,10 +302,17 @@ class MetricCalculationEngine:
         self,
         metric: Dict[str, Any],
         api_data: Dict[str, List[Dict[str, Any]]],
-        calculated_values: Dict[str, Any]
+        calculated_values: Dict[str, Any],
+        custom_values: Optional[Dict[str, Any]] = None
     ) -> tuple:
         """
         Calculate a single metric with failure reason tracking.
+
+        Args:
+            metric: Metric definition
+            api_data: API responses
+            calculated_values: Already calculated metrics
+            custom_values: Pre-calculated values for custom metrics (I-41)
 
         Returns:
             Tuple of (value, failure_reason)
@@ -303,8 +320,17 @@ class MetricCalculationEngine:
         source = metric.get('source')
         metric_name = metric.get('name')
 
+        # I-41: Handle custom metrics
+        if source == 'custom':
+            if custom_values and metric_name in custom_values:
+                value = custom_values[metric_name]
+                logger.debug(f"[MetricEngine] ✓ Custom metric {metric_name} = {value}")
+                return value, None
+            else:
+                return None, f"Custom metric '{metric_name}' not provided in custom_values"
+
         if source == 'api_field':
-            value = self._calculate_api_field(metric, api_data)
+            value, source_info = self._calculate_api_field_with_source(metric, api_data)
             if value is None:
                 api_list_id = metric.get('api_list_id')
                 if not api_list_id:
@@ -313,10 +339,13 @@ class MetricCalculationEngine:
                     return None, f"No data from API '{api_list_id}'"
                 else:
                     return None, f"Field extraction failed from '{api_list_id}'"
+            # I-30: Store source info
+            if source_info:
+                self.metric_sources[metric_name] = source_info
             return value, None
             
         elif source == 'aggregation':
-            value = self._calculate_aggregation(metric, api_data, calculated_values)
+            value, source_info = self._calculate_aggregation_with_source(metric, api_data, calculated_values)
             if value is None:
                 base_metric = metric.get('base_metric')
                 transform_id = metric.get('transform')
@@ -328,10 +357,13 @@ class MetricCalculationEngine:
                     return None, f"Base metric '{base_metric}' is None"
                 else:
                     return None, f"Transform '{transform_id}' returned None"
+            # I-30: Store source info
+            if source_info:
+                self.metric_sources[metric_name] = source_info
             return value, None
             
         elif source == 'expression':
-            value = self._calculate_expression(metric, calculated_values)
+            value, source_info = self._calculate_expression_with_source(metric, calculated_values)
             if value is None:
                 # Extract dependencies from formula if not explicitly provided
                 formula = metric.get('formula', '')
@@ -353,6 +385,9 @@ class MetricCalculationEngine:
                     return None, f"Missing deps: {', '.join(missing_details)} | formula: {formula}"
                 else:
                     return None, f"Expression eval failed | formula: {formula}"
+            # I-30: Store source info
+            if source_info:
+                self.metric_sources[metric_name] = source_info
             return value, None
             
         else:
@@ -362,7 +397,8 @@ class MetricCalculationEngine:
         self,
         metric: Dict[str, Any],
         api_data: Dict[str, List[Dict[str, Any]]],
-        calculated_values: Dict[str, Any]
+        calculated_values: Dict[str, Any],
+        custom_values: Optional[Dict[str, Any]] = None
     ) -> Any:
         """
         Calculate a single metric (backward compatibility).
@@ -373,11 +409,12 @@ class MetricCalculationEngine:
             metric: Metric definition
             api_data: API responses
             calculated_values: Already calculated metrics
+            custom_values: Pre-calculated values for custom metrics (I-41)
 
         Returns:
             Calculated metric value
         """
-        value, _ = self._calculate_metric_with_reason(metric, api_data, calculated_values)
+        value, _ = self._calculate_metric_with_reason(metric, api_data, calculated_values, custom_values)
         return value
 
     def _convert_value(self, value: Any) -> Any:
@@ -513,6 +550,12 @@ class MetricCalculationEngine:
             if len(values) == 1:
                 return values[0]
             elif len(values) > 1:
+                # I-25: 시계열 시가총액 API의 경우 가장 최근 날짜(첫 번째)의 값만 반환
+                # historical-market-cap API는 event_date 이전의 모든 날짜를 반환하므로
+                # 첫 번째 값이 event_date에 가장 가까운 marketCap
+                if 'historical-market-cap' in api_list_id:
+                    logger.debug(f"[MetricEngine][I-25] Using latest marketCap from {len(values)} records")
+                    return values[0]
                 return values
             else:
                 return None
@@ -524,6 +567,136 @@ class MetricCalculationEngine:
             return None
         else:
             return None
+
+    def _calculate_api_field_with_source(
+        self,
+        metric: Dict[str, Any],
+        api_data: Dict[str, List[Dict[str, Any]]]
+    ) -> tuple:
+        """
+        Extract value from API response with source tracking (I-30).
+
+        Returns:
+            Tuple of (value, source_info)
+        """
+        api_list_id = metric.get('api_list_id')
+        metric_name = metric.get('name')
+        value = self._calculate_api_field(metric, api_data)
+        
+        if value is None:
+            return None, None
+        
+        # Build source info
+        source_info = {
+            'api': api_list_id,
+            'type': 'api_field'
+        }
+        
+        # Extract date info from API response
+        api_response = api_data.get(api_list_id)
+        if api_response:
+            if isinstance(api_response, list) and len(api_response) > 0:
+                # For time-series data, get date range
+                dates = []
+                for record in api_response:
+                    record_date = record.get('date') or record.get('fillingDate') or record.get('timestamp')
+                    if record_date:
+                        dates.append(str(record_date)[:10])  # YYYY-MM-DD format
+                
+                if dates:
+                    if len(dates) == 1:
+                        source_info['date'] = dates[0]
+                    else:
+                        source_info['dates'] = dates[:4]  # First 4 dates (most recent)
+                        source_info['count'] = len(dates)
+            elif isinstance(api_response, dict):
+                # For snapshot data, try to get single date
+                record_date = api_response.get('date') or api_response.get('timestamp')
+                if record_date:
+                    source_info['date'] = str(record_date)[:10]
+        
+        return value, source_info
+
+    def _calculate_aggregation_with_source(
+        self,
+        metric: Dict[str, Any],
+        api_data: Dict[str, List[Dict[str, Any]]],
+        calculated_values: Dict[str, Any]
+    ) -> tuple:
+        """
+        Apply aggregation transform with source tracking (I-30).
+
+        Returns:
+            Tuple of (value, source_info)
+        """
+        base_metric_id = metric.get('base_metric_id')
+        aggregation_kind = metric.get('aggregation_kind')
+        metric_name = metric.get('name')
+        
+        value = self._calculate_aggregation(metric, api_data, calculated_values)
+        
+        if value is None:
+            return None, None
+        
+        # Build source info inheriting from base metric
+        source_info = {
+            'type': 'aggregation',
+            'transform': aggregation_kind
+        }
+        
+        # Inherit source from base metric if available
+        base_source = self.metric_sources.get(base_metric_id)
+        if base_source:
+            source_info['baseMetric'] = base_metric_id
+            if 'api' in base_source:
+                source_info['api'] = base_source['api']
+            if 'dates' in base_source:
+                source_info['dates'] = base_source['dates']
+            elif 'date' in base_source:
+                source_info['date'] = base_source['date']
+        
+        return value, source_info
+
+    def _calculate_expression_with_source(
+        self,
+        metric: Dict[str, Any],
+        calculated_values: Dict[str, Any]
+    ) -> tuple:
+        """
+        Calculate expression with source tracking (I-30).
+
+        Returns:
+            Tuple of (value, source_info)
+        """
+        formula = metric.get('formula', '')
+        metric_name = metric.get('name')
+        
+        value = self._calculate_expression(metric, calculated_values)
+        
+        if value is None:
+            return None, None
+        
+        # Build source info from dependencies
+        source_info = {
+            'type': 'expression',
+            'formula': formula
+        }
+        
+        # Collect sources from all dependencies
+        dependencies = []
+        dep_sources = {}
+        for other_metric_name in self.metrics_by_name.keys():
+            if other_metric_name in formula and other_metric_name != metric_name:
+                dependencies.append(other_metric_name)
+                if other_metric_name in self.metric_sources:
+                    dep_sources[other_metric_name] = self.metric_sources[other_metric_name]
+        
+        if dependencies:
+            source_info['dependencies'] = dependencies
+        if dep_sources:
+            source_info['sources'] = dep_sources
+        
+        return value, source_info
 
     def _calculate_aggregation(
         self,
@@ -926,7 +1099,7 @@ class MetricCalculationEngine:
             target_domains: Domains to include (filters out 'internal' domain)
 
         Returns:
-            Dict grouped by domain with _meta information
+            Dict grouped by domain with _meta information (I-30: includes sources)
         """
         result = {}
 
@@ -952,14 +1125,42 @@ class MetricCalculationEngine:
 
             result[domain_suffix][metric_name] = value
 
-        # Add _meta to each domain
+        # I-30: Add _meta with sources to each domain
         for domain_suffix in result:
             if '_meta' not in result[domain_suffix]:
+                # Collect sources for all metrics in this domain
+                domain_sources = {}
+                domain_dates = set()
+                
+                for metric_name in result[domain_suffix]:
+                    if metric_name.startswith('_'):
+                        continue
+                    source_info = self.metric_sources.get(metric_name)
+                    if source_info:
+                        domain_sources[metric_name] = source_info
+                        # Collect dates for summary
+                        if 'date' in source_info:
+                            domain_dates.add(source_info['date'])
+                        elif 'dates' in source_info:
+                            domain_dates.update(source_info['dates'])
+                
+                # Build _meta
                 result[domain_suffix]['_meta'] = {
-                    'date_range': None,
-                    'calcType': 'TTM_fullQuarter',  # Placeholder
-                    'count': 4  # Placeholder
+                    'calcType': 'TTM_fullQuarter',
+                    'count': 4
                 }
+                
+                # Add sources if available
+                if domain_sources:
+                    result[domain_suffix]['_meta']['sources'] = domain_sources
+                
+                # Add date range summary
+                if domain_dates:
+                    sorted_dates = sorted(domain_dates)
+                    if len(sorted_dates) == 1:
+                        result[domain_suffix]['_meta']['dateRange'] = sorted_dates[0]
+                    else:
+                        result[domain_suffix]['_meta']['dateRange'] = f"{sorted_dates[0]} ~ {sorted_dates[-1]}"
 
         return result
 

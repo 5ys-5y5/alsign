@@ -63,6 +63,18 @@ paths:
             pattern: ^[A-Z0-9]+(,[A-Z0-9]+)*$
           example: "AAPL,MSFT,GOOGL"
 
+        - name: calcFairValue
+          in: query
+          required: false
+          description: |
+            If true, calculate sector-average-based fair value for position_quantitative and disparity_quantitative.
+            This requires additional API calls to fmp-stock-peers and peer financials.
+            Default: true (I-36, I-38)
+          schema:
+            type: boolean
+            default: true
+          example: true
+
       requestBody:
         description: Empty JSON body (endpoint accepts no input payload)
         required: false

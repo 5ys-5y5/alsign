@@ -2,9 +2,12 @@
 
 import asyncpg
 import json
+import logging
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
 from ...services.utils.datetime_utils import parse_to_utc
+
+logger = logging.getLogger("alsign")
 
 
 async def upsert_consensus_phase1(
@@ -197,3 +200,205 @@ async def update_consensus_phase2(
                 update_count += 1
 
     return update_count
+
+
+async def calculate_target_summary(
+    pool: asyncpg.Pool,
+    ticker: str,
+    event_date: Any
+) -> Dict[str, Any]:
+    """
+    Calculate target summary from evt_consensus based on event_date.
+    
+    Aggregates price targets from all analysts for the given ticker
+    for periods ending at event_date:
+    - lastMonth: within 30 days before event_date
+    - lastQuarter: within 90 days before event_date
+    - lastYear: within 365 days before event_date
+    - allTime: all records before or on event_date
+    
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        event_date: Reference date for calculation
+        
+    Returns:
+        Dict with summary statistics:
+        {
+            'lastMonthCount': int,
+            'lastMonthAvgPriceTarget': float,
+            'lastQuarterCount': int,
+            'lastQuarterAvgPriceTarget': float,
+            'lastYearCount': int,
+            'lastYearAvgPriceTarget': float,
+            'allTimeCount': int,
+            'allTimeAvgPriceTarget': float,
+            'publishers': list of analyst companies
+        }
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH base_data AS (
+                SELECT 
+                    price_target,
+                    analyst_company,
+                    event_date,
+                    $2::timestamptz AS ref_date
+                FROM evt_consensus
+                WHERE ticker = $1
+                  AND event_date <= $2::timestamptz
+                  AND price_target IS NOT NULL
+            )
+            SELECT
+                -- Last Month (30 days) - Count, Median, Avg
+                COUNT(*) FILTER (WHERE event_date > ref_date - INTERVAL '30 days') AS last_month_count,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price_target) 
+                    FILTER (WHERE event_date > ref_date - INTERVAL '30 days') AS last_month_median,
+                AVG(price_target) FILTER (WHERE event_date > ref_date - INTERVAL '30 days') AS last_month_avg,
+                
+                -- Last Quarter (90 days) - Count, Median, Avg
+                COUNT(*) FILTER (WHERE event_date > ref_date - INTERVAL '90 days') AS last_quarter_count,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price_target) 
+                    FILTER (WHERE event_date > ref_date - INTERVAL '90 days') AS last_quarter_median,
+                AVG(price_target) FILTER (WHERE event_date > ref_date - INTERVAL '90 days') AS last_quarter_avg,
+                
+                -- Last Year (365 days) - Count, Median, Avg
+                COUNT(*) FILTER (WHERE event_date > ref_date - INTERVAL '365 days') AS last_year_count,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price_target) 
+                    FILTER (WHERE event_date > ref_date - INTERVAL '365 days') AS last_year_median,
+                AVG(price_target) FILTER (WHERE event_date > ref_date - INTERVAL '365 days') AS last_year_avg,
+                
+                -- All Time - Count, Median, Avg, Min, Max
+                COUNT(*) AS all_time_count,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price_target) AS all_time_median,
+                AVG(price_target) AS all_time_avg,
+                MIN(price_target) AS all_time_min,
+                MAX(price_target) AS all_time_max,
+                
+                -- Publishers (unique analyst companies)
+                ARRAY_AGG(DISTINCT analyst_company) FILTER (WHERE analyst_company IS NOT NULL) AS publishers
+            FROM base_data
+            """,
+            ticker,
+            event_date
+        )
+        
+        if not row or row['all_time_count'] == 0:
+            logger.debug(f"[calculate_target_summary] No data for ticker={ticker}, event_date={event_date}")
+            return None
+        
+        return {
+            # Last Month
+            'lastMonthCount': row['last_month_count'] or 0,
+            'lastMonthMedianPriceTarget': round(float(row['last_month_median']), 2) if row['last_month_median'] else None,
+            'lastMonthAvgPriceTarget': round(float(row['last_month_avg']), 2) if row['last_month_avg'] else None,
+            # Last Quarter
+            'lastQuarterCount': row['last_quarter_count'] or 0,
+            'lastQuarterMedianPriceTarget': round(float(row['last_quarter_median']), 2) if row['last_quarter_median'] else None,
+            'lastQuarterAvgPriceTarget': round(float(row['last_quarter_avg']), 2) if row['last_quarter_avg'] else None,
+            # Last Year
+            'lastYearCount': row['last_year_count'] or 0,
+            'lastYearMedianPriceTarget': round(float(row['last_year_median']), 2) if row['last_year_median'] else None,
+            'lastYearAvgPriceTarget': round(float(row['last_year_avg']), 2) if row['last_year_avg'] else None,
+            # All Time (with Min/Max)
+            'allTimeCount': row['all_time_count'] or 0,
+            'allTimeMedianPriceTarget': round(float(row['all_time_median']), 2) if row['all_time_median'] else None,
+            'allTimeAvgPriceTarget': round(float(row['all_time_avg']), 2) if row['all_time_avg'] else None,
+            'allTimeMinPriceTarget': round(float(row['all_time_min']), 2) if row['all_time_min'] else None,
+            'allTimeMaxPriceTarget': round(float(row['all_time_max']), 2) if row['all_time_max'] else None,
+            # Publishers
+            'publishers': row['publishers'] or []
+        }
+
+
+async def get_events_for_target_summary(
+    pool: asyncpg.Pool,
+    overwrite: bool,
+    calc_scope: str = None,
+    tickers_param: str = None,
+    from_date: Any = None,
+    to_date: Any = None
+) -> List[Dict[str, Any]]:
+    """
+    Get evt_consensus events that need target_summary calculation.
+    
+    Args:
+        pool: Database connection pool
+        overwrite: If True, return all matching events. If False, only NULL target_summary.
+        calc_scope: 'all', 'ticker', 'event_date_range'
+        tickers_param: Comma-separated tickers (for calc_scope=ticker)
+        from_date: Start date (for calc_scope=event_date_range)
+        to_date: End date (for calc_scope=event_date_range)
+    
+    Returns:
+        List of events needing target_summary calculation
+    """
+    async with pool.acquire() as conn:
+        # Build WHERE clause
+        conditions = []
+        params = []
+        param_idx = 1
+        
+        if not overwrite:
+            conditions.append("target_summary IS NULL")
+        
+        if calc_scope == 'ticker' and tickers_param:
+            ticker_list = [t.strip().upper() for t in tickers_param.split(',')]
+            conditions.append(f"ticker = ANY(${param_idx})")
+            params.append(ticker_list)
+            param_idx += 1
+        elif calc_scope == 'event_date_range' and from_date and to_date:
+            conditions.append(f"event_date::date BETWEEN ${param_idx} AND ${param_idx + 1}")
+            params.extend([from_date, to_date])
+            param_idx += 2
+        
+        where_clause = " AND ".join(conditions) if conditions else "TRUE"
+        
+        query = f"""
+            SELECT id, ticker, event_date
+            FROM evt_consensus
+            WHERE {where_clause}
+            ORDER BY ticker, event_date
+        """
+        
+        rows = await conn.fetch(query, *params)
+        return [dict(row) for row in rows]
+
+
+async def update_target_summary_batch(
+    pool: asyncpg.Pool,
+    updates: List[Dict[str, Any]]
+) -> int:
+    """
+    Batch update target_summary for multiple evt_consensus rows.
+    
+    Args:
+        pool: Database connection pool
+        updates: List of {id, target_summary} dicts
+    
+    Returns:
+        Number of rows updated
+    """
+    if not updates:
+        return 0
+    
+    async with pool.acquire() as conn:
+        # Use UNNEST for batch update
+        ids = [u['id'] for u in updates]
+        summaries = [json.dumps(u['target_summary']) if u['target_summary'] else None for u in updates]
+        
+        result = await conn.execute(
+            """
+            UPDATE evt_consensus AS e
+            SET target_summary = u.summary::jsonb
+            FROM UNNEST($1::uuid[], $2::text[]) AS u(id, summary)
+            WHERE e.id = u.id
+            """,
+            ids,
+            summaries
+        )
+        
+        # Extract count from "UPDATE N"
+        count = int(result.split()[-1]) if result else 0
+        return count

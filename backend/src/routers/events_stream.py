@@ -330,12 +330,13 @@ async def stream_backfill_events_table(
 
                     logger.info(f"[STREAM] Calling valuation_service.calculate_valuations")
 
-                    # Execute valuation calculation
+                    # Execute valuation calculation with cancel event
                     result = await valuation_service.calculate_valuations(
                         overwrite=params.overwrite,
                         from_date=params.from_date,
                         to_date=params.to_date,
-                        tickers=ticker_list
+                        tickers=ticker_list,
+                        cancel_event=cancel_event
                     )
 
                     logger.info(f"[STREAM] valuation_service.calculate_valuations completed")

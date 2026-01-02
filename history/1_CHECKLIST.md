@@ -1,12 +1,12 @@
 # 📋 AlSign 이슈 체크리스트
 
 > **목적**: 서비스의 모든 이슈들의 반영 상태를 한눈에 파악
-> 
+>
 > **범례**: ✅ 반영완료 | 🔄 부분반영 | ❌ 미반영 | ⏸️ 보류
-> 
+>
 > **문서 연결**: 체크리스트(여기) → `2_FLOW.md` (흐름도) → `3_DETAIL.md` (상세도)
-> 
-> **최종 업데이트**: 2025-12-25 21:30 KST
+>
+> **최종 업데이트**: 2026-01-02 KST (I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated)
 
 ---
 
@@ -38,6 +38,23 @@
 | I-22 | SQL 예약어 "position" 문제 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-22 | #I-22 |
 | I-23 | NULL 값 디버깅 로그 개선 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-23 | #I-23 |
 | I-24 | price trends 처리 성능 최적화 | ✅ | 2025-12-25 | 2025-12-25 | N/A | #I-24 | #I-24 |
+| I-25 | API별 기준 날짜 불일치 (marketCap) | ✅ | 2025-12-27 | 2025-12-27 | ✅ | #I-25 | #I-25 |
+| I-26 | consensus_summary_cache event_date 무시 | ✅ | 2025-12-27 | 2025-12-27 | N/A | #I-26 | #I-26 |
+| I-27 | priceTrend 티커별 1회 호출 확인 | ✅ | 2025-12-27 | 2025-12-27 | N/A | #I-27 | #I-27 |
+| I-28 | 재무제표 TTM 계산 시간적 유효성 | ✅ | 2025-12-27 | 2025-12-27 | N/A | #I-28 | #I-28 |
+| I-29 | evt_consensus 2단계 계산 미실행 | ✅ | 2025-12-30 | 2025-12-31 | N/A | #I-29 | #I-29 |
+| I-30 | 메트릭별 원천 날짜 추적 (_meta.sources) | ✅ | 2025-12-30 | 2025-12-31 | N/A | #I-30 | #I-30 |
+| I-31 | targetSummary 계산 (consensusSummary 대체) | ✅ | 2025-12-31 | 2025-12-31 | ✅ | #I-31 | #I-31 |
+| I-32 | Log 패널 리사이즈 기능 | ✅ | 2025-12-31 | 2025-12-31 | N/A | #I-32 | #I-32 |
+| I-33 | 본문 80% 너비 및 가운데 정렬 | ✅ | 2025-12-31 | 2025-12-31 | N/A | #I-33 | #I-33 |
+| I-34 | /setRequests API 변경 기능 (Schema 검증) | ✅ | 2025-12-31 | 2025-12-31 | N/A | #I-34 | #I-34 |
+| I-35 | GET /sourceData 병렬 처리 성능 개선 | ✅ | 2025-12-31 | 2025-12-31 | N/A | #I-35 | #I-35 |
+| I-36 | Quantitative Position/Disparity 항상 None | 🔄 DEPRECATED | 2025-12-31 | 2025-12-31 | I-41로 대체 | #I-36 | #I-36 |
+| I-37 | targetMedian 명칭/값 불일치 (평균 vs 중앙값) | ✅ | 2025-12-31 | 2025-12-31 | N/A | #I-37 | #I-37 |
+| I-38 | calcFairValue 기본값 False로 인한 NULL | 🔄 DEPRECATED | 2026-01-01 | 2026-01-01 | I-41로 대체 | #I-38 | #I-38 |
+| I-39 | target_summary JSONB 문자열 파싱 오류 | ✅ | 2026-01-02 | 2026-01-02 | N/A | #I-39 | #I-39 |
+| I-40 | Peer tickers 미존재 시 로깅 부족 | 🔄 DEPRECATED | 2026-01-02 | 2026-01-02 | I-41로 통합 | #I-40 | #I-40 |
+| I-41 | priceQuantitative 메트릭 미구현 (설계 불일치) | ✅ | 2026-01-02 | 2026-01-02 | N/A | #I-41 | #I-41 |
 
 ---
 
@@ -222,18 +239,310 @@
 
 ---
 
+## 6. 시간적 유효성 이슈 - 2025-12-27 (I-25 ~ I-27)
+
+### I-25: API별 기준 날짜 불일치 (Temporal Validity Mismatch) ✅
+	발견: 2025-12-27 | 해결: 2025-12-27
+	- ✅ marketCap: `fmp-historical-market-capitalization` API로 해결 완료
+	  - API: `/stable/historical-market-capitalization?symbol={ticker}&from={fromDate}&to={toDate}`
+	  - **핵심**: `from`/`to` 파라미터로 날짜 범위 특정 가능
+	  - 응답에 date 필드 포함 → event_date 기준 필터링 가능
+	  - **구현**: 시계열 데이터에서 가장 최근 날짜의 값(첫 번째) 선택
+	- ❌ fmp-price-target-consensus API: 현재 시점 consensus만 반환 (I-26 이슈)
+	- ✅ 재무제표 API: event_date 기준 필터링 적용됨 (정상)
+	
+	**구현 완료 사항**:
+	- ✅ SQL 스크립트 작성: `backend/scripts/fix_I25_historical_market_cap.sql`
+	- ✅ config_lv1_api_list에 fmp-historical-market-capitalization API 추가 (사용자 직접 반영)
+	- ✅ config_lv2_metric에서 marketCap 메트릭의 api_list_id 변경 (사용자 직접 반영)
+	- ✅ valuation_service.py에서 historical-market-cap API 호출 시 from/to 파라미터 처리
+	- ✅ metric_engine.py에서 시계열 marketCap 응답에서 가장 최근 값만 추출
+
+### I-26: consensus_summary_cache가 event_date 무시 ✅
+	발견: 2025-12-27 | 해결: 2025-12-27
+	- ✅ 문제: FMP API가 현재 시점 consensus만 제공, 과거 데이터 없음
+	- ✅ 해결: 과거 이벤트(7일 이전)에는 consensus 값을 NULL로 처리
+	- ✅ `_meta` 필드에 데이터 가용성 및 이유 명시
+	- ✅ 최근 이벤트(7일 이내)에는 현재 consensus 값 사용 (정상)
+	
+	**구현 완료 사항**:
+	- ✅ `calculate_qualitative_metrics_fast()` 함수 수정
+	- ✅ 과거 이벤트 판단 로직 추가 (`event_date < today - 7days`)
+	- ✅ `_meta` 필드에 `dataAvailable`, `reason`, `fetchDate` 정보 포함
+
+### I-27: priceTrend 티커별 1회 호출 확인 ✅
+	발견: 2025-12-27 | 확인 완료
+	- ✅ generate_price_trends()에서 ohlc_cache를 티커별로 구축
+	- ✅ 각 이벤트는 캐시에서 날짜 기반 조회
+	- ✅ 티커당 1회만 OHLC API 호출됨 (정상 작동)
+
+### I-28: 재무제표 TTM 계산 시간적 유효성 확인 ✅
+	발견: 2025-12-27 | 확인 완료
+	- ✅ fmp-income-statement 응답에서 event_date 기준 필터링 정상 작동
+	- ✅ 필터링 로직: `_get_record_date(r) <= event_date_obj`
+	- ✅ TTM 계산: 필터링 후 최근 4분기 합산
+	- ✅ 예시: event_date=2024-12-22 → 2024-12-28 분기 제외됨 (정상)
+	
+	**핵심 로직 위치**:
+	- `valuation_service.py:847-850`: 날짜 필터링
+	- `metric_engine.py:689-722`: TTM 합산 (_ttm_sum_or_scaled)
+
+---
+
+## 7. consensusSignal 및 메타데이터 이슈 - 2025-12-30 (I-29 ~ I-30)
+
+### I-29: evt_consensus 2단계 계산 미실행 ✅
+	발견: 2025-12-30 | 해결됨
+	- ✅ evt_consensus 테이블의 price_target_prev, price_when_posted_prev, direction이 모두 NULL
+	- ✅ 원인: GET /sourceData?mode=consensus의 2단계 계산이 실행되지 않음
+	- ✅ 해결: calc_mode=calculation 모드 추가 (API 호출 없이 2단계 계산만 수행)
+	- ✅ 사용법: GET /sourceData?mode=consensus&calc_mode=calculation&calc_scope=all
+
+### I-30: 메트릭별 원천 날짜 추적 (옵션 B 채택) ✅
+	발견: 2025-12-30 | 해결됨: 2025-12-31
+	- ✅ 각 메트릭별로 원천 데이터의 날짜 정보가 기록됨
+	- ✅ MetricCalculationEngine에 metric_sources 딕셔너리 추가
+	- ✅ _calculate_api_field_with_source: API 응답에서 날짜 추출
+	- ✅ _calculate_aggregation_with_source: 기본 메트릭 소스 상속
+	- ✅ _calculate_expression_with_source: 의존성 소스 수집
+	- ✅ _group_by_domain: _meta.sources에 메트릭별 상세 소스 정보 포함
+
+### I-31: targetSummary 계산 (consensusSummary 대체) ✅
+	발견: 2025-12-31 | 해결됨
+	- ✅ evt_consensus 테이블에 target_summary JSONB 컬럼 추가
+	- ✅ GET /sourceData?mode=consensus에 Phase 3 추가 (targetSummary 계산 및 저장)
+	- ✅ overwrite=true: 지정된 scope의 모든 행 재계산
+	- ✅ overwrite=false: target_summary가 NULL인 행만 계산
+	- ✅ POST /backfillEventsTable에서 evt_consensus.target_summary 읽기
+
+---
+
+## 8. UI/UX 개선 이슈 - 2025-12-31 (I-32 ~ I-34)
+
+### I-32: Log 패널 리사이즈 기능 ✅
+	발견: 2025-12-31 | 해결됨
+	- ✅ 요구사항: Cursor의 agent UI처럼 마우스로 패널 크기 조정
+	- ✅ 구현: BottomPanel에 드래그 리사이즈 핸들러 추가
+	- ✅ 하단 패널: 상단 가장자리 드래그 → 높이 조절 (200px ~ 600px)
+	- ✅ 우측 패널: 좌측 가장자리 드래그 → 너비 조절 (300px ~ 800px)
+	- ✅ 마우스 호버 시 파란색 하이라이트로 리사이즈 영역 표시
+
+### I-33: 본문 80% 너비 및 가운데 정렬 ✅
+	발견: 2025-12-31 | 해결됨
+	- ✅ 요구사항: 모든 라우터 본문이 출력 영역의 80% 너비로 가운데 정렬
+	- ✅ 적용 페이지: /requests, /setRequests, /control, /conditionGroup, /dashboard
+	- ✅ /requests: Wrapper div로 패널 영역 제외 후 80% 적용
+	- ✅ 패널 접힘/펼침 상태에서도 80% 유지
+
+### I-34: /setRequests API 변경 기능 (Schema 기반 검증) ✅
+	발견: 2025-12-31 | 해결됨
+	- ✅ 요구사항: 각 엔드포인트/모드별 config_lv1_api_list ID 변경 가능
+	- ✅ 검증 방식: API 호출 없이 config_lv1_api_list.schema 필드로 필수 키 존재 확인
+	- ✅ UI: 모드별 "변경" 버튼 → 모달에서 새 API 선택 → Schema 검증 → 저장
+	- ✅ 검증 실패 시 저장 불가, 누락된 키 표시
+
+### I-35: GET /sourceData 병렬 처리 성능 개선 ✅
+	발견: 2025-12-31 | 해결됨
+	- ✅ mode=consensus: 티커별 API 호출 병렬 처리 (asyncio.Semaphore)
+	- ✅ mode=earning: 날짜 범위별 API 호출 병렬 처리
+	- ✅ 동시성: API_CONCURRENCY = 10 (Rate limit 고려)
+	- ✅ 진행률 로깅: 배치별 progress, ETA 출력
+	
+	**성능 개선 효과** (mode=consensus 기준):
+	| 항목 | Before | After | 개선율 |
+	|------|--------|-------|--------|
+	| 처리 방식 | 순차 (1개씩) | 병렬 (10개 동시) | - |
+	| 5000 티커 예상 | ~83분 | ~8분 | **90% ↓** |
+
+---
+
+## 9. 계산 로직 검토 이슈 - 2025-12-31 (I-36 ~ I-37)
+
+### I-36: Quantitative Position/Disparity 항상 None 🔄 DEPRECATED
+	발견: 2025-12-31 | 해결됨: 2025-12-31 | **폐기됨: 2026-01-02** (I-41로 대체)
+
+	⚠️ **DEPRECATED**: 이 이슈는 임시 해결책이었으며, I-41에서 원본 설계대로 `priceQuantitative` 메트릭을 구현하여 대체되었습니다.
+
+	**폐기 이유**:
+	- 원본 설계(`1_guideline(function).ini`)는 `priceQuantitative` **메트릭**을 요구했으나, 이 해결책은 `calcFairValue` **파라미터**로 우회함
+	- `config_lv2_metric` 테이블에 메트릭을 정의하지 않아 설계 불일치 발생
+	- I-41에서 메트릭 시스템에 통합하여 근본적으로 해결
+
+	**마이그레이션**:
+	- `calcFairValue` 파라미터는 I-41 배포 후 제거될 예정
+	- 계산 로직 (`get_peer_tickers`, `calculate_sector_average_metrics` 등)은 I-41에서 재사용됨
+
+	---
+
+	**원래 구현 내용** (참고용):
+
+	**현상**: txn_events.position_quantitative, disparity_quantitative가 항상 NULL
+
+	**원인**: Quantitative 지표(PER, PBR, PSR 등)에서 "목표 주가(price_target)"를 직접 도출하는 로직 없음
+
+	**사용자 선택**: **옵션 A** - 업종 평균 대비 적정가 계산
+
+	**구현 내용**:
+	- ✅ `fmp-stock-peers` API로 동종 업종 티커 조회 (symbol만 사용, 다른 값은 event_date와 무관)
+	- ✅ `calculate_sector_average_metrics()`: 동종 업종 평균 PER/PBR 계산
+	- ✅ `calculate_fair_value_from_sector()`: 업종 평균 PER × EPS로 적정가 계산
+	- ✅ `calculate_fair_value_for_ticker()`: 통합 함수
+	- ✅ `calcFairValue` 파라미터 추가 (선택적 기능)
+
+	**사용법**:
+	```bash
+	# 업종 평균 기반 적정가 계산 활성화
+	POST /backfillEventsTable?calcFairValue=true&tickers=AAPL
+	```
+
+### I-37: targetMedian 명칭/값 불일치 (평균 vs 중앙값) ✅
+	발견: 2025-12-31 | 해결됨: 2025-12-31
+	
+	**현상**: 변수명 `targetMedian`인데 실제 값은 `AVG(price_target)` (평균값)
+	
+	**사용자 선택**: **옵션 B** - PostgreSQL PERCENTILE_CONT로 실제 Median 계산 구현
+	
+	**구현 내용**:
+	- ✅ `calculate_target_summary()` SQL에 `PERCENTILE_CONT(0.5)` 추가
+	- ✅ 반환 구조에 Median, Avg, Min, Max 모두 포함
+	- ✅ `valuation_service.py`에서 실제 Median 사용 (`allTimeMedianPriceTarget`)
+	
+	**데이터 재계산**:
+	```bash
+	GET /sourceData?mode=consensus&overwrite=true
+	```
+
+### I-38: calcFairValue 기본값 False로 인한 NULL 🔄 DEPRECATED
+	발견: 2026-01-01 | 해결됨: 2026-01-01 | **폐기됨: 2026-01-02** (I-41로 대체)
+
+	⚠️ **DEPRECATED**: `calcFairValue` 파라미터 자체가 임시 해결책이었으며, I-41에서 메트릭 시스템에 통합되어 더 이상 필요하지 않습니다.
+
+	**폐기 이유**:
+	- 파라미터 기반 접근은 메트릭 시스템 아키텍처와 불일치
+	- I-41에서 `priceQuantitative` 메트릭을 `config_lv2_metric`에 정의하면 자동으로 계산됨
+	- 명시적 파라미터 전달 불필요
+
+	**마이그레이션**:
+	- I-41 배포 후 `calcFairValue` 파라미터 제거 예정
+	- 메트릭이 `metrics_by_domain`에 포함되면 자동 계산
+
+	---
+
+	**원래 구현 내용** (참고용):
+
+	**현상**:
+	- `POST /backfillEventsTable` 호출 시 `position_quantitative`, `disparity_quantitative`가 100% NULL
+	- I-36에서 `calcFairValue` 파라미터를 추가했으나, 기본값이 `False`로 설정되어 있어 명시적으로 `?calcFairValue=true`를 지정하지 않으면 계산되지 않음
+
+	**근본 원인**:
+	- `backend/src/models/request_models.py:248` - `default=False`
+	- `backend/src/services/valuation_service.py:441` - `calc_fair_value: bool = False`
+	- Quantitative metrics는 price target이 없으므로, fair value 계산 없이는 position/disparity를 계산할 수 없음
+
+	**해결책**:
+	- ✅ `BackfillEventsTableQueryParams.calc_fair_value` 기본값을 `True`로 변경
+	- ✅ `calculate_valuations()` 함수 시그니처도 `calc_fair_value: bool = True`로 변경
+	- ✅ 이제 파라미터 없이 `POST /backfillEventsTable` 호출해도 자동으로 position/disparity 계산됨
+
+	**영향**:
+	- 업종 평균 PER/PBR 기반 적정가 자동 계산 (I-36)
+	- `fmp-stock-peers` API 추가 호출 발생 (성능 영향 미미)
+
+	**검증**:
+	```bash
+	# 재계산 (calcFairValue=true가 기본값)
+	POST /backfillEventsTable
+
+	# 또는 명시적으로 비활성화 가능
+	POST /backfillEventsTable?calcFairValue=false
+	```
+
+---
+
+## 10. 설계 불일치 해결 이슈 - 2026-01-02 (I-41)
+
+### I-41: priceQuantitative 메트릭 미구현 (설계 불일치) ✅
+	발견: 2026-01-02 | 해결됨: 2026-01-02
+
+	**현상**:
+	- 원본 설계(`prompt/1_guideline(function).ini`:892-897)는 `priceQuantitative` 메트릭 사용을 명시
+	- 실제 구현에는 `priceQuantitative` 메트릭이 `config_lv2_metric` 테이블에 존재하지 않음
+	- 대신 I-36에서 `calcFairValue` 파라미터로 우회 구현
+
+	**근본 원인**:
+	- 설계 문서와 구현 간 불일치
+	- 메트릭 시스템 아키텍처를 따르지 않은 임시 해결책 (I-36, I-38)
+
+	**사용자 선택**: **옵션 A** - 원본 설계대로 priceQuantitative 메트릭 구현
+
+	**구현 내용**:
+	- ✅ `config_lv2_metric` 테이블에 `priceQuantitative` 메트릭 정의
+	- ✅ I-36에서 개발한 calcFairValue 로직을 메트릭 계산에 통합
+	- ✅ 계산 방식: sector_avg_PER × EPS (또는 sector_avg_PBR × BPS)
+	- ✅ 설계 문서 (`backend/DESIGN_priceQuantitative_metric.md`) 작성
+
+	**메트릭 정의**:
+	```sql
+	INSERT INTO config_lv2_metric (
+	    id, source, domain, aggregation_params
+	) VALUES (
+	    'priceQuantitative',
+	    'custom',
+	    'quantitative-valuation',
+	    '{"calculation_method": "sector_average_fair_value", ...}'::jsonb
+	);
+	```
+
+	**계산 프로세스**:
+	1. `fmp-stock-peers` API로 동종 업종 티커 조회
+	2. 각 peer 티커의 PER/PBR 계산
+	3. IQR 방식으로 이상치 제거 후 평균 계산
+	4. `fair_value = sector_avg_PER × (price / current_PER)`
+	5. `position_quantitative = 'long' if fair_value > price else 'short'`
+	6. `disparity_quantitative = (fair_value / price) - 1`
+
+	**알려진 제한사항**:
+	- Peer tickers 미존재 시 NULL (소형주, 특수 섹터)
+	- fmp-stock-peers는 현재 peer 목록만 반환 (과거 데이터 없음)
+
+	**폐기된 이슈**:
+	- **I-36**: calcFairValue 파라미터 방식 → priceQuantitative 메트릭으로 대체
+	- **I-38**: calcFairValue 기본값 → 메트릭 자동 계산으로 대체
+	- **I-40**: Peer tickers 로깅 → priceQuantitative 제한사항으로 통합
+
+	**참조**:
+	- 설계 문서: `backend/DESIGN_priceQuantitative_metric.md`
+	- SQL 스크립트: `backend/scripts/add_priceQuantitative_metric.sql`
+	- 이슈 분석: `history/ISSUE_priceQuantitative_MISSING.md`
+
+---
+
 ## 📈 통계
 
 ### 상태별 현황
-- ✅ **완료**: 22개 (92%)
-- ⏸️ **보류**: 2개 (8%)
-- ❌ **미반영**: 0개 (0%)
+- ✅ **완료**: 36개 (87.8%)
+- 🔄 **DEPRECATED**: 3개 (7.3%) - I-36, I-38, I-40 (I-41로 대체됨)
+- ⏸️ **보류**: 2개 (4.9%) - I-04, I-14
+
+> **전체 이슈**: 41개 (I-01 ~ I-41)
 
 ### 일자별 이슈 처리
 - **2025-12-23**: I-01 ~ I-09 (9개 이슈 처리)
 - **2025-12-24**: I-10 ~ I-17 (8개 이슈 처리)
 - **2025-12-25**: I-18 ~ I-24 (7개 이슈 처리)
+- **2025-12-27**: I-25 ~ I-28 (4개 이슈 식별 및 완료)
+- **2025-12-30**: I-29 (식별)
+- **2025-12-31**: I-29 ~ I-37 (9개 이슈 해결 - 백엔드 6건, UI/UX 3건)
+- **2026-01-01**: I-38 (calcFairValue 기본값 변경 - 현재 deprecated)
+- **2026-01-02**: I-39 ~ I-41 (JSONB 파싱, priceQuantitative 메트릭 구현)
+
+### 폐기 이슈 (Deprecated)
+- **I-36**: calcFairValue 파라미터 → I-41 priceQuantitative 메트릭으로 대체
+- **I-38**: calcFairValue 기본값 → I-41 메트릭 자동 계산으로 대체
+- **I-40**: Peer tickers 로깅 → I-41 제한사항으로 통합
 
 ---
 
-*최종 업데이트: 2025-12-25 22:00 KST*
+*최종 업데이트: 2026-01-02 KST (I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated)*
+*설계 문서: backend/DESIGN_priceQuantitative_metric.md*
+*이슈 분석: history/ISSUE_priceQuantitative_MISSING.md*
