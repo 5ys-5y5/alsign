@@ -2,7 +2,7 @@
 
 import logging
 import json
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Body
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 from datetime import datetime
@@ -22,8 +22,8 @@ class KPIResponse(BaseModel):
     dataFreshness: Optional[str]
 
 
-class PerformanceSummaryRow(BaseModel):
-    """Response model for a single performance summary row."""
+class EventRow(BaseModel):
+    """Response model for a single event row."""
 
     id: str  # UUID as string for JSON compatibility
     ticker: str
@@ -37,12 +37,43 @@ class PerformanceSummaryRow(BaseModel):
     position_qualitative: Optional[str]
     disparity_qualitative: Optional[float]
     condition: Optional[str]
+    # WTS - which day offset (D+N) has the maximum return
+    wts: Optional[int]
+    # Day offset returns D-14 to D14 (excluding D0)
+    d_neg14: Optional[float]
+    d_neg13: Optional[float]
+    d_neg12: Optional[float]
+    d_neg11: Optional[float]
+    d_neg10: Optional[float]
+    d_neg9: Optional[float]
+    d_neg8: Optional[float]
+    d_neg7: Optional[float]
+    d_neg6: Optional[float]
+    d_neg5: Optional[float]
+    d_neg4: Optional[float]
+    d_neg3: Optional[float]
+    d_neg2: Optional[float]
+    d_neg1: Optional[float]
+    d_pos1: Optional[float]
+    d_pos2: Optional[float]
+    d_pos3: Optional[float]
+    d_pos4: Optional[float]
+    d_pos5: Optional[float]
+    d_pos6: Optional[float]
+    d_pos7: Optional[float]
+    d_pos8: Optional[float]
+    d_pos9: Optional[float]
+    d_pos10: Optional[float]
+    d_pos11: Optional[float]
+    d_pos12: Optional[float]
+    d_pos13: Optional[float]
+    d_pos14: Optional[float]
 
 
-class PerformanceSummaryResponse(BaseModel):
-    """Response model for performance summary with pagination."""
+class EventsResponse(BaseModel):
+    """Response model for events with pagination."""
 
-    data: List[PerformanceSummaryRow]
+    data: List[EventRow]
     total: int
     page: int
     pageSize: int
@@ -123,8 +154,8 @@ async def get_kpis():
         raise HTTPException(status_code=500, detail=f"Failed to fetch KPIs: {str(e)}")
 
 
-@router.get("/performanceSummary", response_model=PerformanceSummaryResponse)
-async def get_performance_summary(
+@router.get("/events", response_model=EventsResponse)
+async def get_events(
     page: int = Query(1, ge=1, description="Page number starting from 1"),
     pageSize: int = Query(50, ge=1, le=1000, description="Number of rows per page"),
     sortBy: Optional[str] = Query(None, description="Column to sort by"),
@@ -138,7 +169,7 @@ async def get_performance_summary(
     condition: Optional[str] = Query(None, description="Filter by condition (contains)"),
 ):
     """
-    Get performance summary from txn_events table with pagination, filtering, and sorting.
+    Get events from txn_events table with pagination, filtering, and sorting.
 
     Supports:
     - Pagination via page and pageSize
@@ -146,7 +177,7 @@ async def get_performance_summary(
     - Sorting by any column (asc/desc)
     """
     logger.info(
-        f"action=get_performance_summary phase=request_received "
+        f"action=get_events phase=request_received "
         f"page={page} pageSize={pageSize} sortBy={sortBy} sortOrder={sortOrder} "
         f"ticker={ticker} sector={sector} industry={industry} source={source} condition={condition}"
     )
@@ -218,7 +249,7 @@ async def get_performance_summary(
             count_query = f"SELECT COUNT(*) FROM txn_events WHERE {where_clause}"
             total = await conn.fetchval(count_query, *params)
 
-            # Get data
+            # Get data with price_trend extraction
             data_query = f"""
                 SELECT
                     id::text,
@@ -232,7 +263,10 @@ async def get_performance_summary(
                     disparity_quantitative,
                     position_qualitative::text,
                     disparity_qualitative,
-                    condition
+                    condition,
+                    price_trend,
+                    position_quantitative as pos_q_enum,
+                    position_qualitative as pos_ql_enum
                 FROM txn_events
                 WHERE {where_clause}
                 ORDER BY {order_clause}
@@ -247,14 +281,62 @@ async def get_performance_summary(
                 f"rows_fetched={len(rows)} page={page} pageSize={pageSize}"
             )
 
-            # Explicitly convert UUIDs and enums to strings
+            # Process rows and extract price_trend data
             data = []
             for row in rows:
                 row_id = str(row["id"])
                 logger.debug(f"Processing row: id={row_id}, type={type(row_id)}, ticker={row['ticker']}")
 
                 try:
-                    row_data = PerformanceSummaryRow(
+                    # Extract price_trend data (JSONB with D-14 to D14)
+                    price_trend = row["price_trend"] or {}
+
+                    # Helper function to extract day offset value
+                    def get_day_value(day_offset: int) -> Optional[float]:
+                        """Extract value for day offset from price_trend."""
+                        if not price_trend:
+                            return None
+                        # Try different key formats: "D-14", "D+1", etc.
+                        key = f"D{day_offset:+d}" if day_offset != 0 else "D0"
+                        # Also try without sign for negative
+                        alt_key = f"D{day_offset}"
+
+                        value = price_trend.get(key) or price_trend.get(alt_key)
+                        if value is not None:
+                            return float(value)
+                        return None
+
+                    # Extract all day offsets (D-14 to D14, excluding D0)
+                    day_values = {}
+                    for offset in range(-14, 15):
+                        if offset == 0:
+                            continue
+                        day_values[offset] = get_day_value(offset)
+
+                    # Calculate WTS: day offset with maximum absolute return
+                    # Apply position multiplier: long = +1, short = -1
+                    position_multiplier = 1
+                    pos_q = row["pos_q_enum"]
+                    if pos_q:
+                        pos_q_str = str(pos_q).lower()
+                        if pos_q_str == "short":
+                            position_multiplier = -1
+                        elif pos_q_str not in ["long", "undefined"]:
+                            position_multiplier = 0  # null position
+
+                    wts = None
+                    if position_multiplier != 0:
+                        max_return = None
+                        max_offset = None
+                        for offset, value in day_values.items():
+                            if value is not None:
+                                adjusted_return = value * position_multiplier
+                                if max_return is None or adjusted_return > max_return:
+                                    max_return = adjusted_return
+                                    max_offset = offset
+                        wts = max_offset
+
+                    row_data = EventRow(
                         id=row_id,
                         ticker=row["ticker"],
                         event_date=row["event_date"],
@@ -267,28 +349,58 @@ async def get_performance_summary(
                         position_qualitative=str(row["position_qualitative"]) if row["position_qualitative"] is not None else None,
                         disparity_qualitative=row["disparity_qualitative"],
                         condition=row["condition"],
+                        wts=wts,
+                        # Day offset values (D-14 to D14, excluding D0)
+                        d_neg14=day_values.get(-14),
+                        d_neg13=day_values.get(-13),
+                        d_neg12=day_values.get(-12),
+                        d_neg11=day_values.get(-11),
+                        d_neg10=day_values.get(-10),
+                        d_neg9=day_values.get(-9),
+                        d_neg8=day_values.get(-8),
+                        d_neg7=day_values.get(-7),
+                        d_neg6=day_values.get(-6),
+                        d_neg5=day_values.get(-5),
+                        d_neg4=day_values.get(-4),
+                        d_neg3=day_values.get(-3),
+                        d_neg2=day_values.get(-2),
+                        d_neg1=day_values.get(-1),
+                        d_pos1=day_values.get(1),
+                        d_pos2=day_values.get(2),
+                        d_pos3=day_values.get(3),
+                        d_pos4=day_values.get(4),
+                        d_pos5=day_values.get(5),
+                        d_pos6=day_values.get(6),
+                        d_pos7=day_values.get(7),
+                        d_pos8=day_values.get(8),
+                        d_pos9=day_values.get(9),
+                        d_pos10=day_values.get(10),
+                        d_pos11=day_values.get(11),
+                        d_pos12=day_values.get(12),
+                        d_pos13=day_values.get(13),
+                        d_pos14=day_values.get(14),
                     )
                     data.append(row_data)
-                    logger.debug(f"Successfully created PerformanceSummaryRow with id={row_data.id}")
+                    logger.debug(f"Successfully created EventRow with id={row_data.id}, wts={wts}")
                 except Exception as e:
-                    logger.error(f"Failed to create PerformanceSummaryRow: {e}, row_id={row_id}, type={type(row_id)}")
+                    logger.error(f"Failed to create EventRow: {e}, row_id={row_id}, type={type(row_id)}")
                     raise
 
             # Log warning if no data found
             if total == 0:
                 logger.warning(
-                    "action=get_performance_summary status=empty_result message='No events in txn_events table. "
+                    "action=get_events status=empty_result message='No events in txn_events table. "
                     "Please run: 1) GET /sourceData to collect foundation data, "
                     "2) POST /setEventsTable to consolidate events, "
                     "3) POST /backfillEventsTable to calculate metrics'"
                 )
 
             logger.info(
-                f"action=get_performance_summary status=success page={page} "
+                f"action=get_events status=success page={page} "
                 f"pageSize={pageSize} total={total} returned={len(data)}"
             )
 
-            return PerformanceSummaryResponse(
+            return EventsResponse(
                 data=data, total=total, page=page, pageSize=pageSize
             )
 
@@ -296,12 +408,12 @@ async def get_performance_summary(
         raise
     except Exception as e:
         logger.error(
-            f"action=get_performance_summary status=error error={str(e)} "
+            f"action=get_events status=error error={str(e)} "
             f"error_type={type(e).__name__} page={page} pageSize={pageSize}",
             exc_info=True
         )
         raise HTTPException(
-            status_code=500, detail=f"Failed to fetch performance summary: {str(e)}"
+            status_code=500, detail=f"Failed to fetch events: {str(e)}"
         )
 
 
@@ -422,4 +534,148 @@ async def get_day_offset_metrics(
         logger.error(f"action=get_day_offset_metrics status=error error={str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch day-offset metrics: {str(e)}"
+        )
+
+
+class BulkUpdateRequest(BaseModel):
+    """Request model for bulk update events."""
+
+    event_ids: List[str]
+    field: str  # "condition" or "position_quantitative" or "position_qualitative"
+    operation: str  # For condition: "append", "replace", "remove". For position: "set"
+    value: Optional[str]  # The value to set/append/remove
+
+
+class BulkUpdateResponse(BaseModel):
+    """Response model for bulk update."""
+
+    updated_count: int
+    message: str
+
+
+@router.post("/bulkUpdate", response_model=BulkUpdateResponse)
+async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
+    """
+    Bulk update events.
+
+    Supports:
+    - condition field: append (adds value with comma), replace (replaces entire value), remove (removes value from comma-separated list)
+    - position_quantitative/position_qualitative: set (sets to specified value: long/short/null/neutral)
+    """
+    logger.info(
+        f"action=bulk_update_events phase=request_received "
+        f"event_ids={len(request.event_ids)} field={request.field} operation={request.operation} value={request.value}"
+    )
+
+    try:
+        # Validate field
+        allowed_fields = ["condition", "position_quantitative", "position_qualitative"]
+        if request.field not in allowed_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid field. Allowed: {', '.join(allowed_fields)}",
+            )
+
+        # Validate operation
+        if request.field == "condition":
+            allowed_operations = ["append", "replace", "remove"]
+            if request.operation not in allowed_operations:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid operation for condition. Allowed: {', '.join(allowed_operations)}",
+                )
+        elif request.field in ["position_quantitative", "position_qualitative"]:
+            allowed_operations = ["set"]
+            if request.operation not in allowed_operations:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid operation for position. Allowed: {', '.join(allowed_operations)}",
+                )
+            # Validate value for position
+            allowed_positions = ["long", "short", "null", "neutral"]
+            if request.value and request.value.lower() not in allowed_positions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid position value. Allowed: {', '.join(allowed_positions)}",
+                )
+
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            updated_count = 0
+
+            if request.field == "condition":
+                if request.operation == "append":
+                    # Append value to existing condition (comma-separated)
+                    update_query = """
+                        UPDATE txn_events
+                        SET condition = CASE
+                            WHEN condition IS NULL OR condition = '' THEN $1
+                            ELSE condition || ',' || $1
+                        END
+                        WHERE id = ANY($2::uuid[])
+                    """
+                    result = await conn.execute(update_query, request.value, request.event_ids)
+                elif request.operation == "replace":
+                    # Replace entire condition value
+                    update_query = """
+                        UPDATE txn_events
+                        SET condition = $1
+                        WHERE id = ANY($2::uuid[])
+                    """
+                    result = await conn.execute(update_query, request.value, request.event_ids)
+                elif request.operation == "remove":
+                    # Remove value from comma-separated list
+                    # This is complex, use Python to parse and update
+                    for event_id in request.event_ids:
+                        row = await conn.fetchrow("SELECT condition FROM txn_events WHERE id = $1::uuid", event_id)
+                        if row and row["condition"]:
+                            conditions = [c.strip() for c in row["condition"].split(",")]
+                            conditions = [c for c in conditions if c != request.value]
+                            new_condition = ",".join(conditions) if conditions else None
+                            await conn.execute(
+                                "UPDATE txn_events SET condition = $1 WHERE id = $2::uuid",
+                                new_condition,
+                                event_id,
+                            )
+                            updated_count += 1
+                    logger.info(
+                        f"action=bulk_update_events status=success field={request.field} "
+                        f"operation={request.operation} updated={updated_count}"
+                    )
+                    return BulkUpdateResponse(
+                        updated_count=updated_count,
+                        message=f"Successfully updated {updated_count} events",
+                    )
+
+                # Extract count from result
+                updated_count = int(result.split()[-1])
+
+            elif request.field in ["position_quantitative", "position_qualitative"]:
+                if request.operation == "set":
+                    # Set position value (long/short/null/neutral)
+                    position_value = None if request.value.lower() == "null" else request.value.lower()
+                    update_query = f"""
+                        UPDATE txn_events
+                        SET {request.field} = $1::position
+                        WHERE id = ANY($2::uuid[])
+                    """
+                    result = await conn.execute(update_query, position_value, request.event_ids)
+                    updated_count = int(result.split()[-1])
+
+            logger.info(
+                f"action=bulk_update_events status=success field={request.field} "
+                f"operation={request.operation} updated={updated_count}"
+            )
+
+            return BulkUpdateResponse(
+                updated_count=updated_count,
+                message=f"Successfully updated {updated_count} events",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"action=bulk_update_events status=error error={str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to bulk update events: {str(e)}"
         )

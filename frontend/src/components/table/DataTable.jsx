@@ -50,6 +50,19 @@ function renderCellValue(value, column) {
     return value.toLocaleString();
   }
 
+  // Handle day offset columns (D-14 to D14)
+  if (column.type === 'dayoffset') {
+    const numValue = Number(value);
+    const percentage = (numValue * 100).toFixed(2);
+    const arrow = numValue > 0 ? '▲' : numValue < 0 ? '▼' : '';
+    const colorClass = numValue > 0 ? 'text-red' : numValue < 0 ? 'text-blue' : '';
+    return (
+      <span className={colorClass}>
+        {arrow} {percentage}%
+      </span>
+    );
+  }
+
   // Handle JSON fields - DO NOT EXPAND
   if (
     column.key === 'value_quantitative' ||
@@ -108,7 +121,7 @@ function applyFilters(data, filters, columns) {
       }
 
       // Number filter: min-max, >min, <max, or exact value
-      if (column.type === 'number') {
+      if (column.type === 'number' || column.type === 'dayoffset') {
         const numValue = Number(cellValue);
         const filterStr = filterValue.trim();
 
@@ -204,6 +217,10 @@ function applySort(data, sortConfig, columns) {
  * @param {Object} props.sortConfig - Sort configuration { key, direction }
  * @param {Function} props.onSortChange - Callback when sort changes
  * @param {boolean} [props.loading] - Loading state
+ * @param {boolean} [props.enableRowExpand] - Enable row expand on click
+ * @param {boolean} [props.enableCheckboxes] - Enable row selection with checkboxes
+ * @param {boolean} [props.enableFooterStats] - Enable footer statistics row
+ * @param {Function} [props.onSelectionChange] - Callback when row selection changes (receives Set of row IDs)
  * @returns {JSX.Element} Data table component
  */
 export default function DataTable({
@@ -216,7 +233,23 @@ export default function DataTable({
   sortConfig,
   onSortChange,
   loading = false,
+  enableRowExpand = false,
+  enableCheckboxes = false,
+  enableFooterStats = false,
+  onSelectionChange,
 }) {
+  // Track expanded rows
+  const [expandedRows, setExpandedRows] = useState(new Set());
+
+  // Track selected rows (for checkboxes)
+  const [selectedRows, setSelectedRows] = useState(new Set());
+
+  // Notify parent when selection changes
+  useEffect(() => {
+    if (onSelectionChange) {
+      onSelectionChange(selectedRows);
+    }
+  }, [selectedRows, onSelectionChange]);
   // Determine visible columns
   const visibleColumns = useMemo(() => {
     return columns.filter((col) => selectedColumns.includes(col.key));
@@ -259,9 +292,111 @@ export default function DataTable({
     onFiltersChange(newFilters);
   };
 
+  // Handle row expand toggle
+  const toggleRowExpand = (rowId) => {
+    const newExpanded = new Set(expandedRows);
+    if (newExpanded.has(rowId)) {
+      newExpanded.delete(rowId);
+    } else {
+      newExpanded.add(rowId);
+    }
+    setExpandedRows(newExpanded);
+  };
+
+  // Handle checkbox toggle
+  const toggleRowSelect = (rowId) => {
+    const newSelected = new Set(selectedRows);
+    if (newSelected.has(rowId)) {
+      newSelected.delete(rowId);
+    } else {
+      newSelected.add(rowId);
+    }
+    setSelectedRows(newSelected);
+  };
+
+  // Handle select all toggle
+  const toggleSelectAll = () => {
+    if (selectedRows.size === processedData.length) {
+      // Deselect all
+      setSelectedRows(new Set());
+    } else {
+      // Select all
+      const allIds = processedData.map((row) => row.id);
+      setSelectedRows(new Set(allIds));
+    }
+  };
+
+  // Calculate footer statistics
+  const calculateFooterStats = (columnKey, column) => {
+    if (!enableFooterStats) return null;
+
+    const values = processedData.map((row) => row[columnKey]).filter((v) => v !== null && v !== undefined);
+
+    if (values.length === 0) return '-';
+
+    switch (columnKey) {
+      case 'ticker':
+        // Row count
+        return `${processedData.length} rows`;
+
+      case 'event_date':
+        // Min ~ Max
+        const dates = values.map((d) => new Date(d));
+        const minDate = new Date(Math.min(...dates)).toISOString().split('T')[0];
+        const maxDate = new Date(Math.max(...dates)).toISOString().split('T')[0];
+        return `${minDate} ~ ${maxDate}`;
+
+      case 'source':
+      case 'sector':
+      case 'industry':
+      case 'condition':
+        // Distinct count
+        return `${new Set(values).size} distinct`;
+
+      case 'disparity_quantitative':
+      case 'disparity_qualitative':
+        // Average
+        const avg = values.reduce((sum, v) => sum + Number(v), 0) / values.length;
+        return `avg: ${(avg * 100).toFixed(2)}%`;
+
+      case 'wts':
+        // Average of each Dk, then find k with max average
+        // This requires access to all D-14~D14 columns
+        const dayOffsets = {};
+        for (let offset = -14; offset <= 14; offset++) {
+          if (offset === 0) continue;
+          const key = offset < 0 ? `d_neg${Math.abs(offset)}` : `d_pos${offset}`;
+          const dayValues = processedData
+            .map((row) => row[key])
+            .filter((v) => v !== null && v !== undefined)
+            .map((v) => Number(v));
+          if (dayValues.length > 0) {
+            dayOffsets[offset] = dayValues.reduce((sum, v) => sum + v, 0) / dayValues.length;
+          }
+        }
+        let maxAvg = -Infinity;
+        let maxOffset = null;
+        for (const [offset, avg] of Object.entries(dayOffsets)) {
+          if (avg > maxAvg) {
+            maxAvg = avg;
+            maxOffset = Number(offset);
+          }
+        }
+        return maxOffset !== null ? `D${maxOffset > 0 ? '+' : ''}${maxOffset}` : '-';
+
+      default:
+        // For day offset columns (d_neg14 ~ d_pos14), show average
+        if (column.type === 'dayoffset') {
+          const avg = values.reduce((sum, v) => sum + Number(v), 0) / values.length;
+          return `avg: ${(avg * 100).toFixed(2)}%`;
+        }
+        return '-';
+    }
+  };
+
   return (
     <div className="table-shell">
-      {/* Toolbar */}
+      {/* Toolbar - Always visible at top */}
       <div className="table-toolbar">
         <ColumnSelector
           allColumns={columns}
@@ -274,17 +409,26 @@ export default function DataTable({
         </div>
       </div>
 
-      {/* Scrollable Table Container */}
-      <div className="scroll-y">
-        <div className="scroll-x">
-          {loading ? (
-            <div className="loading">Loading...</div>
-          ) : processedData.length === 0 ? (
-            <div className="empty-state">No data to display</div>
-          ) : (
+      {/* Scrollable Table Container with sticky header */}
+      <div className="table-scroll-container">
+        {loading ? (
+          <div className="loading">Loading...</div>
+        ) : processedData.length === 0 ? (
+          <div className="empty-state">No data to display</div>
+        ) : (
+          <div className="table-wrapper">
             <table>
               <thead>
                 <tr>
+                  {enableCheckboxes && (
+                    <th style={{ width: '50px' }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedRows.size === processedData.length && processedData.length > 0}
+                        onChange={toggleSelectAll}
+                      />
+                    </th>
+                  )}
                   {visibleColumns.map((column) => (
                     <SortHeader
                       key={column.key}
@@ -307,24 +451,79 @@ export default function DataTable({
                 </tr>
               </thead>
               <tbody>
-                {processedData.map((row, rowIndex) => (
-                  <tr key={row.id || rowIndex}>
+                {processedData.map((row, rowIndex) => {
+                  const isExpanded = expandedRows.has(row.id);
+                  const isSelected = selectedRows.has(row.id);
+
+                  return (
+                    <React.Fragment key={row.id || rowIndex}>
+                      <tr
+                        onClick={() => enableRowExpand && toggleRowExpand(row.id)}
+                        style={{ cursor: enableRowExpand ? 'pointer' : 'default' }}
+                      >
+                        {enableCheckboxes && (
+                          <td onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleRowSelect(row.id)}
+                            />
+                          </td>
+                        )}
+                        {visibleColumns.map((column) => (
+                          <td
+                            key={column.key}
+                            style={{
+                              width: column.width ? `${column.width}px` : 'auto',
+                            }}
+                          >
+                            {renderCellValue(row[column.key], column)}
+                          </td>
+                        ))}
+                      </tr>
+                      {isExpanded && (
+                        <tr className="expanded-row">
+                          <td colSpan={visibleColumns.length + (enableCheckboxes ? 1 : 0)}>
+                            <div style={{ padding: 'var(--space-3)', backgroundColor: 'var(--surface)' }}>
+                              <h4 style={{ marginBottom: 'var(--space-2)', fontWeight: 'var(--font-semibold)' }}>
+                                Full Details
+                              </h4>
+                              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--space-2)' }}>
+                                {columns.map((column) => (
+                                  <div key={column.key} style={{ fontSize: 'var(--text-sm)' }}>
+                                    <strong>{column.label}:</strong> {renderCellValue(row[column.key], column)}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+              {enableFooterStats && !loading && processedData.length > 0 && (
+                <tfoot>
+                  <tr>
+                    {enableCheckboxes && <td style={{ width: '50px' }}></td>}
                     {visibleColumns.map((column) => (
                       <td
                         key={column.key}
                         style={{
                           width: column.width ? `${column.width}px` : 'auto',
                         }}
+                        title={calculateFooterStats(column.key, column)}
                       >
-                        {renderCellValue(row[column.key], column)}
+                        {calculateFooterStats(column.key, column)}
                       </td>
                     ))}
                   </tr>
-                ))}
-              </tbody>
+                </tfoot>
+              )}
             </table>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

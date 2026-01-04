@@ -1,14 +1,13 @@
 /**
  * DashboardPage Component
  *
- * Main dashboard page displaying KPI cards, performance summary, and day-offset metrics.
+ * Main dashboard page displaying KPI cards and events.
  * Based on alsign/prompt/2_designSystem.ini route contract for dashboard route.
  */
 
 import React, { useState, useEffect } from 'react';
 import KPICard from '../components/dashboard/KPICard';
-import PerformanceTable from '../components/dashboard/PerformanceTable';
-import DayOffsetTable from '../components/dashboard/DayOffsetTable';
+import EventsTable from '../components/dashboard/EventsTable';
 
 // API base URL from environment or default to localhost
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
@@ -40,18 +39,13 @@ export default function DashboardPage() {
   const [kpisLoading, setKpisLoading] = useState(true);
   const [kpisError, setKpisError] = useState(null);
 
-  // Performance summary state
-  const [performanceData, setPerformanceData] = useState([]);
-  const [performanceLoading, setPerformanceLoading] = useState(true);
-  const [performanceError, setPerformanceError] = useState(null);
-
-  // Day-offset metrics state
-  const [dayOffsetData, setDayOffsetData] = useState([]);
-  const [dayOffsetLoading, setDayOffsetLoading] = useState(true);
-  const [dayOffsetError, setDayOffsetError] = useState(null);
-
-  // Day-offset groupBy selector
-  const [groupBy, setGroupBy] = useState('sector');
+  // Events state
+  const [eventsData, setEventsData] = useState([]);
+  const [eventsTotal, setEventsTotal] = useState(0);
+  const [eventsPage, setEventsPage] = useState(1);
+  const [eventsPageSize, setEventsPageSize] = useState(100);
+  const [eventsLoading, setEventsLoading] = useState(true);
+  const [eventsError, setEventsError] = useState(null);
 
   // Fetch KPIs
   useEffect(() => {
@@ -83,15 +77,14 @@ export default function DashboardPage() {
     fetchKPIs();
   }, []);
 
-  // Fetch performance summary
+  // Fetch events
   useEffect(() => {
-    async function fetchPerformanceSummary() {
+    async function fetchEvents() {
       try {
-        setPerformanceLoading(true);
-        setPerformanceError(null);
-        // Fetch first page with reasonable page size
+        setEventsLoading(true);
+        setEventsError(null);
         const response = await fetch(
-          `${API_BASE_URL}/dashboard/performanceSummary?page=1&pageSize=100`
+          `${API_BASE_URL}/dashboard/events?page=${eventsPage}&pageSize=${eventsPageSize}`
         );
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
@@ -99,54 +92,24 @@ export default function DashboardPage() {
           throw new Error(errorMessage);
         }
         const result = await response.json();
-        setPerformanceData(result.data);
+        setEventsData(result.data);
+        setEventsTotal(result.total);
 
         // Warn if no data found
         if (result.data.length === 0 || result.total === 0) {
-          setPerformanceError('No events in database. To populate data: 1) Run GET /sourceData to collect foundation data, 2) POST /setEventsTable to consolidate events, 3) POST /backfillEventsTable to calculate metrics.');
+          setEventsError('No events in database. To populate data: 1) Run GET /sourceData to collect foundation data, 2) POST /setEventsTable to consolidate events, 3) POST /backfillEventsTable to calculate metrics.');
         }
       } catch (error) {
-        console.error('Failed to fetch performance summary:', error);
-        setPerformanceError(error.message || 'Failed to connect to backend. Please ensure the backend server is running on port 8000.');
+        console.error('Failed to fetch events:', error);
+        setEventsError(error.message || 'Failed to connect to backend. Please ensure the backend server is running on port 8000.');
       } finally {
-        setPerformanceLoading(false);
+        setEventsLoading(false);
       }
     }
 
-    fetchPerformanceSummary();
-  }, []);
+    fetchEvents();
+  }, [eventsPage, eventsPageSize]);
 
-  // Fetch day-offset metrics
-  useEffect(() => {
-    async function fetchDayOffsetMetrics() {
-      try {
-        setDayOffsetLoading(true);
-        setDayOffsetError(null);
-        const response = await fetch(
-          `${API_BASE_URL}/dashboard/dayOffsetMetrics?groupBy=${groupBy}`
-        );
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const errorMessage = errorData.detail || errorData.error?.message || `HTTP ${response.status}`;
-          throw new Error(errorMessage);
-        }
-        const result = await response.json();
-        setDayOffsetData(result.data);
-
-        // Warn if no data found
-        if (result.data.length === 0 || result.total === 0) {
-          setDayOffsetError('No metrics available. Database needs to be populated with market data first. Please run API endpoints in this order: 1) GET /sourceData (collect foundation data), 2) POST /setEventsTable (consolidate events), 3) POST /backfillEventsTable (calculate metrics).');
-        }
-      } catch (error) {
-        console.error('Failed to fetch day-offset metrics:', error);
-        setDayOffsetError(error.message || 'Failed to connect to backend. Please ensure the backend server is running on port 8000.');
-      } finally {
-        setDayOffsetLoading(false);
-      }
-    }
-
-    fetchDayOffsetMetrics();
-  }, [groupBy]);
 
   return (
     <>
@@ -188,63 +151,25 @@ export default function DashboardPage() {
         </div>
       </section>
 
-      {/* Performance Summary Section */}
+      {/* Events Section */}
       <section style={{ marginBottom: 'var(--space-5)' }}>
-        {performanceError ? (
+        {eventsError ? (
           <div className="alert alert-error">
-            Error loading performance summary: {performanceError}
+            Error loading events: {eventsError}
           </div>
         ) : (
-          <PerformanceTable data={performanceData} loading={performanceLoading} />
-        )}
-      </section>
-
-      {/* Day-Offset Metrics Section */}
-      <section>
-        {/* GroupBy Selector */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 'var(--space-2)',
-            marginBottom: 'var(--space-3)',
-          }}
-        >
-          <label
-            htmlFor="groupBy"
-            style={{
-              fontSize: 'var(--text-sm)',
-              fontWeight: 'var(--font-medium)',
-              color: 'var(--text)',
+          <EventsTable
+            data={eventsData}
+            loading={eventsLoading}
+            total={eventsTotal}
+            page={eventsPage}
+            pageSize={eventsPageSize}
+            onPageChange={setEventsPage}
+            onPageSizeChange={(newSize) => {
+              setEventsPageSize(newSize);
+              setEventsPage(1); // Reset to first page
             }}
-          >
-            Group by:
-          </label>
-          <select
-            id="groupBy"
-            value={groupBy}
-            onChange={(e) => setGroupBy(e.target.value)}
-            style={{
-              padding: 'var(--space-1) var(--space-2)',
-              border: '1px solid var(--border)',
-              borderRadius: 'var(--rounded-lg)',
-              fontSize: 'var(--text-sm)',
-              backgroundColor: 'white',
-            }}
-          >
-            <option value="sector">Sector</option>
-            <option value="industry">Industry</option>
-            <option value="source">Source</option>
-            <option value="analyst">Analyst</option>
-          </select>
-        </div>
-
-        {dayOffsetError ? (
-          <div className="alert alert-error">
-            Error loading day-offset metrics: {dayOffsetError}
-          </div>
-        ) : (
-          <DayOffsetTable data={dayOffsetData} loading={dayOffsetLoading} />
+          />
         )}
       </section>
     </>
