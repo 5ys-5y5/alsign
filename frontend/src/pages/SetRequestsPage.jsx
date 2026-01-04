@@ -21,10 +21,91 @@ const ENDPOINT_FLOWS = {
     title: 'GET /sourceData',
     description: '외부 FMP API에서 금융 데이터를 수집하여 DB에 저장',
     parameters: [
-      { name: 'mode', type: 'string', required: true, options: ['holiday', 'target', 'consensus', 'earning'] },
-      { name: 'overwrite', type: 'boolean', required: false },
-      { name: 'calc_mode', type: 'string', required: false, options: ['maintenance', 'calculation'] },
-      { name: 'calc_scope', type: 'string', required: false, options: ['all', 'ticker', 'event_date_range'] },
+      {
+        name: 'mode',
+        type: 'string',
+        required: false,
+        options: ['holiday', 'target', 'consensus', 'earning'],
+        description: '실행할 모드 (쉼표 구분 가능, 예: "target,consensus"). 미지정 시 전체 모드 순차 실행 (holiday → target → consensus → earning)'
+      },
+      {
+        name: 'overwrite',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: 'NULL만 채우기(false) vs 기존 데이터 덮어쓰기(true)'
+      },
+      {
+        name: 'past',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: 'earning 모드 전용: true면 과거 5년 + 미래 28일, false면 미래 28일만'
+      },
+      {
+        name: 'calc_mode',
+        type: 'string',
+        required: false,
+        options: ['maintenance', 'calculation'],
+        description: 'consensus 모드 전용: maintenance(Phase 1+2 with scope), calculation(Phase 2만, API 호출 없음). 미지정 시 Phase 1+2 실행'
+      },
+      {
+        name: 'calc_scope',
+        type: 'string',
+        required: false,
+        options: ['all', 'ticker', 'event_date_range', 'partition_keys'],
+        description: 'calc_mode와 함께 사용: 재계산 범위 지정 (all, ticker, event_date_range, partition_keys)'
+      },
+      {
+        name: 'tickers',
+        type: 'string',
+        required: false,
+        description: 'calc_scope=ticker일 때 필수: 쉼표로 구분된 티커 목록 (예: "AAPL,MSFT")'
+      },
+      {
+        name: 'from',
+        type: 'date',
+        required: false,
+        description: 'calc_scope=event_date_range일 때 필수: 시작 날짜 (YYYY-MM-DD)'
+      },
+      {
+        name: 'to',
+        type: 'date',
+        required: false,
+        description: 'calc_scope=event_date_range일 때 필수: 종료 날짜 (YYYY-MM-DD)'
+      },
+    ],
+    usageExamples: [
+      {
+        title: '기본: 전체 모드 순차 실행',
+        url: 'GET /sourceData',
+        description: 'holiday → target → consensus → earning 순서로 모두 실행'
+      },
+      {
+        title: '특정 모드만 실행',
+        url: 'GET /sourceData?mode=consensus',
+        description: 'consensus 모드만 실행 (Phase 1+2+3)'
+      },
+      {
+        title: '여러 모드 선택 실행',
+        url: 'GET /sourceData?mode=target,consensus',
+        description: 'target과 consensus만 실행'
+      },
+      {
+        title: 'consensus 재계산 (전체)',
+        url: 'GET /sourceData?mode=consensus&calc_mode=maintenance&calc_scope=all',
+        description: 'API 호출 + 모든 파티션 재계산'
+      },
+      {
+        title: 'consensus 재계산 (특정 티커만)',
+        url: 'GET /sourceData?mode=consensus&calc_mode=calculation&calc_scope=ticker&tickers=AAPL,MSFT',
+        description: 'AAPL, MSFT만 재계산 (API 호출 없음)'
+      },
+      {
+        title: 'earning 과거 데이터 수집',
+        url: 'GET /sourceData?mode=earning&past=true',
+        description: '과거 5년 + 미래 28일 실적 발표일 수집'
+      },
     ],
     modes: {
       holiday: {
@@ -123,10 +204,80 @@ const ENDPOINT_FLOWS = {
     title: 'POST /backfillEventsTable',
     description: 'txn_events 테이블의 이벤트에 valuation metrics 계산',
     parameters: [
-      { name: 'overwrite', type: 'boolean', required: false },
-      { name: 'from_date', type: 'date', required: false },
-      { name: 'to_date', type: 'date', required: false },
-      { name: 'tickers', type: 'array', required: false },
+      {
+        name: 'overwrite',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: 'NULL만 채우기(false) vs 덮어쓰기(true). metrics 지정 시 해당 메트릭에만 적용, 미지정 시 전체 필드에 적용 (I-41 Part 3)'
+      },
+      {
+        name: 'from',
+        type: 'date',
+        required: false,
+        description: '이벤트 시작 날짜 필터 (YYYY-MM-DD). 미지정 시 전체 기간'
+      },
+      {
+        name: 'to',
+        type: 'date',
+        required: false,
+        description: '이벤트 종료 날짜 필터 (YYYY-MM-DD). 미지정 시 전체 기간'
+      },
+      {
+        name: 'tickers',
+        type: 'string',
+        required: false,
+        description: '티커 필터 (쉼표 구분, 예: "AAPL,MSFT"). 미지정 시 전체 티커'
+      },
+      {
+        name: 'calcFairValue',
+        type: 'boolean',
+        required: false,
+        default: 'true',
+        deprecated: true,
+        description: '[DEPRECATED - I-41] 업종 평균 적정가 계산 → metrics=priceQuantitative 사용 권장'
+      },
+      {
+        name: 'metrics',
+        type: 'string',
+        required: false,
+        description: '업데이트할 메트릭 ID 리스트 (쉼표 구분, 예: "priceQuantitative,PER,PBR"). 미지정 시 전체 메트릭 계산 (I-41)'
+      },
+    ],
+    behaviorMatrix: [
+      { metrics: 'None', overwrite: 'false', behavior: '전체 필드 NULL만 채우기 (기본 동작)' },
+      { metrics: 'None', overwrite: 'true', behavior: '전체 필드 강제 덮어쓰기' },
+      { metrics: '"priceQuantitative"', overwrite: 'false', behavior: 'priceQuantitative만 NULL 채우기' },
+      { metrics: '"priceQuantitative"', overwrite: 'true', behavior: 'priceQuantitative만 강제 덮어쓰기' },
+      { metrics: '"PER,PBR"', overwrite: 'false', behavior: 'PER,PBR만 NULL 채우기 (동시)' },
+      { metrics: '"PER,PBR"', overwrite: 'true', behavior: 'PER,PBR만 강제 덮어쓰기 (동시)' },
+    ],
+    usageExamples: [
+      {
+        title: '기본: 모든 메트릭 계산 (NULL만)',
+        url: 'POST /backfillEventsTable',
+        description: 'NULL 값만 채우기, 전체 메트릭'
+      },
+      {
+        title: '특정 메트릭만 NULL 채우기',
+        url: 'POST /backfillEventsTable?metrics=priceQuantitative',
+        description: 'priceQuantitative 메트릭만 계산 (NULL 값만)'
+      },
+      {
+        title: '특정 메트릭 강제 재계산',
+        url: 'POST /backfillEventsTable?metrics=priceQuantitative&overwrite=true',
+        description: 'priceQuantitative 강제 덮어쓰기'
+      },
+      {
+        title: '여러 메트릭 동시 업데이트',
+        url: 'POST /backfillEventsTable?metrics=PER,PBR,PSR&overwrite=false',
+        description: 'PER, PBR, PSR 메트릭만 NULL 채우기'
+      },
+      {
+        title: '날짜 + 티커 + 메트릭 필터링',
+        url: 'POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&tickers=AAPL,MSFT&metrics=priceQuantitative&overwrite=true',
+        description: '2024년, AAPL/MSFT만, priceQuantitative 강제 재계산'
+      },
     ],
     phases: [
       {
@@ -210,8 +361,60 @@ const ENDPOINT_FLOWS = {
     title: 'POST /setEventsTable',
     description: 'evt_* 테이블의 데이터를 txn_events 테이블로 통합',
     parameters: [
-      { name: 'table', type: 'string', required: true, options: ['consensus', 'earning'] },
-      { name: 'overwrite', type: 'boolean', required: false },
+      {
+        name: 'schema',
+        type: 'string',
+        required: false,
+        default: 'public',
+        description: '검색할 스키마 이름. evt_* 테이블을 자동 탐색'
+      },
+      {
+        name: 'table',
+        type: 'string',
+        required: false,
+        description: '특정 evt_* 테이블만 처리 (쉼표 구분 가능, 예: "evt_consensus,evt_earning"). 미지정 시 스키마 내 모든 evt_* 테이블 처리'
+      },
+      {
+        name: 'overwrite',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: 'sector/industry 업데이트 모드: false=NULL만 채우기, true=불일치도 수정'
+      },
+      {
+        name: 'dryRun',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: 'true면 변경사항만 표시하고 실제 DB 수정 없음 (테스트용)'
+      },
+    ],
+    usageExamples: [
+      {
+        title: '기본: 모든 evt_* 테이블 통합',
+        url: 'POST /setEventsTable',
+        description: 'public 스키마의 모든 evt_* 테이블을 txn_events로 통합'
+      },
+      {
+        title: '특정 테이블만 통합',
+        url: 'POST /setEventsTable?table=evt_consensus',
+        description: 'evt_consensus 테이블만 처리'
+      },
+      {
+        title: '여러 테이블 통합',
+        url: 'POST /setEventsTable?table=evt_consensus,evt_earning',
+        description: 'evt_consensus, evt_earning 테이블 처리'
+      },
+      {
+        title: 'Dry Run (테스트)',
+        url: 'POST /setEventsTable?dryRun=true',
+        description: '변경사항만 확인, 실제 수정 없음'
+      },
+      {
+        title: 'sector/industry 강제 수정',
+        url: 'POST /setEventsTable?overwrite=true',
+        description: 'NULL뿐만 아니라 불일치하는 sector/industry도 수정'
+      },
     ],
     phases: [
       {
@@ -425,29 +628,172 @@ function EndpointFlowDiagram({ endpoint, onApiClick }) {
         </p>
       </div>
 
-      {/* 파라미터 */}
-      <div style={{ marginBottom: 'var(--space-3)' }}>
-        <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)', marginBottom: '4px' }}>
-          Parameters:
+      {/* 파라미터 상세 */}
+      <div style={{ marginBottom: 'var(--space-4)' }}>
+        <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: 'var(--ink)', marginBottom: '8px' }}>
+          📋 Parameters
         </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {endpoint.parameters.map((param) => (
-            <span
+            <div
               key={param.name}
               style={{
-                padding: '4px 8px',
-                backgroundColor: param.required ? '#fef3c7' : '#f3f4f6',
+                padding: 'var(--space-2)',
+                backgroundColor: param.deprecated ? '#fef3c7' : param.required ? '#fee2e2' : '#f9fafb',
+                border: `1px solid ${param.deprecated ? '#fcd34d' : param.required ? '#fca5a5' : '#e5e7eb'}`,
                 borderRadius: 'var(--rounded)',
-                fontSize: 'var(--text-xs)',
-                fontFamily: 'monospace',
               }}
             >
-              {param.name}{param.required ? '*' : ''}
-              {param.options && `: [${param.options.join('|')}]`}
-            </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                <code style={{
+                  fontSize: 'var(--text-sm)',
+                  fontWeight: 'var(--font-semibold)',
+                  color: param.deprecated ? '#92400e' : param.required ? '#991b1b' : 'var(--ink)'
+                }}>
+                  {param.name}
+                </code>
+                <span style={{
+                  fontSize: 'var(--text-xs)',
+                  color: 'var(--text-dim)',
+                  fontFamily: 'monospace'
+                }}>
+                  {param.type}
+                </span>
+                {param.required && (
+                  <span style={{ fontSize: 'var(--text-xs)', color: '#991b1b', fontWeight: 'var(--font-semibold)' }}>
+                    REQUIRED
+                  </span>
+                )}
+                {param.deprecated && (
+                  <span style={{ fontSize: 'var(--text-xs)', color: '#92400e', fontWeight: 'var(--font-semibold)' }}>
+                    DEPRECATED
+                  </span>
+                )}
+                {param.default && (
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
+                    default: {param.default}
+                  </span>
+                )}
+              </div>
+              {param.options && (
+                <div style={{ marginBottom: '4px' }}>
+                  <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
+                    Options: {param.options.map((opt, idx) => (
+                      <code key={idx} style={{
+                        backgroundColor: 'white',
+                        padding: '2px 4px',
+                        margin: '0 2px',
+                        borderRadius: '2px',
+                        fontSize: 'var(--text-xs)'
+                      }}>
+                        {opt}
+                      </code>
+                    ))}
+                  </span>
+                </div>
+              )}
+              {param.description && (
+                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>
+                  {param.description}
+                </div>
+              )}
+            </div>
           ))}
         </div>
       </div>
+
+      {/* 동작 매트릭스 (있는 경우) */}
+      {endpoint.behaviorMatrix && (
+        <div style={{ marginBottom: 'var(--space-4)' }}>
+          <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: 'var(--ink)', marginBottom: '8px' }}>
+            🎯 Parameter Behavior Matrix
+          </div>
+          <div style={{
+            overflowX: 'auto',
+            backgroundColor: 'var(--bg-primary)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--rounded)'
+          }}>
+            <table style={{
+              width: '100%',
+              fontSize: 'var(--text-xs)',
+              borderCollapse: 'collapse'
+            }}>
+              <thead>
+                <tr style={{ backgroundColor: '#f3f4f6' }}>
+                  <th style={{ padding: '8px', textAlign: 'left', borderBottom: '2px solid var(--border)', fontWeight: 'var(--font-semibold)' }}>
+                    metrics
+                  </th>
+                  <th style={{ padding: '8px', textAlign: 'left', borderBottom: '2px solid var(--border)', fontWeight: 'var(--font-semibold)' }}>
+                    overwrite
+                  </th>
+                  <th style={{ padding: '8px', textAlign: 'left', borderBottom: '2px solid var(--border)', fontWeight: 'var(--font-semibold)' }}>
+                    동작
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {endpoint.behaviorMatrix.map((row, idx) => (
+                  <tr key={idx} style={{ backgroundColor: idx % 2 === 0 ? 'white' : '#f9fafb' }}>
+                    <td style={{ padding: '8px', borderBottom: '1px solid #e5e7eb', fontFamily: 'monospace' }}>
+                      {row.metrics}
+                    </td>
+                    <td style={{ padding: '8px', borderBottom: '1px solid #e5e7eb', fontFamily: 'monospace' }}>
+                      {row.overwrite}
+                    </td>
+                    <td style={{ padding: '8px', borderBottom: '1px solid #e5e7eb' }}>
+                      {row.behavior}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* 사용 예시 (있는 경우) */}
+      {endpoint.usageExamples && (
+        <div style={{ marginBottom: 'var(--space-4)' }}>
+          <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: 'var(--ink)', marginBottom: '8px' }}>
+            💡 Usage Examples
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            {endpoint.usageExamples.map((example, idx) => (
+              <div
+                key={idx}
+                style={{
+                  padding: 'var(--space-2)',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  borderRadius: 'var(--rounded)',
+                }}
+              >
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: '#1e40af', marginBottom: '4px' }}>
+                  {idx + 1}. {example.title}
+                </div>
+                <code style={{
+                  display: 'block',
+                  padding: '6px 8px',
+                  backgroundColor: 'white',
+                  borderRadius: 'var(--rounded)',
+                  fontSize: 'var(--text-xs)',
+                  fontFamily: 'monospace',
+                  color: '#1e3a8a',
+                  marginBottom: '4px',
+                  overflowX: 'auto',
+                  whiteSpace: 'nowrap'
+                }}>
+                  {example.url}
+                </code>
+                <div style={{ fontSize: 'var(--text-xs)', color: '#1e40af' }}>
+                  → {example.description}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* 모드 선택 (있는 경우) */}
       {endpoint.modes && (

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..database.connection import db_pool
 from ..config import settings
+from ..utils.logging_utils import log_error, log_warning
 
 logger = logging.getLogger("alsign")
 
@@ -123,7 +124,7 @@ async def get_api_services():
             return services
 
     except Exception as e:
-        logger.error(f"action=get_api_services status=error error={str(e)}")
+        log_error(logger, "Failed to fetch API services", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch API services: {str(e)}"
         )
@@ -186,7 +187,7 @@ async def update_api_service(service: str, update: APIServiceUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"action=update_api_service status=error error={str(e)}")
+        log_error(logger, "Failed to update API service", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to update API service: {str(e)}"
         )
@@ -210,7 +211,7 @@ async def get_runtime_info():
         return runtime
 
     except Exception as e:
-        logger.error(f"action=get_runtime_info status=error error={str(e)}")
+        log_error(logger, "Failed to fetch runtime info", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch runtime info: {str(e)}"
         )
@@ -263,7 +264,7 @@ async def get_api_list():
             return items
 
     except Exception as e:
-        logger.error(f"action=get_api_list status=error error={str(e)}")
+        log_error(logger, "Failed to fetch API list", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch API list: {str(e)}"
         )
@@ -351,7 +352,7 @@ async def update_api_list_item(api_id: str, update: APIListUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"action=update_api_list status=error error={str(e)}")
+        log_error(logger, "Failed to update API list", exception=e)
         raise HTTPException(status_code=500, detail=f"Failed to update API: {str(e)}")
 
 
@@ -420,9 +421,9 @@ async def test_api_endpoint(api_id: str, test_params: Optional[Dict[str, Any]] =
         except Exception as api_error:
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(api_error)
-            
-            logger.warning(f"action=test_api status=api_error id={api_id} error={error_msg}")
-            
+
+            log_warning(logger, f"API test failed for {api_id}: {error_msg}")
+
             return APITestResult(
                 success=False,
                 error=error_msg,
@@ -432,7 +433,7 @@ async def test_api_endpoint(api_id: str, test_params: Optional[Dict[str, Any]] =
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"action=test_api status=error id={api_id} error={str(e)}")
+        log_error(logger, f"Failed to test API {api_id}", exception=e)
         raise HTTPException(status_code=500, detail=f"Failed to test API: {str(e)}")
 
 
@@ -497,7 +498,7 @@ async def get_metrics():
             return items
 
     except Exception as e:
-        logger.error(f"action=get_metrics status=error error={str(e)}")
+        log_error(logger, "Failed to fetch metrics", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch metrics: {str(e)}"
         )
@@ -595,9 +596,10 @@ async def update_metric_api_list_id(metric_id: str, update: MetricApiUpdate):
             }
             
             if missing_keys:
-                logger.warning(
-                    f"action=update_metric_api status=validation_failed "
-                    f"metric={metric_id} api={update.api_list_id} missing_keys={missing_keys}"
+                log_warning(
+                    logger,
+                    f"Metric API validation failed: missing required keys {missing_keys}",
+                    metric_id=metric_id
                 )
                 return MetricApiUpdateResult(
                     success=False,
@@ -632,12 +634,12 @@ async def update_metric_api_list_id(metric_id: str, update: MetricApiUpdate):
         except Exception as api_error:
             elapsed_ms = int((time.time() - start_time) * 1000)
             error_msg = str(api_error)
-            
-            logger.warning(
-                f"action=update_metric_api status=api_error "
-                f"metric={metric_id} api={update.api_list_id} error={error_msg}"
+
+            log_warning(
+                logger,
+                f"API test failed for metric {metric_id}: {error_msg}"
             )
-            
+
             return MetricApiUpdateResult(
                 success=False,
                 metric_id=metric_id,
@@ -654,7 +656,7 @@ async def update_metric_api_list_id(metric_id: str, update: MetricApiUpdate):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"action=update_metric_api status=error error={str(e)}")
+        log_error(logger, "Failed to update metric API", exception=e)
         raise HTTPException(status_code=500, detail=f"Failed to update metric: {str(e)}")
 
 
@@ -759,7 +761,7 @@ async def get_endpoint_api_config():
         }
     
     except Exception as e:
-        logger.error(f"action=get_endpoint_api_config status=error error={str(e)}")
+        log_error(logger, "Failed to get endpoint API config", exception=e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -825,7 +827,7 @@ async def get_metric_transforms():
             return items
 
     except Exception as e:
-        logger.error(f"action=get_metric_transforms status=error error={str(e)}")
+        log_error(logger, "Failed to fetch metric transforms", exception=e)
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch metric transforms: {str(e)}"
         )

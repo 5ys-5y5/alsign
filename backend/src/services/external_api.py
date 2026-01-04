@@ -8,6 +8,7 @@ from ..config import settings
 from .utils.batch_utils import RateLimiter
 from ..database.connection import db_pool
 from ..database.queries import api_config
+from ..utils.logging_utils import log_error, log_warning
 
 logger = logging.getLogger("alsign")
 
@@ -66,10 +67,11 @@ class FMPAPIClient:
         Apply schema mapping to API response data.
 
         Converts API field names to internal standard field names.
+        Supports both simple string mappings and complex nested object/array mappings.
 
         Args:
             data: API response (dict or list of dicts)
-            schema: Schema mapping (internal_name: api_field_name)
+            schema: Schema mapping (internal_name: api_field_name or nested schema)
 
         Returns:
             Mapped data with standardized field names
@@ -82,15 +84,62 @@ class FMPAPIClient:
         if isinstance(schema, str):
             schema = json.loads(schema)
 
-        # Reverse mapping: api_field_name -> internal_name
-        reverse_schema = {v: k for k, v in schema.items()}
+        # Build reverse mapping for simple fields only
+        reverse_schema = {}
+        nested_schemas = {}
+
+        for internal_name, mapping_value in schema.items():
+            if isinstance(mapping_value, dict):
+                # This is a nested schema (for arrays/objects)
+                api_field = mapping_value.get('value')
+                if api_field:
+                    nested_schemas[api_field] = {
+                        'internal_name': internal_name,
+                        'type': mapping_value.get('type'),
+                        'items': mapping_value.get('items', {})
+                    }
+            elif isinstance(mapping_value, str):
+                # Simple string mapping
+                reverse_schema[mapping_value] = internal_name
+
+        def map_array_items(items: List[Any], item_schema: Dict[str, Any]) -> List[Any]:
+            """Map items in an array using the item schema."""
+            mapped_items = []
+            for item in items:
+                if isinstance(item, dict):
+                    mapped_item = {}
+                    for field_name, field_spec in item_schema.items():
+                        if isinstance(field_spec, dict):
+                            api_field_name = field_spec.get('value')
+                            if api_field_name and api_field_name in item:
+                                mapped_item[field_name] = item[api_field_name]
+                    mapped_items.append(mapped_item)
+                else:
+                    # Item is not a dict, keep as-is
+                    mapped_items.append(item)
+            return mapped_items
 
         def map_item(item: Dict[str, Any]) -> Dict[str, Any]:
             """Map a single item."""
             mapped = {}
+
             for api_field, value in item.items():
-                internal_field = reverse_schema.get(api_field, api_field)
-                mapped[internal_field] = value
+                # Check if this is a nested field
+                if api_field in nested_schemas:
+                    nested_info = nested_schemas[api_field]
+                    internal_name = nested_info['internal_name']
+
+                    if nested_info['type'] == 'array' and isinstance(value, list):
+                        # Map array items
+                        mapped[internal_name] = map_array_items(value, nested_info['items'])
+                    else:
+                        # Keep as-is for other nested types
+                        mapped[internal_name] = value
+                else:
+                    # Simple field mapping
+                    internal_field = reverse_schema.get(api_field, api_field)
+                    mapped[internal_field] = value
+
             return mapped
 
         if isinstance(data, list):
@@ -129,7 +178,8 @@ class FMPAPIClient:
     async def call_api(
         self,
         api_id: str,
-        variables: Optional[Dict[str, Any]] = None
+        variables: Optional[Dict[str, Any]] = None,
+        event_id: Optional[str] = None
     ) -> Any:
         """
         Call API using DB configuration.
@@ -137,6 +187,7 @@ class FMPAPIClient:
         Args:
             api_id: API identifier in config_lv1_api_list (e.g., 'fmp-company-screener')
             variables: Variables for URL template substitution (e.g., {'ticker': 'AAPL', 'fromDate': '2024-01-01'})
+            event_id: Optional txn_events.id for tracing (e.g., '86f110f9-43a9-4a32-8600-c95daff9565d')
 
         Returns:
             API response with schema mapping applied
@@ -162,7 +213,10 @@ class FMPAPIClient:
         # Substitute URL template
         url = self._substitute_url_template(config['api'], substitution_vars)
 
-        logger.info(f"[API Call] {api_id} -> {url}")
+        # Build row context for tracing
+        row_context = f"[table: txn_events | id: {event_id}]" if event_id else "[no event context]"
+
+        logger.info(f"{row_context} | [API Call] {api_id} -> {url}")
 
         # Wait for rate limiter
         await self.rate_limiter.acquire()
@@ -171,9 +225,9 @@ class FMPAPIClient:
         try:
             response = await self.client.get(url)
             response.raise_for_status()
-            logger.info(f"[API Response] {api_id} -> HTTP {response.status_code}")
+            logger.info(f"{row_context} | [API Response] {api_id} -> HTTP {response.status_code}")
         except Exception as e:
-            logger.error(f"[API Error] {api_id} -> {type(e).__name__}: {str(e)}")
+            log_error(logger, f"{row_context} | API call failed: {api_id}", exception=e)
             raise
 
         # Parse response
@@ -181,9 +235,9 @@ class FMPAPIClient:
             data = response.json()
             data_type = type(data).__name__
             data_len = len(data) if isinstance(data, (list, dict)) else 0
-            logger.info(f"[API Parse] {api_id} -> Type: {data_type}, Length: {data_len}")
+            logger.info(f"{row_context} | [API Parse] {api_id} -> Type: {data_type}, Length: {data_len}")
         except Exception as e:
-            logger.error(f"[API Parse Error] {api_id} -> {type(e).__name__}: {str(e)}")
+            log_error(logger, f"{row_context} | API parse failed: {api_id}", exception=e)
             raise
 
         # Apply schema mapping
@@ -192,10 +246,9 @@ class FMPAPIClient:
             try:
                 data = self._apply_schema_mapping(data, schema)
                 mapped_len = len(data) if isinstance(data, (list, dict)) else 0
-                logger.info(f"[Schema Mapping] {api_id} -> Mapped {mapped_len} items")
+                logger.info(f"{row_context} | [Schema Mapping] {api_id} -> Mapped {mapped_len} items")
             except Exception as e:
-                logger.error(f"[Schema Mapping Error] {api_id} -> {type(e).__name__}: {str(e)}")
-                logger.error(f"[Schema Mapping Error] Schema type: {type(schema)}, Schema: {str(schema)[:200]}")
+                log_error(logger, f"Schema mapping failed: {api_id} (schema type: {type(schema).__name__})", exception=e)
                 raise
 
         return data

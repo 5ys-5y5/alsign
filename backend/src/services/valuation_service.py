@@ -12,9 +12,13 @@ from ..database.connection import db_pool
 from ..database.queries import metrics, policies, targets, consensus
 from .external_api import FMPAPIClient
 from .utils.datetime_utils import calculate_dayOffset_dates, calculate_dayOffset_dates_cached, get_trading_days_in_range
-from .utils.response_formatter import format_value_quantitative, format_value_qualitative
+# I-42: Removed formatter imports - formatting should only be done in API responses, not database storage
+# from .utils.response_formatter import format_value_quantitative, format_value_qualitative
 from ..models.response_models import EventProcessingResult
 from .metric_engine import MetricCalculationEngine
+from ..utils.logging_utils import (
+    log_error, log_warning, log_event_update, log_batch_start, log_batch_complete, log_db_update
+)
 
 logger = logging.getLogger("alsign")
 
@@ -45,7 +49,8 @@ async def process_ticker_batch(
     overwrite: bool = False,
     total_events_count: int = 0,
     completed_events_count: Dict[str, int] = None,
-    calc_fair_value: bool = False
+    calc_fair_value: bool = False,
+    metrics_list: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Process all events for a single ticker (with REAL API caching).
@@ -72,11 +77,7 @@ async def process_ticker_batch(
     qual_success = 0
     qual_fail = 0
     
-    logger.info(
-        f"\n{'*'*90}\n"
-        f"[START TICKER] {ticker} | {len(ticker_events)} events to process\n"
-        f"{'*'*90}"
-    )
+    log_batch_start(logger, ticker, len(ticker_events))
     
     # ========================================
     # CRITICAL: Fetch API data ONCE for ticker
@@ -87,18 +88,22 @@ async def process_ticker_batch(
         engine = MetricCalculationEngine(metrics_by_domain, transforms)
         required_apis = engine.get_required_apis()
         
-        logger.info(f"[Ticker Batch] {ticker}: Fetching {len(required_apis)} APIs (ONCE)")
-        
+        # Use special event_id format for ticker-level API calls
+        ticker_context_id = f"ticker-cache:{ticker}"
+
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL API CACHING START ==========")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | Fetching {len(required_apis)} APIs for {ticker} (ONCE for all {len(ticker_events)} events)")
+
         # Fetch all API data once
         ticker_api_cache = {}
         consensus_summary_cache = None
-        
+
         async with FMPAPIClient() as fmp_client:
             # Fetch quantitative APIs
             for api_id in required_apis:
                 try:
                     params = {'ticker': ticker}
-                    
+
                     if 'historical-price' in api_id or 'eod' in api_id or 'historical-market-cap' in api_id:
                         # Wide date range to cover all events
                         # I-25: fmp-historical-market-capitalization도 from/to 파라미터 필요
@@ -107,17 +112,17 @@ async def process_ticker_batch(
                     else:
                         params['period'] = 'quarter'
                         params['limit'] = 100
-                    
-                    result = await fmp_client.call_api(api_id, params)
+
+                    result = await fmp_client.call_api(api_id, params, event_id=ticker_context_id)
                     ticker_api_cache[api_id] = result
                     logger.debug(f"[Ticker Batch] {ticker}: Cached {api_id} ({len(result) if isinstance(result, list) else 'single'} records)")
                 except Exception as e:
-                    logger.warning(f"[Ticker Batch] {ticker}: Failed to fetch {api_id}: {e}")
+                    log_warning(logger, f"Failed to fetch API {api_id}", ticker=ticker)
                     ticker_api_cache[api_id] = []
-            
+
             # Fetch qualitative API (consensus) ONCE for ticker
             try:
-                consensus_data = await fmp_client.call_api('fmp-price-target-consensus', {'ticker': ticker})
+                consensus_data = await fmp_client.call_api('fmp-price-target-consensus', {'ticker': ticker}, event_id=ticker_context_id)
                 if consensus_data:
                     if isinstance(consensus_data, list) and len(consensus_data) > 0:
                         consensus_summary_cache = consensus_data[0]
@@ -126,8 +131,9 @@ async def process_ticker_batch(
                 logger.debug(f"[Ticker Batch] {ticker}: Consensus summary cached")
             except Exception as e:
                 logger.warning(f"[Ticker Batch] {ticker}: Consensus fetch skipped: {e}")
-        
-        logger.info(f"[Ticker Batch] {ticker}: API cache ready ({len(ticker_api_cache) + 1} APIs)")
+
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | API cache ready: {len(ticker_api_cache) + 1} APIs cached")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL API CACHING END ==========")
         
         # OPTIMIZATION: Load transforms and engine ONCE per ticker (not per event!)
         transforms = await metrics.select_metric_transforms(pool)
@@ -135,9 +141,44 @@ async def process_ticker_batch(
         target_domains = ['valuation', 'profitability', 'momentum', 'risk', 'dilution']
         
         logger.info(f"[Ticker Batch] {ticker}: MetricEngine initialized (60 metrics)")
-        
+
+        # ========================================
+        # CRITICAL: Fetch peer data ONCE for ticker (PERFORMANCE FIX)
+        # ========================================
+        # IMPORTANT: Always calculate priceQuantitative for ALL events (source-agnostic)
+        # per user requirement: "quantitative columns must be filled regardless of source value"
+        peer_tickers = []
+        sector_averages = {}
+        peer_count = 0
+
+        try:
+            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER TICKER DATA CACHING START ==========")
+
+            # Get peer tickers ONCE for this ticker (ALWAYS, not just for consensus events)
+            peer_tickers = await get_peer_tickers(ticker, event_id=ticker_context_id)
+            peer_count = len(peer_tickers)
+
+            if peer_tickers and ticker_events:
+                logger.info(f"[table: txn_events | id: {ticker_context_id}] | Found {peer_count} peer tickers: {peer_tickers}")
+
+                # Use first event's date as reference for sector averages
+                reference_date = ticker_events[0]['event_date']
+                sector_averages = await calculate_sector_average_metrics(
+                    pool, peer_tickers, reference_date, metrics_by_domain, event_id=ticker_context_id
+                )
+                logger.info(
+                    f"[table: txn_events | id: {ticker_context_id}] | Peer data cached: "
+                    f"{peer_count} peers, sector averages={list(sector_averages.keys())}"
+                )
+                logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER TICKER DATA CACHING END ==========")
+            else:
+                logger.warning(f"[PERF] {ticker}: No peer tickers found, priceQuantitative will be NULL")
+        except Exception as e:
+            logger.warning(f"[PERF] {ticker}: Failed to fetch peer data: {e}")
+            sector_averages = {}
+
     except Exception as e:
-        logger.error(f"[Ticker Batch] {ticker}: Failed to build API cache: {e}")
+        log_error(logger, f"Failed to build API cache for {ticker}", exception=e, ticker=ticker)
         # Return early with all events failed
         for event in ticker_events:
             results.append(EventProcessingResult(
@@ -169,72 +210,208 @@ async def process_ticker_batch(
     batch_start_time = time.time()
     last_checkpoint_time = batch_start_time
     last_checkpoint_idx = 0
-    
+
+    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | ========== EVENT PROCESSING START ==========")
+    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | Processing {total_events} events using CACHED API data (no new API calls)")
+
     for idx, event in enumerate(ticker_events, 1):
+        event_id = event.get('id')
         event_date = event['event_date']
         source = event['source']
         source_id = event['source_id']
-        
+
+        # Row ID logging for user visibility - use txn_events.id
+        event_id_str = str(event_id) if event_id else "unknown"
+        row_context = f"[table: txn_events | id: {event_id_str}]"
+
+        logger.info(f"{row_context} | ---------- Event {idx}/{total_events} | source={source} ----------")
+
         try:
-            # Calculate quantitative metrics using CACHED API data + pre-initialized engine
+            # I-41: Prepare custom_values for priceQuantitative metric
+            custom_values = {}
+
+            # ALWAYS calculate priceQuantitative for ALL events (source-agnostic)
+            # per user requirement: "quantitative columns must be filled regardless of source value"
+            # IMPORTANT: Store current_price for later use in position/disparity calculation
+            current_price_for_position = None
+
+            if sector_averages:
+                # First, calculate basic quantitative metrics (PER, PBR, etc.) to get current values
+                temp_quant_result = await calculate_quantitative_metrics_fast(
+                    ticker, event_date, ticker_api_cache, engine, target_domains
+                )
+
+                # Get current price for priceQuantitative calculation
+                # For consensus events: get from qualitative metrics (recent data)
+                # For earning events: get historical price at event_date
+                current_price = None
+                if source == 'consensus':
+                    temp_qual_result = await calculate_qualitative_metrics_fast(
+                        pool, ticker, event_date, source, source_id, consensus_summary_cache
+                    )
+                    current_price = temp_qual_result.get('currentPrice')
+                else:
+                    # For earning events: get historical price at event_date
+                    # Use fmp-historical-price-eod-full API cache
+                    if 'fmp-historical-price-eod-full' in ticker_api_cache:
+                        historical_prices = ticker_api_cache['fmp-historical-price-eod-full']
+                        if isinstance(historical_prices, list):
+                            # Convert event_date to date object for comparison
+                            if isinstance(event_date, str):
+                                target_date = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+                            elif hasattr(event_date, 'date'):
+                                target_date = event_date.date()
+                            else:
+                                target_date = event_date
+
+                            # Find the closest price on or before event_date
+                            for price_record in historical_prices:
+                                record_date_str = price_record.get('date')
+                                if record_date_str:
+                                    try:
+                                        record_date = datetime.fromisoformat(record_date_str.replace('Z', '+00:00')).date()
+                                        if record_date == target_date:
+                                            current_price = price_record.get('close')
+                                            break
+                                    except:
+                                        continue
+
+                # CRITICAL: Save current_price for position/disparity calculation later
+                current_price_for_position = current_price
+
+                # DEBUG: Log price retrieval
+                if idx <= 2:
+                    logger.info(f"{row_context} | DEBUG | current_price={current_price}, has_temp_value={temp_quant_result.get('value') is not None}, sector_avg_keys={list(sector_averages.keys())}")
+
+                if current_price and temp_quant_result.get('value'):
+                    # PERFORMANCE FIX: Use CACHED sector_averages (NO API CALLS!)
+                    # Instead of calling calculate_price_quantitative_metric which fetches peer data every time,
+                    # we use the sector_averages that were cached once at ticker level
+                    fair_value = calculate_fair_value_from_sector(
+                        temp_quant_result.get('value'),
+                        sector_averages,  # CACHED at ticker level - NO API calls!
+                        current_price
+                    )
+
+                    if fair_value is not None:
+                        custom_values['priceQuantitative'] = fair_value
+                        if idx <= 2:
+                            logger.info(f"{row_context} | DEBUG | priceQuantitative={fair_value:.2f} (CACHED sector_avg)")
+                    else:
+                        if idx <= 2:
+                            logger.warning(f"{row_context} | DEBUG | priceQuantitative=NULL (calculation failed)")
+                else:
+                    if idx <= 2:
+                        logger.warning(f"{row_context} | DEBUG | Skipped priceQuantitative: current_price={current_price}, has_value={temp_quant_result.get('value') is not None}")
+
+            # Calculate quantitative metrics using CACHED API data + custom values
             quant_result = await calculate_quantitative_metrics_fast(
-                ticker, event_date, ticker_api_cache, engine, target_domains
+                ticker, event_date, ticker_api_cache, engine, target_domains,
+                custom_values=custom_values  # I-41: Pass custom metrics
             )
-            
+
             # Calculate qualitative metrics using CACHED consensus data
             qual_result = await calculate_qualitative_metrics_fast(
                 pool, ticker, event_date, source, source_id, consensus_summary_cache
             )
-            
+
             # Calculate positions and disparities
-            # I-36: If calc_fair_value is True, calculate sector-average-based fair value
-            if calc_fair_value:
-                fair_value_result = await calculate_fair_value_for_ticker(
-                    pool, ticker, event_date, 
-                    quant_result.get('value'),
-                    qual_result.get('currentPrice'),
-                    metrics_by_domain
-                )
-                position_quant = fair_value_result.get('position')
-                disparity_quant = fair_value_result.get('disparity')
-                
-                # Add fair value info to quantitative result
-                if quant_result.get('value') and fair_value_result.get('fair_value'):
-                    if 'valuation' not in quant_result['value']:
-                        quant_result['value']['valuation'] = {}
-                    quant_result['value']['valuation']['_fairValue'] = {
-                        'value': fair_value_result.get('fair_value'),
-                        'sectorAverages': fair_value_result.get('sector_averages'),
-                        'peerCount': fair_value_result.get('peer_count')
-                    }
+            # I-41: Use priceQuantitative from value_quantitative if available
+            value_quant = quant_result.get('value', {})
+
+            # CRITICAL: Use current_price from qualitative OR historical price for earning events
+            current_price = qual_result.get('currentPrice')
+            if not current_price and current_price_for_position:
+                # For earning events: use historical price that was retrieved earlier
+                current_price = current_price_for_position
+
+            # Extract priceQuantitative from valuation domain
+            price_quant_value = None
+            if value_quant and 'valuation' in value_quant:
+                price_quant_value = value_quant['valuation'].get('priceQuantitative')
+
+            # DEBUG: Log position/disparity calculation
+            if idx <= 2:
+                logger.info(f"{row_context} | DEBUG | Position calc: price_quant={price_quant_value}, current_price={current_price} (from_qual={qual_result.get('currentPrice') is not None}, from_hist={current_price_for_position is not None})")
+
+            if price_quant_value is not None and current_price:
+                # I-41: Calculate position/disparity using priceQuantitative
+                if price_quant_value > current_price:
+                    position_quant = 'long'
+                elif price_quant_value < current_price:
+                    position_quant = 'short'
+                else:
+                    position_quant = 'neutral'
+
+                disparity_quant = round((price_quant_value / current_price) - 1, 4) if current_price != 0 else None
+
+                if idx <= 2:
+                    logger.info(f"{row_context} | DEBUG | Calculated position={position_quant}, disparity={disparity_quant}")
             else:
-                # Default: Quantitative position/disparity is always None (no target price)
+                # Fallback: No priceQuantitative available
                 position_quant, disparity_quant = calculate_position_disparity(
                     quant_result.get('value'),
                     qual_result.get('currentPrice')
                 )
+                if idx <= 2:
+                    logger.warning(f"{row_context} | DEBUG | Fallback position={position_quant}, disparity={disparity_quant}")
             
             position_qual, disparity_qual = calculate_position_disparity(
                 qual_result.get('value'),
                 qual_result.get('currentPrice')
             )
-            
-            # Format values for better readability before storing
-            formatted_quant = format_value_quantitative(quant_result.get('value'))
-            formatted_qual = format_value_qualitative(qual_result.get('value'))
-            
+
+            # I-42: DON'T format values for database storage
+            # The formatter creates nested structure (values/dateInfo) which breaks database queries
+            # Formatting should only be done for API responses, not database storage
+            #
+            # OLD CODE (BROKEN):
+            # formatted_quant = format_value_quantitative(quant_result.get('value'))
+            # formatted_qual = format_value_qualitative(qual_result.get('value'))
+            #
+            # NEW CODE: Store raw values directly
+            value_quant = quant_result.get('value')
+            value_qual = qual_result.get('value')
+
+            # I-42 DEBUG: Log what we're about to store
+            if value_quant and 'valuation' in value_quant:
+                val_keys = list(value_quant['valuation'].keys())[:5]
+                logger.info(f"[I-42 DEBUG] value_quant valuation keys: {val_keys}")
+                if 'priceQuantitative' in value_quant['valuation']:
+                    logger.info(f"[I-42 DEBUG] priceQuantitative value: {value_quant['valuation']['priceQuantitative']}")
+
+            # Extract priceQuantitative for dedicated column
+            price_quant_col = None
+            if value_quant and 'valuation' in value_quant:
+                price_quant_col = value_quant['valuation'].get('priceQuantitative')
+
+            # Build peer_quantitative JSONB (if priceQuantitative exists)
+            peer_quant_col = None
+            if price_quant_col is not None and sector_averages:
+                peer_quant_col = {
+                    'peerCount': peer_count,
+                    'sectorAverages': sector_averages
+                }
+
+            # DEBUG: Log column values for first few events
+            if idx <= 3:
+                logger.info(f"{row_context} | DEBUG | price_quantitative={price_quant_col}, peer_quantitative={'set' if peer_quant_col else 'NULL'}")
+
             # Prepare batch update
             batch_updates.append({
                 'ticker': ticker,
                 'event_date': event_date,
                 'source': source,
                 'source_id': source_id,
-                'value_quantitative': formatted_quant,
-                'value_qualitative': formatted_qual,
+                'value_quantitative': value_quant,
+                'value_qualitative': value_qual,
                 'position_quantitative': position_quant,
                 'position_qualitative': position_qual,
                 'disparity_quantitative': disparity_quant,
-                'disparity_qualitative': disparity_qual
+                'disparity_qualitative': disparity_qual,
+                # NEW: Dedicated columns for performance (I-42)
+                'price_quantitative': price_quant_col,
+                'peer_quantitative': peer_quant_col
             })
             
             # Track success/fail
@@ -279,7 +456,10 @@ async def process_ticker_batch(
                 position=position_dict if position_dict else None,
                 disparity=disparity_dict if disparity_dict else None
             ))
-            
+
+            # Log each event completion
+            logger.info(f"{row_context} | Event {idx}/{total_events} completed | quant={'OK' if quant_result['status']=='success' else 'FAIL'}, qual={'OK' if qual_result['status']=='success' else 'FAIL'}")
+
             # Log event progress every 10 events (reduce I/O overhead)
             if idx % 10 == 0 or idx == total_events:
                 event_pct = (idx / total_events) * 100
@@ -333,8 +513,8 @@ async def process_ticker_batch(
                 )
             
         except Exception as e:
-            logger.error(f"[Ticker Batch] Failed to process {ticker} {event_date}: {e}")
-            
+            log_error(logger, f"{row_context} | Event processing failed", exception=e, ticker=ticker)
+
             quant_fail += 1
             qual_fail += 1
             
@@ -398,28 +578,28 @@ async def process_ticker_batch(
                     f"ETA: {eta_str}\n"
                     f"{'#'*80}"
                 )
-    
+
+    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | ========== EVENT PROCESSING END ==========")
+    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | Processed {total_events} events | quant_success={quant_success}, qual_success={qual_success}")
+
     # Batch update DB
     try:
         if batch_updates:
+            # I-41: Pass selective metric update parameters
             updated_count = await metrics.batch_update_event_valuations(
-                pool, batch_updates, overwrite=overwrite
+                pool, batch_updates, overwrite=overwrite,
+                metrics=metrics_list
             )
-            logger.info(f"[Ticker Batch] {ticker}: Updated {updated_count} events in DB")
+            log_db_update(logger, "txn_events", updated_count, len(batch_updates))
     except Exception as e:
-        logger.error(f"[Ticker Batch] {ticker}: DB batch update failed: {e}")
+        log_error(logger, f"DB batch update failed for {ticker}", exception=e, ticker=ticker)
     
     # Update global completed events count
     if completed_events_count is not None:
         completed_events_count['count'] = completed_events_count.get('count', 0) + len(ticker_events)
     
     # Log ticker completion
-    logger.info(
-        f"\n{'*'*90}\n"
-        f"[COMPLETE TICKER] {ticker} | {len(ticker_events)} events processed\n"
-        f"[COMPLETE TICKER] Quant: {quant_success}✓/{quant_fail}✗ | Qual: {qual_success}✓/{qual_fail}✗\n"
-        f"{'*'*90}\n"
-    )
+    log_batch_complete(logger, ticker, len(ticker_events), quant_success + qual_success, quant_fail + qual_fail)
     
     return {
         'ticker': ticker,
@@ -439,8 +619,7 @@ async def calculate_valuations(
     tickers: Optional[List[str]] = None,
     cancel_event: Optional[asyncio.Event] = None,
     calc_fair_value: bool = True,
-    metrics: Optional[List[str]] = None,
-    overwrite_metrics: bool = False
+    metrics_list: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Calculate quantitative and qualitative valuations for all events in txn_events.
@@ -453,24 +632,25 @@ async def calculate_valuations(
         - disparity_quantitative, disparity_qualitative (price deviation)
 
     Args:
-        overwrite: If False, partial update (NULL only). If True, full replace.
+        overwrite: If False, update only NULL values. If True, overwrite existing values.
+                   When used with metrics_list: applies to specified metrics only.
+                   When used without metrics_list: applies to all value_* JSONB fields.
         from_date: Optional start date for filtering events by event_date.
         to_date: Optional end date for filtering events by event_date.
         tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
         cancel_event: Optional asyncio.Event for cancellation.
         calc_fair_value: [DEPRECATED - I-41] If True, calculate sector-average-based fair value (I-36).
-        metrics: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
-        overwrite_metrics: If True, overwrite all specified metrics. If False, only update NULL values (I-41).
+        metrics_list: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
 
     Returns:
         Dict with summary and per-event results
 
     Example:
         # Update only priceQuantitative metric for NULL values
-        >>> await calculate_valuations(metrics=['priceQuantitative'], overwrite_metrics=False)
+        >>> await calculate_valuations(metrics_list=['priceQuantitative'], overwrite=False)
 
         # Recalculate PER and PBR for all events (overwrite existing values)
-        >>> await calculate_valuations(metrics=['PER', 'PBR'], overwrite_metrics=True)
+        >>> await calculate_valuations(metrics_list=['PER', 'PBR'], overwrite=True)
     """
     start_time = time.time()
     
@@ -648,7 +828,8 @@ async def calculate_valuations(
         async with semaphore:
             result = await process_ticker_batch(
                 pool, ticker, ticker_events, metrics_by_domain, overwrite,
-                total_events_count, completed_events_count, calc_fair_value
+                total_events_count, completed_events_count, calc_fair_value,
+                metrics_list  # I-41: Pass selective update parameters
             )
             
             # Update progress
@@ -869,7 +1050,8 @@ async def calculate_quantitative_metrics_fast(
     event_date,
     api_cache: Dict[str, List[Dict[str, Any]]],
     engine: MetricCalculationEngine,
-    target_domains: List[str]
+    target_domains: List[str],
+    custom_values: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     ULTRA-FAST quantitative metrics calculation.
@@ -908,7 +1090,8 @@ async def calculate_quantitative_metrics_fast(
                 api_data_filtered[api_id] = records
         
         # Calculate metrics using PRE-INITIALIZED engine
-        result = engine.calculate_all(api_data_filtered, target_domains)
+        # I-41: Pass custom_values for priceQuantitative metric
+        result = engine.calculate_all(api_data_filtered, target_domains, custom_values)
         
         return {
             'status': 'success',
@@ -1882,46 +2065,43 @@ async def generate_price_trends(
 # I-36: 업종 평균 기반 적정가(Fair Value) 계산 함수들
 # =============================================================================
 
-async def get_peer_tickers(ticker: str) -> List[str]:
+async def get_peer_tickers(ticker: str, event_id: Optional[str] = None) -> List[str]:
     """
     fmp-stock-peers API를 사용하여 동종 업종 티커 목록을 조회합니다.
-    
+
     주의: fmp-stock-peers API는 현재 날짜 기준 데이터만 반환하므로,
     symbol(ticker) 값만 사용하고 다른 값(price, mktCap 등)은 사용하지 않습니다. (I-36)
-    
+
     Args:
         ticker: 기준 티커
-    
+        event_id: Optional event context for API call logging
+
     Returns:
         동종 업종 티커 목록 (기준 티커 제외)
     """
     try:
         async with FMPAPIClient() as fmp_client:
-            response = await fmp_client.call_api('fmp-stock-peers', {'ticker': ticker})
-            
+            response = await fmp_client.call_api('fmp-stock-peers', {'ticker': ticker}, event_id=event_id)
+
             if not response or len(response) == 0:
                 logger.warning(f"[I-36] No peer tickers found for {ticker}")
                 return []
-            
-            # I-36: symbol(ticker) 값만 추출, 다른 값은 event_date와 무관하므로 사용하지 않음
+
+            # I-36: FMP API returns flat list of peer ticker objects
+            # After schema mapping: 'symbol' -> 'ticker'
             peer_tickers = []
             for item in response:
-                peer_list = item.get('peerTickers', [])
-                if isinstance(peer_list, list):
-                    for peer in peer_list:
-                        if isinstance(peer, dict) and 'symbol' in peer:
-                            peer_ticker = peer['symbol']
-                            if peer_ticker != ticker:  # 기준 티커 제외
-                                peer_tickers.append(peer_ticker)
-                        elif isinstance(peer, str):
-                            if peer != ticker:
-                                peer_tickers.append(peer)
-            
-            logger.debug(f"[I-36] Found {len(peer_tickers)} peer tickers for {ticker}: {peer_tickers[:5]}...")
+                if isinstance(item, dict):
+                    # Get ticker from mapped field name
+                    peer_ticker = item.get('ticker') or item.get('symbol')
+                    if peer_ticker and peer_ticker != ticker:  # Exclude base ticker
+                        peer_tickers.append(peer_ticker)
+
+            logger.info(f"[I-36] Found {len(peer_tickers)} peer tickers for {ticker}: {peer_tickers[:5]}...")
             return peer_tickers
-            
+
     except Exception as e:
-        logger.error(f"[I-36] Failed to get peer tickers for {ticker}: {e}")
+        logger.error(f"[I-36] Failed to get peer tickers for {ticker}: {e}", exc_info=True)
         return []
 
 
@@ -1930,18 +2110,20 @@ async def calculate_sector_average_metrics(
     peer_tickers: List[str],
     event_date,
     metrics_by_domain: Dict[str, List[Dict[str, Any]]],
-    target_metrics: List[str] = ['PER', 'PBR']
+    target_metrics: List[str] = ['PER', 'PBR'],
+    event_id: Optional[str] = None
 ) -> Dict[str, float]:
     """
     동종 업종 티커들의 평균 PER, PBR 등을 계산합니다.
-    
+
     Args:
         pool: DB 연결 풀
         peer_tickers: 동종 업종 티커 목록
         event_date: 이벤트 날짜 (시간적 유효성 적용)
         metrics_by_domain: 메트릭 정의
         target_metrics: 계산할 메트릭 목록
-    
+        event_id: Optional event context for API call logging
+
     Returns:
         {'PER': 25.5, 'PBR': 3.2, ...} 형태의 업종 평균
     """
@@ -1965,11 +2147,14 @@ async def calculate_sector_average_metrics(
     async with FMPAPIClient() as fmp_client:
         for peer_ticker in peer_tickers[:10]:  # 최대 10개 peer만 사용 (성능)
             try:
+                # Build peer context for logging: show that this is peer data collection
+                peer_context = f"{event_id}:peer-{peer_ticker}" if event_id else f"peer-{peer_ticker}"
+
                 # API 데이터 조회
                 peer_api_cache = {}
                 for api_id in required_apis:
                     params = {'ticker': peer_ticker}
-                    
+
                     # API별 파라미터 설정
                     if 'income-statement' in api_id or 'balance-sheet' in api_id or 'cash-flow' in api_id:
                         params['period'] = 'quarter'
@@ -1982,8 +2167,8 @@ async def calculate_sector_average_metrics(
                             params['toDate'] = event_date.strftime('%Y-%m-%d')
                         else:
                             params['toDate'] = str(event_date)
-                    
-                    api_response = await fmp_client.call_api(api_id, params)
+
+                    api_response = await fmp_client.call_api(api_id, params, event_id=peer_context)
                     if api_response:
                         peer_api_cache[api_id] = api_response
                 
@@ -2080,30 +2265,32 @@ def calculate_fair_value_from_sector(
         
         current_per = valuation.get('PER')
         sector_avg_per = sector_averages.get('PER')
-        
-        if current_per and sector_avg_per and current_per != 0:
+
+        # CRITICAL: Only use positive PER values (negative PER = loss-making company)
+        if current_per and sector_avg_per and current_per > 0 and sector_avg_per > 0:
             # EPS = 현재 주가 / 현재 PER
             eps = current_price / current_per
             # 적정가 = 업종 평균 PER × EPS
             fair_value = sector_avg_per * eps
-            
+
             logger.debug(
                 f"[I-36] Fair value calculation: "
                 f"current_price={current_price:.2f}, current_PER={current_per:.2f}, "
                 f"sector_avg_PER={sector_avg_per:.2f}, EPS={eps:.4f}, fair_value={fair_value:.2f}"
             )
             return fair_value
-        
-        # PER이 없으면 PBR로 시도
+
+        # PER이 음수이거나 없으면 PBR로 시도
         current_pbr = valuation.get('PBR')
         sector_avg_pbr = sector_averages.get('PBR')
-        
-        if current_pbr and sector_avg_pbr and current_pbr != 0:
+
+        # CRITICAL: Only use positive PBR values
+        if current_pbr and sector_avg_pbr and current_pbr > 0 and sector_avg_pbr > 0:
             # BPS = 현재 주가 / 현재 PBR
             bps = current_price / current_pbr
             # 적정가 = 업종 평균 PBR × BPS
             fair_value = sector_avg_pbr * bps
-            
+
             logger.debug(
                 f"[I-36] Fair value calculation (PBR): "
                 f"current_price={current_price:.2f}, current_PBR={current_pbr:.2f}, "

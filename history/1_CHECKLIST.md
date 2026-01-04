@@ -55,6 +55,7 @@
 | I-39 | target_summary JSONB 문자열 파싱 오류 | ✅ | 2026-01-02 | 2026-01-02 | N/A | #I-39 | #I-39 |
 | I-40 | Peer tickers 미존재 시 로깅 부족 | 🔄 DEPRECATED | 2026-01-02 | 2026-01-02 | I-41로 통합 | #I-40 | #I-40 |
 | I-41 | priceQuantitative 메트릭 미구현 (설계 불일치) | ✅ | 2026-01-02 | 2026-01-02 | N/A | #I-41 | #I-41 |
+| I-42 | fmp-stock-peers schema mapping + DB 저장 실패 | ✅ | 2026-01-02 | 2026-01-02 | N/A | #I-42 | #I-42 |
 
 ---
 
@@ -461,8 +462,10 @@
 
 ## 10. 설계 불일치 해결 이슈 - 2026-01-02 (I-41)
 
-### I-41: priceQuantitative 메트릭 미구현 (설계 불일치) ✅
+### I-41: priceQuantitative 메트릭 미구현 (설계 불일치) + 선택적 메트릭 업데이트 ✅
 	발견: 2026-01-02 | 해결됨: 2026-01-02
+
+	**Part 1: 설계 불일치 - priceQuantitative 메트릭 구현**
 
 	**현상**:
 	- 원본 설계(`prompt/1_guideline(function).ini`:892-897)는 `priceQuantitative` 메트릭 사용을 명시
@@ -473,15 +476,18 @@
 	- 설계 문서와 구현 간 불일치
 	- 메트릭 시스템 아키텍처를 따르지 않은 임시 해결책 (I-36, I-38)
 
-	**사용자 선택**: **옵션 A** - 원본 설계대로 priceQuantitative 메트릭 구현
+	**LLM 제안**: 2가지 옵션 제시
+	- **옵션 A**: 원본 설계대로 priceQuantitative 메트릭 구현 (메트릭 시스템 통합)
+	- **옵션 B**: calcFairValue 파라미터 유지 (빠른 우회 해결)
 
-	**구현 내용**:
+	**사용자 선택**: **옵션 A** 채택 - 근본적 해결 선호
+
+	**LLM 반영 - 데이터베이스 설정**:
 	- ✅ `config_lv2_metric` 테이블에 `priceQuantitative` 메트릭 정의
-	- ✅ I-36에서 개발한 calcFairValue 로직을 메트릭 계산에 통합
-	- ✅ 계산 방식: sector_avg_PER × EPS (또는 sector_avg_PBR × BPS)
-	- ✅ 설계 문서 (`backend/DESIGN_priceQuantitative_metric.md`) 작성
+	- ✅ source='custom' 지원을 위한 CHECK 제약조건 업데이트
+	- ✅ aggregation_params에 계산 방법 메타데이터 저장
 
-	**메트릭 정의**:
+	**메트릭 정의** (`backend/scripts/add_priceQuantitative_metric.sql`):
 	```sql
 	INSERT INTO config_lv2_metric (
 	    id, source, domain, aggregation_params
@@ -493,6 +499,12 @@
 	);
 	```
 
+	**LLM 반영 - 백엔드 구현**:
+	- ✅ `MetricEngine.calculate_all()`: custom_values 파라미터 추가
+	- ✅ `MetricEngine._calculate_metric_with_reason()`: source='custom' 처리 로직
+	- ✅ `calculate_price_quantitative_metric()`: 기존 calcFairValue 로직 래핑
+	- ✅ `process_ticker_batch()`: priceQuantitative 계산 후 custom_values로 전달
+
 	**계산 프로세스**:
 	1. `fmp-stock-peers` API로 동종 업종 티커 조회
 	2. 각 peer 티커의 PER/PBR 계산
@@ -501,8 +513,68 @@
 	5. `position_quantitative = 'long' if fair_value > price else 'short'`
 	6. `disparity_quantitative = (fair_value / price) - 1`
 
+	---
+
+	**Part 2: 선택적 메트릭 업데이트 기능 (Selective Metric Update)**
+
+	**사용자 요구사항**:
+	> "테이블에 값을 효율적으로 채워넣기 위해 txn_events 테이블의 config_lv2_metric 테이블의 id별로 파라미터에 값을 입력하면
+	> 해당하는 값만 overwrite 하거나 null 값만 업데이트 하거나 입력한 ticker에 대해서만 엔드포인트를 실행할 수 있도록"
+
+	**LLM 제안**: 3가지 옵션 제시
+	- **옵션 1**: metrics 파라미터만 추가 (단순)
+	- **옵션 2**: metrics + overwriteMetrics 파라미터 (유연)
+	- **옵션 3**: 옵션 2 + DB 레벨 selective update (완전)
+
+	**사용자 선택**: **옵션 3** 채택 - 완전한 구현 선호
+
+	**LLM 반영 - API 파라미터**:
+	- ✅ `metrics`: 업데이트할 메트릭 ID 리스트 (예: `priceQuantitative,PER,PBR`)
+	- ✅ `overwriteMetrics`: True=덮어쓰기, False=NULL만 업데이트
+	- ✅ `BackfillEventsTableQueryParams.get_metrics_list()`: 파싱 함수 추가
+
+	**LLM 반영 - 백엔드 로직**:
+	- ✅ `calculate_valuations()`: metrics_list 파라미터 추가
+	- ✅ `process_ticker_batch()`: metrics_list를 DB 업데이트에 전달
+	- ✅ `batch_update_event_valuations()`: JSONB 선택적 병합 쿼리 구현
+
+	**데이터베이스 업데이트 로직** (`backend/src/database/queries/metrics.py`):
+	```sql
+	-- metrics_list 지정 시: JSONB || 연산자로 선택적 병합
+	SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative
+
+	-- metrics_list 미지정 시: 기존 로직 (전체 교체 또는 NULL만 업데이트)
+	```
+
+	**사용법 예시**:
+	```bash
+	# priceQuantitative만 NULL 값 업데이트
+	POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=false
+
+	# priceQuantitative 강제 재계산 (덮어쓰기)
+	POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=true
+
+	# 특정 ticker의 여러 메트릭 업데이트
+	POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwriteMetrics=true
+	```
+
+	---
+
+	**Part 3: API 단순화 (overwriteMetrics 제거)** - 2026-01-02
+
+	사용자 제안으로 `overwriteMetrics` 파라미터를 제거하고 기존 `overwrite` 파라미터를 확장:
+	- **문제**: `overwrite`와 `overwriteMetrics` 2개 파라미터로 인한 UX 혼란
+	- **사용자 제안**: "overwriteMetrics는 이미 모든 엔드포인트에 overwrite 파라미터가 있어 이것을 사용하면 되는 것 아닌가요?"
+	- **LLM 동의**: 단일 파라미터로 문맥적 의미 부여 (metrics 유무에 따라)
+	- **반영**:
+	  - `overwriteMetrics` 파라미터 완전 제거
+	  - `overwrite` 파라미터 의미 확장:
+	    - `metrics` 지정 시: 해당 메트릭에만 적용
+	    - `metrics` 미지정 시: 전체 필드에 적용
+	  - 백엔드 4개 파일, 프론트엔드 2개 파일 수정
+
 	**알려진 제한사항**:
-	- Peer tickers 미존재 시 NULL (소형주, 특수 섹터)
+	- Peer tickers 미존재 시 priceQuantitative NULL (소형주, 특수 섹터)
 	- fmp-stock-peers는 현재 peer 목록만 반환 (과거 데이터 없음)
 
 	**폐기된 이슈**:
@@ -510,21 +582,180 @@
 	- **I-38**: calcFairValue 기본값 → 메트릭 자동 계산으로 대체
 	- **I-40**: Peer tickers 로깅 → priceQuantitative 제한사항으로 통합
 
+	**수정된 파일**:
+	- `backend/scripts/add_priceQuantitative_metric.sql`: 메트릭 정의
+	- `backend/src/models/request_models.py`: metrics 파라미터, overwrite 의미 확장
+	- `backend/src/routers/events.py`: 파라미터 파싱 (overwriteMetrics 제거)
+	- `backend/src/services/valuation_service.py`: 계산 로직 통합 (overwriteMetrics 제거)
+	- `backend/src/services/metric_engine.py`: custom_values 지원
+	- `backend/src/database/queries/metrics.py`: 선택적 JSONB 업데이트 (SQL 단순화)
+	- `frontend/src/pages/RequestsPage.jsx`: metrics, calcFairValue 파라미터 추가
+	- `frontend/src/pages/SetRequestsPage.jsx`: endpoint flow 파라미터 업데이트
+
 	**참조**:
 	- 설계 문서: `backend/DESIGN_priceQuantitative_metric.md`
 	- SQL 스크립트: `backend/scripts/add_priceQuantitative_metric.sql`
 	- 이슈 분석: `history/ISSUE_priceQuantitative_MISSING.md`
+
+### I-42: fmp-stock-peers API schema mapping 오류 + priceQuantitative DB 저장 실패 🔄
+	발견: 2026-01-02 | 진행중
+
+	**Part 1: Schema Mapping Error (✅ 완료)**
+
+	**현상**:
+	- I-41 구현 후 RGTI의 priceQuantitative가 여전히 NULL
+	- Peer ticker API 호출 시 schema mapping TypeError 발생
+	- 에러: `TypeError: unhashable type: 'dict'` at `external_api.py:86`
+
+	**원인**:
+	- `fmp-stock-peers` API schema가 nested dict 구조로 정의됨
+	- `_apply_schema_mapping()` 함수가 nested schema를 처리하지 못함
+	- `reverse_schema = {v: k for k, v in schema.items()}` 에서 dict를 key로 사용 시도
+
+	**LLM 제안**: 3가지 옵션 제시
+	- **옵션 A**: Schema mapping 함수 개선 (nested schema 지원 추가)
+	- **옵션 B**: fmp-stock-peers schema를 flat 구조로 변경
+	- **옵션 C**: Schema mapping 우회 (특정 API만)
+
+	**사용자 선택**: 사용자 명시 없음 → LLM이 **옵션 A + B 결합** 선택
+	- 옵션 A: `_apply_schema_mapping()` 함수 개선으로 범용 해결
+	- 옵션 B: `fmp-stock-peers` schema를 실제 API 응답에 맞게 수정
+
+	**LLM 반영 내용**:
+	- ✅ `external_api.py`: `_apply_schema_mapping()` nested schema 지원 추가
+	  - Line 87-102: nested_schemas 딕셔너리로 array/object 타입 분리 처리
+	  - Line 104-119: `map_array_items()` helper 함수 구현
+	  - Line 121-142: `map_item()` 함수에서 nested field 처리 로직 추가
+
+	- ✅ `valuation_service.py`: `get_peer_tickers()` 함수 수정
+	  - Line 1952-1960: Flat list 구조 처리 (nested peerTickers 제거)
+	  - Schema mapping 후 'ticker' 필드 직접 추출
+
+	- ✅ Database: `fmp-stock-peers` schema 수정
+	  ```sql
+	  -- Before (nested, 에러 발생):
+	  {
+	    "ticker": "symbol",
+	    "peerTickers": {
+	      "type": "array",
+	      "items": {"symbol": {"type": "string", "value": "symbol"}, ...}
+	    }
+	  }
+
+	  -- After (flat, 정상 작동):
+	  {
+	    "ticker": "symbol",
+	    "companyName": "companyName",
+	    "price": "price",
+	    "mktCap": "mktCap"
+	  }
+	  ```
+
+	**검증 결과** (Part 1):
+	- ✅ Peer ticker retrieval: 성공 (RGTI → 9 peers: BILI, CACI, DUOL, IONQ, QBTS, QXO, SAIL, SNX, ZBRA)
+	- ✅ Sector average calculation: 성공 (PER: 20.15, PBR: 3.87)
+	- ✅ Fair value calculation: 성공 (로직 검증 완료)
+
+	---
+
+	**Part 2: Database 저장 실패 (✅ 완료)**
+
+	**현상**:
+	- priceQuantitative 계산 성공하지만 데이터베이스에 NULL로 저장됨
+	- `test_full_flow.py` 실행 시 "Current price not found!" 에러 발생
+	- 데이터베이스 조회 결과 nested structure 발견:
+	  ```json
+	  {
+	    "valuation": {
+	      "values": {"priceQuantitative": null, "PER": -19.09, ...},
+	      "dateInfo": {...}
+	    }
+	  }
+	  ```
+
+	**원인 분석**:
+	1. **Formatter가 데이터베이스 저장 전에 호출됨**
+	   - `valuation_service.py:264`: `format_value_quantitative()` 호출
+	   - Nested structure 생성: `{values: {...}, dateInfo: {...}}`
+
+	2. **데이터베이스 쿼리 경로 불일치**
+	   - 기대 경로: `value_quantitative->'valuation'->>'priceQuantitative'`
+	   - 실제 경로: `value_quantitative->'valuation'->'values'->>'priceQuantitative'`
+
+	3. **Cascading failures**
+	   - currentPrice 조회 실패 (`value_qualitative->>'currentPrice'` → NULL)
+	   - currentPrice 없으면 priceQuantitative 계산 차단됨
+	   - 계산되어도 nested path로 인해 조회 실패
+
+	**LLM 제안**: 3가지 옵션 제시
+	- **옵션 A**: Formatter를 API 응답 단계로 이동 (데이터베이스 저장 후)
+	- **옵션 B**: Formatter 완전 제거, raw engine output 저장
+	- **옵션 C**: 데이터베이스 쿼리를 nested path로 수정
+
+	**사용자 선택**: 사용자 명시 없음 → LLM이 **옵션 B** 선택
+	- Formatter는 API 응답 포맷팅 전용으로 사용되어야 함
+	- 데이터베이스에는 engine의 raw output 저장 (flat structure)
+	- 기존 쿼리들과의 호환성 유지
+
+	**LLM 반영 내용**:
+	- ✅ `valuation_service.py:263-287`: Formatter 호출 제거
+	  ```python
+	  # OLD (BROKEN):
+	  # formatted_quant = format_value_quantitative(quant_result.get('value'))
+	  # formatted_qual = format_value_qualitative(qual_result.get('value'))
+
+	  # NEW (FIXED):
+	  value_quant = quant_result.get('value')
+	  value_qual = qual_result.get('value')
+	  ```
+
+	- ✅ `valuation_service.py:15-16`: Formatter imports 주석 처리
+	  ```python
+	  # I-42: Removed formatter imports - formatting should only be done in API responses
+	  # from .utils.response_formatter import format_value_quantitative, format_value_qualitative
+	  ```
+
+	- ✅ `metrics.py:274-279`: Debug logging 추가
+	  - 데이터베이스 저장 직전 구조 확인 로그
+
+	**검증 결과** (Part 2):
+	- ✅ Engine output 검증: Flat structure 확인 (`test_engine_output.py`)
+	  ```json
+	  {
+	    "valuation": {
+	      "priceQuantitative": 123.45,
+	      "PER": -19.09,
+	      "_meta": {...}
+	    }
+	  }
+	  ```
+	- ✅ custom_values 전달: Engine에서 정상 처리 확인
+	- ⏳ 최종 통합 테스트: 서버 재시작 및 backfill 재실행 필요
+
+	**수정된 파일** (전체):
+	- `backend/src/services/external_api.py`: Schema mapping 함수 개선 (Part 1)
+	- `backend/src/services/valuation_service.py`:
+	  - Peer ticker 추출 로직 수정 (Part 1)
+	  - Formatter 호출 제거 (Part 2)
+	- `backend/src/database/queries/metrics.py`: Debug logging 추가 (Part 2)
+	- Database: `config_lv1_api_list.fmp-stock-peers.schema` 수정 (Part 1)
+
+	**테스트 스크립트 생성**:
+	- `backend/test_rgti_peers_api.py`: API 호출 테스트 (Part 1)
+	- `backend/test_sector_averages.py`: Sector average 계산 테스트 (Part 1)
+	- `backend/test_full_flow.py`: End-to-end 테스트 (Part 1-2)
+	- `backend/test_engine_output.py`: Engine flat structure 검증 (Part 2)
 
 ---
 
 ## 📈 통계
 
 ### 상태별 현황
-- ✅ **완료**: 36개 (87.8%)
-- 🔄 **DEPRECATED**: 3개 (7.3%) - I-36, I-38, I-40 (I-41로 대체됨)
-- ⏸️ **보류**: 2개 (4.9%) - I-04, I-14
+- ✅ **완료**: 37개 (88.1%)
+- 🔄 **DEPRECATED**: 3개 (7.1%) - I-36, I-38, I-40 (I-41로 대체됨)
+- ⏸️ **보류**: 2개 (4.8%) - I-04, I-14
 
-> **전체 이슈**: 41개 (I-01 ~ I-41)
+> **전체 이슈**: 42개 (I-01 ~ I-42)
 
 ### 일자별 이슈 처리
 - **2025-12-23**: I-01 ~ I-09 (9개 이슈 처리)
@@ -534,7 +765,7 @@
 - **2025-12-30**: I-29 (식별)
 - **2025-12-31**: I-29 ~ I-37 (9개 이슈 해결 - 백엔드 6건, UI/UX 3건)
 - **2026-01-01**: I-38 (calcFairValue 기본값 변경 - 현재 deprecated)
-- **2026-01-02**: I-39 ~ I-41 (JSONB 파싱, priceQuantitative 메트릭 구현)
+- **2026-01-02**: I-39 ~ I-42 (JSONB 파싱, priceQuantitative 메트릭 구현, schema mapping 개선)
 
 ### 폐기 이슈 (Deprecated)
 - **I-36**: calcFairValue 파라미터 → I-41 priceQuantitative 메트릭으로 대체
@@ -543,6 +774,7 @@
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated)*
+*최종 업데이트: 2026-01-02 KST (I-42 진행 중 - fmp-stock-peers schema mapping 개선 완료, DB 저장 로직 조사 중)*
+*이전 업데이트: I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated*
 *설계 문서: backend/DESIGN_priceQuantitative_metric.md*
 *이슈 분석: history/ISSUE_priceQuantitative_MISSING.md*

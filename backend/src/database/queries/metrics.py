@@ -2,7 +2,12 @@
 
 import asyncpg
 import json
-from typing import List, Dict, Any
+import logging
+from typing import List, Dict, Any, Optional
+
+from ...utils.logging_utils import log_db_update, log_row_update
+
+logger = logging.getLogger("alsign")
 
 
 async def select_metric_definitions(
@@ -97,7 +102,7 @@ async def select_events_for_valuation(
     """
     async with pool.acquire() as conn:
         query = """
-            SELECT ticker, event_date, source, source_id,
+            SELECT id, ticker, event_date, source, source_id,
                    sector, industry,
                    value_quantitative, value_qualitative,
                    position_quantitative, position_qualitative,
@@ -239,11 +244,12 @@ async def select_consensus_data(
 async def batch_update_event_valuations(
     pool: asyncpg.Pool,
     updates: List[Dict[str, Any]],
-    overwrite: bool = False
+    overwrite: bool = False,
+    metrics: Optional[List[str]] = None
 ) -> int:
     """
     Batch update event valuations in txn_events.
-    
+
     Args:
         pool: Database connection pool
         updates: List of update dictionaries, each containing:
@@ -257,8 +263,12 @@ async def batch_update_event_valuations(
             - position_qualitative: Position signal
             - disparity_quantitative: Quantitative disparity
             - disparity_qualitative: Qualitative disparity
-        overwrite: If False, partial update (NULL only). If True, full replace.
-    
+        overwrite: If False, update only NULL values. If True, overwrite existing values.
+                   When used with metrics: applies to specified metrics only.
+                   When used without metrics: applies to all value_* JSONB fields.
+        metrics: Optional list of metric IDs to update (I-41). If specified, only these metrics
+                 are updated within value_quantitative JSONB. Works in combination with 'overwrite'.
+
     Returns:
         Number of rows updated
     """
@@ -266,6 +276,13 @@ async def batch_update_event_valuations(
         return 0
     
     async with pool.acquire() as conn:
+        # I-42 DEBUG: Log what we're storing
+        if updates and len(updates) > 0:
+            first_upd = updates[0]
+            val_quant = first_upd.get('value_quantitative')
+            if val_quant and isinstance(val_quant, dict) and 'valuation' in val_quant:
+                logger.info(f"[I-42 DB DEBUG] Storing valuation keys: {list(val_quant['valuation'].keys())[:6]}")
+
         # Prepare batch data
         records = [
             (
@@ -278,22 +295,58 @@ async def batch_update_event_valuations(
                 upd.get('position_quantitative'),
                 upd.get('position_qualitative'),
                 upd.get('disparity_quantitative'),
-                upd.get('disparity_qualitative')
+                upd.get('disparity_qualitative'),
+                # I-42: Dedicated columns for performance
+                upd.get('price_quantitative'),
+                json.dumps(upd.get('peer_quantitative')) if upd.get('peer_quantitative') else None
             )
             for upd in updates
         ]
         
-        if overwrite:
+        # I-41: Selective metric update support
+        if metrics is not None:
+            # Selective metric update mode (I-41)
+            # Deep merge specific metrics into value_quantitative JSONB
+            # The 'overwrite' parameter controls whether to replace existing values or only fill NULLs
+            query = """
+                WITH batch_data AS (
+                    SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[],
+                                       $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
+                                       $9::numeric[], $10::numeric[], $11::numeric[], $12::jsonb[])
+                    AS t(ticker, event_date, source, source_id,
+                         value_quantitative, value_qualitative,
+                         position_quantitative, position_qualitative,
+                         disparity_quantitative, disparity_qualitative,
+                         price_quantitative, peer_quantitative)
+                )
+                UPDATE txn_events e
+                SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative,
+                    value_qualitative = COALESCE(e.value_qualitative, b.value_qualitative),
+                    position_quantitative = COALESCE(e.position_quantitative, b.position_quantitative::"position"),
+                    position_qualitative = COALESCE(e.position_qualitative, b.position_qualitative::"position"),
+                    disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
+                    disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative),
+                    price_quantitative = COALESCE(e.price_quantitative, b.price_quantitative),
+                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative)
+                FROM batch_data b
+                WHERE e.ticker = b.ticker
+                  AND e.event_date = b.event_date
+                  AND e.source = b.source
+                  AND e.source_id = b.source_id
+                RETURNING e.id, e.ticker, e.event_date, e.source, e.source_id
+            """
+        elif overwrite:
             # Full replace mode using temp table
             query = """
                 WITH batch_data AS (
                     SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[],
                                        $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
-                                       $9::numeric[], $10::numeric[])
-                    AS t(ticker, event_date, source, source_id, 
+                                       $9::numeric[], $10::numeric[], $11::numeric[], $12::jsonb[])
+                    AS t(ticker, event_date, source, source_id,
                          value_quantitative, value_qualitative,
                          position_quantitative, position_qualitative,
-                         disparity_quantitative, disparity_qualitative)
+                         disparity_quantitative, disparity_qualitative,
+                         price_quantitative, peer_quantitative)
                 )
                 UPDATE txn_events e
                 SET value_quantitative = b.value_quantitative,
@@ -301,12 +354,15 @@ async def batch_update_event_valuations(
                     position_quantitative = b.position_quantitative::"position",
                     position_qualitative = b.position_qualitative::"position",
                     disparity_quantitative = b.disparity_quantitative,
-                    disparity_qualitative = b.disparity_qualitative
+                    disparity_qualitative = b.disparity_qualitative,
+                    price_quantitative = b.price_quantitative,
+                    peer_quantitative = b.peer_quantitative
                 FROM batch_data b
                 WHERE e.ticker = b.ticker
                   AND e.event_date = b.event_date
                   AND e.source = b.source
                   AND e.source_id = b.source_id
+                RETURNING e.id, e.ticker, e.event_date, e.source, e.source_id
             """
         else:
             # Partial update mode - only update NULL values
@@ -314,11 +370,12 @@ async def batch_update_event_valuations(
                 WITH batch_data AS (
                     SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[],
                                        $5::jsonb[], $6::jsonb[], $7::text[], $8::text[],
-                                       $9::numeric[], $10::numeric[])
+                                       $9::numeric[], $10::numeric[], $11::numeric[], $12::jsonb[])
                     AS t(ticker, event_date, source, source_id,
                          value_quantitative, value_qualitative,
                          position_quantitative, position_qualitative,
-                         disparity_quantitative, disparity_qualitative)
+                         disparity_quantitative, disparity_qualitative,
+                         price_quantitative, peer_quantitative)
                 )
                 UPDATE txn_events e
                 SET value_quantitative = CASE
@@ -332,19 +389,23 @@ async def batch_update_event_valuations(
                     position_quantitative = COALESCE(e.position_quantitative, b.position_quantitative::"position"),
                     position_qualitative = COALESCE(e.position_qualitative, b.position_qualitative::"position"),
                     disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
-                    disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative)
+                    disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative),
+                    price_quantitative = COALESCE(e.price_quantitative, b.price_quantitative),
+                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative)
                 FROM batch_data b
                 WHERE e.ticker = b.ticker
                   AND e.event_date = b.event_date
                   AND e.source = b.source
                   AND e.source_id = b.source_id
+                RETURNING e.id, e.ticker, e.event_date, e.source, e.source_id
             """
         
         # Unzip records into column arrays
         tickers, event_dates, sources, source_ids = [], [], [], []
         val_quants, val_quals, pos_quants, pos_quals = [], [], [], []
         disp_quants, disp_quals = [], []
-        
+        price_quants, peer_quants = [], []  # I-42: New columns
+
         for rec in records:
             tickers.append(rec[0])
             event_dates.append(rec[1])
@@ -356,17 +417,27 @@ async def batch_update_event_valuations(
             pos_quals.append(rec[7])
             disp_quants.append(rec[8])
             disp_quals.append(rec[9])
-        
-        result = await conn.execute(
+            price_quants.append(rec[10])  # I-42
+            peer_quants.append(rec[11])   # I-42
+
+        updated_rows = await conn.fetch(
             query,
             tickers, event_dates, sources, source_ids,
             val_quants, val_quals, pos_quants, pos_quals,
-            disp_quants, disp_quals
+            disp_quants, disp_quals, price_quants, peer_quants  # I-42
         )
-        
-        # Parse result (format: "UPDATE N")
-        updated_count = int(result.split()[-1]) if result else 0
-        return updated_count
+
+        # Log updated row IDs
+        if updated_rows:
+            log_db_update(logger, "txn_events", len(updated_rows))
+            for row in updated_rows:
+                log_row_update(
+                    logger, "txn_events", str(row['id'])[:8],
+                    f"ticker={row['ticker']}, date={row['event_date'].date() if row['event_date'] else None}, source={row['source']}",
+                    level="debug"
+                )
+
+        return len(updated_rows)
 
 
 async def update_event_valuations(

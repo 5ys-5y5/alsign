@@ -1657,26 +1657,30 @@
 
 ---
 
-## I-41: priceQuantitative 메트릭 미구현 (설계 불일치)
+## I-41: priceQuantitative 메트릭 미구현 (설계 불일치) + 선택적 메트릭 업데이트
 
 > **발견**: 2026-01-02 | **해결**: 2026-01-02 ✅
 
-### 현상
+---
+
+### Part 1: 설계 불일치 - priceQuantitative 메트릭 구현
+
+#### 현상
 	원본 설계 문서(`prompt/1_guideline(function).ini`:892-897)는 `priceQuantitative` 메트릭 사용을 명시했으나, 실제 구현에는 해당 메트릭이 `config_lv2_metric` 테이블에 존재하지 않음
 
-### 원인
+#### 원인
 	- 설계 문서와 구현 간 불일치
 	- I-36에서 `calcFairValue` 파라미터로 임시 우회
 	- 메트릭 시스템 아키텍처를 따르지 않음
 
-### LLM 제공 선택지
+#### LLM 제공 선택지
 	| 옵션 | 설명 | 복잡도 |
 	|------|------|--------|
 	| **A** | **priceQuantitative 메트릭 구현 (원본 설계 준수)** | **🔴 높음** |
 	| B | 설계 문서 업데이트 (현행 유지) | 🟢 낮음 |
 	| C | 하이브리드 (메트릭 + fallback) | 🟡 중간 |
 
-### 사용자 채택
+#### 사용자 채택
 	**옵션 A 채택** - 원본 설계대로 priceQuantitative 메트릭 구현
 
 	**핵심 결정**:
@@ -1684,11 +1688,12 @@
 	- I-36의 calcFairValue 로직을 메트릭 계산에 통합
 	- 메트릭 시스템 아키텍처 준수
 
-### 반영 내용
+#### 반영 내용 (Part 1)
 	- **상태**: ✅ 해결됨
-	- **구현 내용**:
-		1. SQL 스크립트 작성: `backend/scripts/add_priceQuantitative_metric.sql`
-		2. 메트릭 정의:
+	- **데이터베이스**:
+		1. SQL 스크립트: `backend/scripts/add_priceQuantitative_metric.sql`
+		2. CHECK 제약조건 업데이트: source='custom' 지원 추가
+		3. 메트릭 정의:
 			```sql
 			INSERT INTO config_lv2_metric (
 			    id: 'priceQuantitative',
@@ -1703,26 +1708,413 @@
 			    }
 			)
 			```
-		3. 계산 로직 (I-36에서 개발한 함수 재사용):
-			- `get_peer_tickers()`: fmp-stock-peers API 호출
-			- `calculate_sector_average_metrics()`: 업종 평균 계산
-			- `calculate_fair_value_from_sector()`: 적정가 도출
-		4. position/disparity 계산:
-			```
-			position_quantitative = 'long' if priceQuantitative > price else 'short'
-			disparity_quantitative = (priceQuantitative / price) - 1
-			```
-	- **폐기된 이슈**:
-		- I-36: calcFairValue 파라미터 방식
-		- I-38: calcFairValue 기본값
-		- I-40: Peer tickers 로깅
-	- **알려진 제한사항**:
-		- Peer tickers 미존재 시 NULL (소형주, 특수 섹터)
-		- fmp-stock-peers는 현재 peer 목록만 제공
-	- **참조**:
-		- → [설계 문서: backend/DESIGN_priceQuantitative_metric.md]
-		- → [이슈 분석: history/ISSUE_priceQuantitative_MISSING.md]
-		- → [상세: I-41]
+	- **백엔드 구현**:
+		1. `MetricEngine.calculate_all()`: custom_values 파라미터 추가
+		2. `MetricEngine._calculate_metric_with_reason()`: source='custom' 처리
+		3. `calculate_price_quantitative_metric()`: 기존 calcFairValue 로직 래핑
+		4. `process_ticker_batch()`: priceQuantitative 계산 후 custom_values 전달
+	- **계산 로직** (I-36 재사용):
+		- `get_peer_tickers()`: fmp-stock-peers API 호출
+		- `calculate_sector_average_metrics()`: 업종 평균 계산
+		- `calculate_fair_value_from_sector()`: 적정가 도출
+	- **position/disparity 계산**:
+		```
+		position_quantitative = 'long' if priceQuantitative > price else 'short'
+		disparity_quantitative = (priceQuantitative / price) - 1
+		```
+
+---
+
+### Part 2: 선택적 메트릭 업데이트 기능 (Selective Metric Update)
+
+#### 현상
+	사용자가 특정 메트릭만 효율적으로 업데이트하고 싶어 함:
+	> "테이블에 값을 효율적으로 채워넣기 위해 txn_events 테이블의 config_lv2_metric 테이블의 id별로 파라미터에 값을 입력하면
+	> 해당하는 값만 overwrite 하거나 null 값만 업데이트 하거나 입력한 ticker에 대해서만 엔드포인트를 실행할 수 있도록"
+
+#### 원인
+	- 기존: 전체 value_quantitative JSONB를 교체하거나 NULL만 업데이트
+	- 문제: 특정 메트릭만 재계산하고 싶을 때 비효율적
+	- 예: priceQuantitative만 추가하려는데 PER, PBR 등 다른 메트릭까지 재계산됨
+
+#### LLM 제공 선택지
+	| 옵션 | 설명 | 유연성 | 복잡도 |
+	|------|------|--------|--------|
+	| 1 | metrics 파라미터만 추가 | 🟡 중간 | 🟢 낮음 |
+	| 2 | metrics + overwriteMetrics 파라미터 | 🟢 높음 | 🟡 중간 |
+	| **3** | **옵션 2 + DB 레벨 selective update** | **🟢 최고** | **🔴 높음** |
+
+#### 사용자 채택
+	**옵션 3 채택** - 완전한 선택적 업데이트 구현
+
+	**핵심 결정**:
+	- API 파라미터로 대상 메트릭 지정
+	- DB 레벨에서 JSONB 선택적 병합
+	- overwriteMetrics로 덮어쓰기 제어
+
+#### 반영 내용 (Part 2)
+	- **상태**: ✅ 해결됨
+	- **API 파라미터** (`backend/src/models/request_models.py`):
+		```python
+		metrics: Optional[str] = Field(
+		    default=None,
+		    description="업데이트할 메트릭 ID 리스트 (예: 'priceQuantitative,PER,PBR')"
+		)
+		overwrite_metrics: bool = Field(
+		    default=False,
+		    description="True=덮어쓰기, False=NULL만 업데이트"
+		)
+		```
+	- **파라미터 전달 체인**:
+		1. `POST /backfillEventsTable` (router)
+		2. → `calculate_valuations()` (service)
+		3. → `process_ticker_batch()` (service)
+		4. → `batch_update_event_valuations()` (DB query)
+	- **데이터베이스 로직** (`backend/src/database/queries/metrics.py`):
+		```sql
+		-- metrics_list 지정 시: JSONB || 연산자로 선택적 병합
+		UPDATE txn_events
+		SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative
+
+		-- overwriteMetrics=true: 지정된 메트릭 덮어쓰기
+		-- overwriteMetrics=false: NULL인 메트릭만 채우기
+		```
+	- **사용법 예시**:
+		```bash
+		# priceQuantitative만 NULL 값 채우기
+		POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=false
+
+		# priceQuantitative 강제 재계산
+		POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=true
+
+		# 여러 메트릭 동시 업데이트
+		POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwriteMetrics=true
+		```
+
+---
+
+### Part 3: API 단순화 (overwriteMetrics 제거) - 2026-01-02
+
+#### 현상 (문제 제기)
+- Part 2에서 `metrics` + `overwriteMetrics` 조합으로 선택적 업데이트 구현
+- 사용자 피드백: "overwriteMetrics는 이미 모든 엔드포인트에 overwrite 파라미터가 있어 이것을 사용하면 되는 것 아닌가요?"
+- **문제**: 2개의 overwrite 관련 파라미터로 인한 UX 혼란
+  - `overwrite`: 전체 필드 업데이트 모드
+  - `overwriteMetrics`: 선택 메트릭 업데이트 모드
+  - 4가지 조합 (2×2) → 사용자 혼란 유발
+
+#### LLM 제안
+- **옵션 A (채택)**: `overwriteMetrics` 제거, `overwrite` 의미 확장
+  - `metrics` 지정 시: `overwrite`가 해당 메트릭에만 적용
+  - `metrics` 미지정 시: `overwrite`가 전체 필드에 적용
+  - 장점: 단일 파라미터, 직관적 의미, 기존 API 일관성 유지
+  - 단점: None
+
+#### 사용자 선택 및 반영
+- **채택**: 옵션 A (사용자 제안 수용)
+- **반영 내용**:
+  1. `BackfillEventsTableQueryParams.overwrite_metrics` 필드 제거
+  2. `overwrite` 필드 description 업데이트 (문맥적 의미 설명)
+  3. `metrics` 필드 description 업데이트 (overwrite 상호작용 설명)
+  4. `calculate_valuations()` 함수에서 `overwrite_metrics` 파라미터 제거
+  5. `batch_update_event_valuations()` SQL 로직 단순화
+  6. 프론트엔드 UI 파라미터 업데이트
+
+#### 구현 세부사항
+
+**단순화된 동작 매트릭스**:
+```
+metrics    | overwrite | 동작
+-----------|-----------|---------------------
+None       | false     | 전체 필드 NULL만 채우기
+None       | true      | 전체 필드 강제 덮어쓰기
+'PER,PBR'  | false     | PER,PBR만 NULL 채우기
+'PER,PBR'  | true      | PER,PBR만 강제 덮어쓰기
+```
+
+**사용법 예시**:
+```bash
+# priceQuantitative만 NULL 값 채우기
+POST /backfillEventsTable?metrics=priceQuantitative&overwrite=false
+
+# priceQuantitative 강제 재계산
+POST /backfillEventsTable?metrics=priceQuantitative&overwrite=true
+
+# 여러 메트릭 동시 업데이트 (NULL만)
+POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwrite=false
+```
+
+---
+
+### 전체 반영 요약
+
+#### 수정된 파일
+	1. `backend/scripts/add_priceQuantitative_metric.sql`: 메트릭 정의
+	2. `backend/src/models/request_models.py`: metrics 파라미터, overwrite 의미 확장
+	3. `backend/src/routers/events.py`: 파라미터 파싱 (overwriteMetrics 제거)
+	4. `backend/src/services/valuation_service.py`: 계산 로직 통합 (overwriteMetrics 제거)
+	5. `backend/src/services/metric_engine.py`: custom_values 지원
+	6. `backend/src/database/queries/metrics.py`: 선택적 JSONB 업데이트 (SQL 단순화)
+	7. `frontend/src/pages/RequestsPage.jsx`: metrics, calcFairValue 파라미터 추가
+	8. `frontend/src/pages/SetRequestsPage.jsx`: endpoint flow 파라미터 업데이트
+
+#### 폐기된 이슈
+	- **I-36**: calcFairValue 파라미터 방식 → priceQuantitative 메트릭으로 대체
+	- **I-38**: calcFairValue 기본값 → 메트릭 자동 계산으로 대체
+	- **I-40**: Peer tickers 로깅 → priceQuantitative 제한사항으로 통합
+
+#### 알려진 제한사항
+	- Peer tickers 미존재 시 priceQuantitative NULL (소형주, 특수 섹터)
+	- fmp-stock-peers는 현재 peer 목록만 제공 (과거 데이터 없음)
+
+#### 참조
+	- → [설계 문서: backend/DESIGN_priceQuantitative_metric.md]
+	- → [이슈 분석: history/ISSUE_priceQuantitative_MISSING.md]
+	- → [상세: I-41]
+
+---
+
+## I-42: fmp-stock-peers API schema mapping 오류 (🔄 진행중)
+
+### 현상
+	I-41 구현 후에도 RGTI의 priceQuantitative가 NULL로 남아 있음.
+
+	**Part 1: Schema Mapping Error**
+	- FMP `fmp-stock-peers` API 호출 시 TypeError 발생
+	- 에러 메시지: `TypeError: unhashable type: 'dict'` at `external_api.py:86`
+	- Peer ticker 조회 실패 → sector average 계산 불가 → priceQuantitative NULL
+
+	**Part 2: Database 저장 실패**
+	- Schema mapping 수정 후에도 priceQuantitative가 DB에 저장되지 않음
+	- Fair value 계산은 성공 (PER: 20.15, PBR: 3.87)
+	- DB UPDATE 후 조회 시 여전히 NULL
+
+### 원인
+	**Part 1: Schema Mapping**
+	1. Database schema가 nested dict 구조로 정의됨
+	   ```json
+	   {
+	     "ticker": "symbol",
+	     "peerTickers": {
+	       "type": "array",
+	       "items": {"symbol": {"type": "string", "value": "symbol"}, ...}
+	     }
+	   }
+	   ```
+	2. `_apply_schema_mapping()` 함수가 nested schema 미지원
+	   - `reverse_schema = {v: k for k, v in schema.items()}` 에서 dict를 key로 사용 시도
+	   - Dict는 unhashable type이므로 TypeError 발생
+	3. `get_peer_tickers()` 함수가 잘못된 구조 기대
+	   - 코드는 nested `peerTickers` array 기대
+	   - 실제 API는 flat list 반환: `[{symbol, companyName, price, mktCap}, ...]`
+
+	**Part 2: Database Persistence Failure** (✅ 완료)
+	1. **Formatter가 데이터베이스 저장 전에 호출됨**
+	   - `valuation_service.py:264`에서 `format_value_quantitative()` 호출
+	   - Engine의 flat structure를 nested structure로 변환
+	   - 변환 결과: `{values: {...}, dateInfo: {...}}`
+
+	2. **데이터베이스 쿼리 경로 불일치**
+	   - 기대 경로: `value_quantitative->'valuation'->>'priceQuantitative'`
+	   - 실제 경로: `value_quantitative->'valuation'->'values'->>'priceQuantitative'`
+	   - 모든 flat path 쿼리 실패 (currentPrice, priceQuantitative 등)
+
+	3. **Cascading failures**
+	   - currentPrice 조회 실패 → priceQuantitative 계산 차단
+	   - 계산 성공해도 nested path로 인해 조회 실패
+	   - 기존 코드와의 호환성 완전 상실
+
+### LLM 제공 선택지
+	**Part 1**:
+	| 옵션 | 설명 |
+	|------|------|
+	| A | `_apply_schema_mapping()` 함수 개선 (nested schema 지원 추가) - 범용 해결 |
+	| B | `fmp-stock-peers` schema를 flat 구조로 변경 - API 응답 구조에 맞춤 |
+	| C | Schema mapping 우회 (특정 API만 처리) - 임시 해결 |
+
+	**Part 2**:
+	| 옵션 | 설명 |
+	|------|------|
+	| A | Formatter를 API 응답 단계로 이동 (데이터베이스 저장 후 적용) |
+	| B | Formatter 호출 완전 제거, raw engine output 저장 - 기존 코드 호환성 유지 |
+	| C | 데이터베이스 쿼리를 nested path로 수정 - 대규모 변경 필요 |
+
+### 사용자 채택
+	**Part 1**: 사용자 명시 없음 → LLM이 **옵션 A + B 결합** 선택
+	- 이유: 옵션 A로 범용 해결 + 옵션 B로 정확한 schema 정의
+
+	**Part 2**: 사용자 명시 없음 → LLM이 **옵션 B** 선택
+	- 이유:
+	  - Formatter는 API 응답 포맷팅 용도로만 사용되어야 함
+	  - 데이터베이스에는 raw engine output 저장 (flat structure)
+	  - 기존 쿼리 코드와의 호환성 유지 (최소 변경)
+	  - 옵션 A는 formatter 위치만 이동하는 임시 방편
+	  - 옵션 C는 전체 쿼리 코드 수정 필요 (비효율적)
+
+### 반영 내용
+	**Part 1: Schema Mapping Error (✅ 완료)**
+
+	1. **external_api.py** - `_apply_schema_mapping()` 함수 개선:
+	```python
+	# Before (Line 86):
+	reverse_schema = {v: k for k, v in schema.items()}  # TypeError if v is dict!
+
+	# After (Line 87-142):
+	# 1. Separate simple and nested schemas
+	reverse_schema = {}  # For simple string mappings
+	nested_schemas = {}  # For array/object types
+
+	for internal_name, mapping_value in schema.items():
+	    if isinstance(mapping_value, dict):
+	        # Nested schema (array/object)
+	        api_field = mapping_value.get('value')
+	        nested_schemas[api_field] = {
+	            'internal_name': internal_name,
+	            'type': mapping_value.get('type'),
+	            'items': mapping_value.get('items', {})
+	        }
+	    elif isinstance(mapping_value, str):
+	        # Simple mapping
+	        reverse_schema[mapping_value] = internal_name
+
+	# 2. Add helper for array items
+	def map_array_items(items, item_schema):
+	    # Map each item using item schema
+	    ...
+
+	# 3. Update map_item() to handle nested fields
+	def map_item(item):
+	    for api_field, value in item.items():
+	        if api_field in nested_schemas:
+	            # Handle nested field (array/object)
+	            ...
+	        else:
+	            # Handle simple field
+	            ...
+	```
+
+	2. **valuation_service.py** - `get_peer_tickers()` 함수 수정:
+	```python
+	# Before (Line 1955-1964): Expected nested structure
+	for item in response:
+	    peer_list = item.get('peerTickers', [])  # Nested array expected
+	    for peer in peer_list:
+	        if isinstance(peer, dict) and 'symbol' in peer:
+	            peer_ticker = peer['symbol']
+	            ...
+
+	# After (Line 1952-1960): Handle flat list
+	for item in response:
+	    if isinstance(item, dict):
+	        # Get ticker from mapped field name
+	        peer_ticker = item.get('ticker') or item.get('symbol')
+	        if peer_ticker and peer_ticker != ticker:
+	            peer_tickers.append(peer_ticker)
+	```
+
+	3. **Database** - `config_lv1_api_list` schema 수정:
+	```sql
+	-- Execute SQL to fix schema
+	UPDATE config_lv1_api_list
+	SET schema = '{
+	  "ticker": "symbol",
+	  "companyName": "companyName",
+	  "price": "price",
+	  "mktCap": "mktCap"
+	}'::jsonb
+	WHERE id = 'fmp-stock-peers';
+	```
+
+	**검증 결과 (Part 1)**:
+	- ✅ Peer ticker retrieval: 성공
+	  - Test: `python test_rgti_peers_api.py`
+	  - Result: 9 peers found - BILI, CACI, DUOL, IONQ, QBTS, QXO, SAIL, SNX, ZBRA
+	- ✅ Sector average calculation: 성공
+	  - Test: `python test_sector_averages.py`
+	  - Result: PER: 20.15, PBR: 3.87
+	- ✅ Fair value calculation: 성공 (로직 검증)
+
+	---
+
+	**Part 2: Database 저장 실패 (✅ 완료)**
+
+	1. **valuation_service.py** - Formatter 호출 제거:
+	```python
+	# Before (Line 263-265): Formatter applied before DB storage
+	formatted_quant = format_value_quantitative(quant_result.get('value'))
+	formatted_qual = format_value_qualitative(qual_result.get('value'))
+	batch_updates.append({
+	    'value_quantitative': formatted_quant,  # Nested structure!
+	    'value_qualitative': formatted_qual
+	})
+
+	# After (Line 272-287): Store raw engine output
+	# I-42: DON'T format values for database storage
+	# The formatter creates nested structure (values/dateInfo) which breaks queries
+	value_quant = quant_result.get('value')  # Flat structure from engine
+	value_qual = qual_result.get('value')
+
+	# I-42 DEBUG: Log what we're about to store
+	if value_quant and 'valuation' in value_quant:
+	    val_keys = list(value_quant['valuation'].keys())[:5]
+	    logger.info(f"[I-42 DEBUG] value_quant valuation keys: {val_keys}")
+
+	batch_updates.append({
+	    'value_quantitative': value_quant,  # Flat structure preserved!
+	    'value_qualitative': value_qual
+	})
+	```
+
+	2. **valuation_service.py** - Formatter imports 주석 처리:
+	```python
+	# Line 15-16: Commented out formatter imports
+	# I-42: Removed formatter imports - formatting should only be done in API responses
+	# from .utils.response_formatter import format_value_quantitative, format_value_qualitative
+	```
+
+	3. **metrics.py** - Debug logging 추가:
+	```python
+	# Line 274-279: Added logging to verify flat structure before DB write
+	# I-42 DEBUG: Log what we're storing
+	if updates and len(updates) > 0:
+	    first_upd = updates[0]
+	    val_quant = first_upd.get('value_quantitative')
+	    if val_quant and isinstance(val_quant, dict) and 'valuation' in val_quant:
+	        logger.info(f"[I-42 DB DEBUG] Storing valuation keys: {list(val_quant['valuation'].keys())[:6]}")
+	```
+
+	**검증 결과 (Part 2)**:
+	- ✅ Engine output 검증 (`test_engine_output.py`):
+	  ```json
+	  {
+	    "valuation": {
+	      "priceQuantitative": 123.45,  // Flat structure!
+	      "PER": -19.09,
+	      "PSR": 894.28,
+	      "PBR": 18.02,
+	      "evEBITDA": -17.25,
+	      "_meta": {...}
+	    }
+	  }
+	  ```
+	- ✅ custom_values 전달: Engine에서 정상 처리됨
+	- ✅ Flat structure 유지: Nested 'values' key 없음
+	- ⏳ 최종 통합 테스트: 서버 재시작 후 backfill 재실행 필요
+
+	**수정된 파일** (전체):
+	- `backend/src/services/external_api.py`: Schema mapping 함수 (Part 1, Line 64-149)
+	- `backend/src/services/valuation_service.py`:
+	  - Peer ticker 추출 (Part 1, Line 1931-1967)
+	  - Formatter 호출 제거 (Part 2, Line 263-287)
+	  - Formatter imports 주석 (Part 2, Line 15-16)
+	- `backend/src/database/queries/metrics.py`: Debug logging (Part 2, Line 274-279)
+	- Database: `config_lv1_api_list.schema` for fmp-stock-peers (Part 1)
+
+	**생성된 테스트 스크립트**:
+	- `backend/test_rgti_peers_api.py`: Peer ticker API test (Part 1)
+	- `backend/test_sector_averages.py`: Sector average calculation test (Part 1)
+	- `backend/test_full_flow.py`: End-to-end test (Part 1-2)
+	- `backend/test_engine_output.py`: Engine flat structure verification (Part 2)
 
 ---
 
@@ -1737,6 +2129,7 @@
 | **I-39** | **target_summary JSONB 파싱 오류** | **✅** | **JSON parsing 추가** | **I-39** |
 | **I-40** | **Peer tickers 로깅** | **🔄 DEPRECATED** | **I-41 제한사항으로 통합** | **-** |
 | **I-41** | **priceQuantitative 메트릭 미구현** | **✅** | **옵션 A: 메트릭 구현 (원본 설계 준수)** | **I-41** |
+| **I-42** | **fmp-stock-peers schema mapping + DB 저장 실패** | **✅** | **Part 1: A+B (schema 개선), Part 2: B (formatter 제거)** | **I-42** |
 
 ### 폐기 이슈 (Deprecated)
 - **I-36**: calcFairValue 파라미터 → I-41 priceQuantitative 메트릭으로 대체
@@ -1745,4 +2138,5 @@
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated)*
+*최종 업데이트: 2026-01-02 KST (I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결)*
+*이전 업데이트: I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated*

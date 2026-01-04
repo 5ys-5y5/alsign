@@ -1,8 +1,8 @@
 # POST /backfillEventsTable 엔드포인트 흐름
 
 > **목적**: txn_events 테이블의 이벤트들에 대해 valuation metrics를 계산하고 저장
-> 
-> **최종 업데이트**: 2025-12-27
+>
+> **최종 업데이트**: 2026-01-02 (I-41 Part 1+2+3 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화)
 
 ---
 
@@ -15,6 +15,35 @@
 | **서비스 파일** | `backend/src/services/valuation_service.py` |
 | **DB 쿼리 파일** | `backend/src/database/queries/metrics.py` |
 | **엔진 파일** | `backend/src/services/metric_engine.py` |
+
+### 쿼리 파라미터
+
+| 파라미터 | 타입 | 기본값 | 설명 |
+|---------|------|--------|------|
+| `overwrite` | boolean | false | NULL만 채우기(false) vs 덮어쓰기(true). metrics 지정 시 해당 메트릭에만 적용, 미지정 시 전체 필드에 적용 (I-41 Part 3) |
+| `from` | date | null | 이벤트 시작 날짜 필터 (YYYY-MM-DD) |
+| `to` | date | null | 이벤트 종료 날짜 필터 (YYYY-MM-DD) |
+| `tickers` | string | null | 티커 필터 (쉼표 구분, 예: "AAPL,MSFT") |
+| `calcFairValue` | boolean | true | [DEPRECATED - I-41] 업종 평균 적정가 계산 여부 → metrics=priceQuantitative 사용 권장 |
+| **`metrics`** | **string** | **null** | **업데이트할 메트릭 ID 리스트 (쉼표 구분, 예: "priceQuantitative,PER,PBR") (I-41 Part 2)** |
+
+**사용법 예시**:
+```bash
+# 1. 기본: 모든 메트릭 계산 (NULL 값만 채우기)
+POST /backfillEventsTable
+
+# 2. 특정 메트릭만 NULL 값 채우기 (I-41)
+POST /backfillEventsTable?metrics=priceQuantitative
+
+# 3. 특정 메트릭 강제 재계산 (I-41 Part 3)
+POST /backfillEventsTable?metrics=priceQuantitative&overwrite=true
+
+# 4. 여러 메트릭 동시 업데이트 (I-41)
+POST /backfillEventsTable?metrics=priceQuantitative,PER,PBR&overwrite=false
+
+# 5. 날짜 범위 + 티커 + 선택적 메트릭 (I-41)
+POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&tickers=AAPL&metrics=priceQuantitative&overwrite=true
+```
 
 ---
 
@@ -503,16 +532,78 @@ engine.calculate_all(api_data, target_domains)
 - ~~**사용법**: `POST /backfillEventsTable?calcFairValue=true&tickers=AAPL`~~ (deprecated)
 - **참조**: `history/3_DETAIL.md#I-36`, `history/3_DETAIL.md#I-41`
 
-### I-41 구현됨 (2026-01-02) ✅
+### I-41 Part 1+2+3 구현됨 (2026-01-02) ✅
+
+**Part 1: priceQuantitative 메트릭 구현**
 - **문제**: 원본 설계 불일치 - `priceQuantitative` 메트릭 미구현
-- **해결**: `config_lv2_metric` 테이블에 priceQuantitative 메트릭 추가
+- **해결**: `config_lv2_metric` 테이블에 priceQuantitative 메트릭 추가 (source='custom')
 - **구현 내용**:
   - SQL: `backend/scripts/add_priceQuantitative_metric.sql`
   - 설계 문서: `backend/DESIGN_priceQuantitative_metric.md`
   - I-36의 계산 로직 재사용 (get_peer_tickers, calculate_sector_average_metrics 등)
-  - 메트릭 시스템에 통합 (source='custom')
-- **폐기된 이슈**: I-36 (calcFairValue 파라미터), I-38 (기본값), I-40 (peer tickers)
-- **참조**: `history/3_DETAIL.md#I-41`, `history/ISSUE_priceQuantitative_MISSING.md`
+  - `MetricEngine`: custom_values 파라미터 지원 추가
+  - `calculate_price_quantitative_metric()`: 기존 로직 래핑
+  - Event 처리 루프에서 priceQuantitative 계산 후 custom_values로 전달
+
+**Part 2: 선택적 메트릭 업데이트 (Selective Metric Update)**
+- **문제**: 특정 메트릭만 효율적으로 업데이트 필요
+- **해결**: `metrics` 파라미터 추가
+- **구현 내용**:
+  - **API 파라미터**: `metrics` (업데이트할 메트릭 ID 리스트, 쉼표 구분)
+  - **데이터베이스**: JSONB `||` 연산자로 선택적 병합
+  - **파라미터 전달**: router → calculate_valuations → process_ticker_batch → batch_update_event_valuations
+
+**Part 3: API 단순화 (overwriteMetrics 제거)**
+- **문제**: `overwrite` + `overwriteMetrics` 파라미터로 인한 UX 혼란
+- **사용자 제안**: "overwriteMetrics는 이미 모든 엔드포인트에 overwrite 파라미터가 있어 이것을 사용하면 되는 것 아닌가요?"
+- **해결**: `overwriteMetrics` 제거, `overwrite` 파라미터 의미 확장
+- **구현 내용**:
+  - `overwriteMetrics` 파라미터 완전 제거
+  - `overwrite` 파라미터 문맥적 의미 부여:
+    - `metrics` 지정 시: 해당 메트릭에만 적용
+    - `metrics` 미지정 시: 전체 필드에 적용
+  - 백엔드 4개 파일, 프론트엔드 2개 파일 수정
+
+**단순화된 동작 매트릭스**:
+```
+metrics          | overwrite | 동작
+-----------------|-----------|---------------------
+None             | false     | 전체 필드 NULL만 채우기
+None             | true      | 전체 필드 강제 덮어쓰기
+'priceQuant'     | false     | priceQuantitative만 NULL 채우기
+'priceQuant'     | true      | priceQuantitative만 강제 덮어쓰기
+'PER,PBR'        | false     | PER,PBR만 NULL 채우기
+'PER,PBR'        | true      | PER,PBR만 강제 덮어쓰기
+```
+
+**사용법**:
+```bash
+# priceQuantitative만 NULL 값 채우기 (기본 동작)
+POST /backfillEventsTable?metrics=priceQuantitative
+
+# priceQuantitative 강제 재계산 (덮어쓰기)
+POST /backfillEventsTable?metrics=priceQuantitative&overwrite=true
+
+# 여러 메트릭 동시 업데이트 (NULL만)
+POST /backfillEventsTable?metrics=priceQuantitative,PER,PBR&overwrite=false
+
+# 특정 티커의 여러 메트릭 강제 재계산
+POST /backfillEventsTable?tickers=AAPL,MSFT&metrics=PER,PBR,PSR&overwrite=true
+```
+
+**폐기된 이슈**:
+- I-36 (calcFairValue 파라미터), I-38 (기본값), I-40 (peer tickers)
+
+**수정된 파일**:
+- `backend/src/models/request_models.py`: metrics 파라미터, overwrite 의미 확장
+- `backend/src/routers/events.py`: 파라미터 파싱 (overwriteMetrics 제거)
+- `backend/src/services/valuation_service.py`: priceQuantitative 계산 (overwriteMetrics 제거)
+- `backend/src/services/metric_engine.py`: custom_values 지원
+- `backend/src/database/queries/metrics.py`: 선택적 JSONB 업데이트 (SQL 단순화)
+- `frontend/src/pages/RequestsPage.jsx`: metrics, calcFairValue 파라미터 추가
+- `frontend/src/pages/SetRequestsPage.jsx`: endpoint flow 파라미터 업데이트
+
+**참조**: `history/3_DETAIL.md#I-41`, `history/ISSUE_priceQuantitative_MISSING.md`
 
 ### I-37 해결됨 (2025-12-31) ✅
 - **문제**: 변수명 `targetMedian`인데 실제 값은 `AVG(price_target)` (평균값)

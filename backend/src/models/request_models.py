@@ -228,7 +228,7 @@ class BackfillEventsTableQueryParams(BaseModel):
 
     overwrite: bool = Field(
         default=False,
-        description="If false, partially update NULL values within value_* jsonb. If true, fully replace value_* fields."
+        description="If false, update only NULL values. If true, overwrite existing values. When used with 'metrics' parameter: applies to specified metrics only. When used without 'metrics': applies to all value_* JSONB fields."
     )
     from_date: Optional[date] = Field(
         default=None,
@@ -251,12 +251,7 @@ class BackfillEventsTableQueryParams(BaseModel):
     )
     metrics: Optional[str] = Field(
         default=None,
-        description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. Use this for selective metric updates. (I-41)"
-    )
-    overwrite_metrics: bool = Field(
-        default=False,
-        alias="overwriteMetrics",
-        description="If false, update only NULL metric values. If true, recalculate and overwrite all specified metrics. (I-41)"
+        description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. When specified with overwrite=true, overwrites existing values; with overwrite=false, updates only NULL values. (I-41)"
     )
 
     def get_ticker_list(self) -> Optional[List[str]]:

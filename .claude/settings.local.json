@@ -82,7 +82,20 @@
       "Bash(cmd //c \"taskkill /F /PID 15084 2>&1\")",
       "Bash(cmd //c \"taskkill /F /PID 30040 2>&1\")",
       "Bash(cmd //c \"taskkill /F /PID 48932 2>&1\")",
-      "Bash(cmd //c \"for %p in \\(48932 52536\\) do taskkill /F /PID %p 2>nul\")"
+      "Bash(cmd //c \"for %p in \\(48932 52536\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(git add:*)",
+      "Bash(git config:*)",
+      "Bash(cmd //c \"for %p in \\(52536 22068 48932\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 22068 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 52536 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /IM python.exe /FI \"\"WINDOWTITLE eq python*uvicorn*\"\" 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 50232 2>&1\")",
+      "Bash(cmd //c \"for %p in \\(47100 50232\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /IM python.exe\")",
+      "Bash(cmd //c \"tasklist | findstr uvicorn\")",
+      "Bash(cmd //c \"for %p in \\(16732 36424\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(else)",
+      "Bash(cmd //c \"for %p in \\(43120 36908\\) do taskkill /F /PID %p 2>nul\")"
     ]
   }
 }

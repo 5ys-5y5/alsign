@@ -682,6 +682,7 @@ export default function RequestsPage() {
               type: 'boolean',
               control: 'checkbox',
               required: false,
+              description: 'If false, update only NULL values. If true, overwrite existing values. When used with metrics: applies to specified metrics only.',
             },
             {
               key: 'from',
@@ -706,6 +707,23 @@ export default function RequestsPage() {
               control: 'input',
               required: false,
               placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
+            },
+            {
+              key: 'calcFairValue',
+              label: 'Calc Fair Value [DEPRECATED]',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '[DEPRECATED - I-41] Use metrics=priceQuantitative instead',
+            },
+            {
+              key: 'metrics',
+              label: 'Metrics (comma-separated)',
+              type: 'text',
+              control: 'input',
+              required: false,
+              placeholder: 'priceQuantitative,PER,PBR',
+              description: 'Selective metric update: specify metric IDs to recalculate (I-41)',
             },
           ]}
           bodyFields={[

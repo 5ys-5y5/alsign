@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from ..models.request_models import SetEventsTableQueryParams, BackfillEventsTableQueryParams
 from ..models.response_models import SetEventsTableResponse, BackfillEventsTableResponse
 from ..services import events_service, valuation_service
+from ..utils.logging_utils import log_error
 
 logger = logging.getLogger("alsign")
 
@@ -69,36 +70,11 @@ async def set_events_table(
 
     except ValueError as e:
         # Schema not found or invalid table name
-        logger.error(
-            f"Validation error: {str(e)}",
-            extra={
-                'endpoint': 'POST /setEventsTable',
-                'phase': 'validation',
-                'elapsed_ms': 0,
-                'counters': {},
-                'progress': {},
-                'rate': {},
-                'batch': {},
-                'warn': []
-            }
-        )
+        log_error(logger, "Validation error in POST /setEventsTable", exception=e)
         raise HTTPException(status_code=400, detail=str(e))
 
     except Exception as e:
-        logger.error(
-            f"POST /setEventsTable failed: {str(e)}",
-            extra={
-                'endpoint': 'POST /setEventsTable',
-                'phase': 'error',
-                'elapsed_ms': 0,
-                'counters': {},
-                'progress': {},
-                'rate': {},
-                'batch': {},
-                'warn': []
-            },
-            exc_info=True
-        )
+        log_error(logger, "POST /setEventsTable failed", exception=e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -135,7 +111,7 @@ async def backfill_events_table(
 
     logger.info("=" * 80)
     logger.info(f"[ROUTER] POST /backfillEventsTable RECEIVED - reqId={req_id}")
-    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, calcFairValue={params.calc_fair_value}, metrics={metrics_list}, overwriteMetrics={params.overwrite_metrics}")
+    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, calcFairValue={params.calc_fair_value}, metrics={metrics_list}")
     logger.info("=" * 80)
 
     try:
@@ -146,8 +122,7 @@ async def backfill_events_table(
             to_date=params.to_date,
             tickers=ticker_list,
             calc_fair_value=params.calc_fair_value,
-            metrics=metrics_list,
-            overwrite_metrics=params.overwrite_metrics
+            metrics_list=metrics_list
         )
         logger.info(f"[ROUTER] valuation_service.calculate_valuations completed successfully")
 
@@ -176,21 +151,7 @@ async def backfill_events_table(
     except Exception as e:
         logger.error("=" * 80)
         logger.error(f"[ROUTER] POST /backfillEventsTable FAILED")
-        logger.error(f"[ROUTER] Exception: {type(e).__name__}: {str(e)}")
         logger.error("=" * 80)
 
-        logger.error(
-            f"POST /backfillEventsTable failed: {str(e)}",
-            extra={
-                'endpoint': 'POST /backfillEventsTable',
-                'phase': 'error',
-                'elapsed_ms': 0,
-                'counters': {},
-                'progress': {},
-                'rate': {},
-                'batch': {},
-                'warn': []
-            },
-            exc_info=True
-        )
+        log_error(logger, "POST /backfillEventsTable failed", exception=e)
         raise HTTPException(status_code=500, detail=str(e))

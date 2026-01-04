@@ -4257,27 +4257,357 @@ if fair_value and current_price:
 
 **이것은 FMP API의 제한사항**이며, 근본적 해결 불가
 
-### I-41-G: 영향받는 파일
+### I-41-G: 선택적 메트릭 업데이트 기능 (Part 2)
+
+**사용자 요구사항 (추가)**:
+> "테이블에 값을 효율적으로 채워넣기 위해 txn_events 테이블의 config_lv2_metric 테이블의 id별로 파라미터에 값을 입력하면
+> 해당하는 값만 overwrite 하거나 null 값만 업데이트 하거나 입력한 ticker에 대해서만 엔드포인트를 실행할 수 있도록"
+
+**1. API 파라미터 추가** (`backend/src/models/request_models.py:247-303`)
+
+```python
+class BackfillEventsTableQueryParams(BaseModel):
+    # ... 기존 파라미터 ...
+
+    metrics: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. Use this for selective metric updates. (I-41)"
+    )
+    overwrite_metrics: bool = Field(
+        default=False,
+        alias="overwriteMetrics",
+        description="If false, update only NULL metric values. If true, recalculate and overwrite all specified metrics. (I-41)"
+    )
+
+    def get_metrics_list(self) -> Optional[List[str]]:
+        """
+        Parse metrics parameter into a list of metric IDs.
+
+        Returns:
+            List of metric IDs, or None if metrics parameter is not provided
+
+        Example:
+            'priceQuantitative,PER,PBR' -> ['priceQuantitative', 'PER', 'PBR']
+        """
+        if self.metrics is None:
+            return None
+
+        # Remove brackets if present and split by comma
+        metrics_str = self.metrics.strip()
+        if metrics_str.startswith('[') and metrics_str.endswith(']'):
+            metrics_str = metrics_str[1:-1]
+
+        # Split by comma and clean up whitespace
+        metrics_list = [m.strip() for m in metrics_str.split(',') if m.strip()]
+
+        return metrics_list if metrics_list else None
+```
+
+**2. 파라미터 전달 체인**
+
+```python
+# backend/src/routers/events.py:133-150
+@router.post("/backfillEventsTable")
+async def backfill_events_table(params: BackfillEventsTableQueryParams = Depends()):
+    # Parse metrics list (I-41)
+    metrics_list = params.get_metrics_list()
+
+    result = await valuation_service.calculate_valuations(
+        overwrite=params.overwrite,
+        from_date=params.from_date,
+        to_date=params.to_date,
+        tickers=ticker_list,
+        calc_fair_value=params.calc_fair_value,
+        metrics_list=metrics_list,  # I-41
+        overwrite_metrics=params.overwrite_metrics  # I-41
+    )
+```
+
+```python
+# backend/src/services/valuation_service.py:479-488
+async def calculate_valuations(
+    overwrite: bool = False,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    tickers: Optional[List[str]] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    calc_fair_value: bool = True,
+    metrics_list: Optional[List[str]] = None,  # I-41
+    overwrite_metrics: bool = False  # I-41
+) -> Dict[str, Any]:
+```
+
+```python
+# backend/src/services/valuation_service.py:40-51
+async def process_ticker_batch(
+    pool,
+    ticker: str,
+    ticker_events: List[Dict[str, Any]],
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    overwrite: bool = False,
+    total_events_count: int = 0,
+    completed_events_count: Dict[str, int] = None,
+    calc_fair_value: bool = False,
+    metrics_list: Optional[List[str]] = None,  # I-41
+    overwrite_metrics: bool = False  # I-41
+) -> Dict[str, Any]:
+```
+
+**3. MetricEngine custom_values 지원** (`backend/src/services/metric_engine.py`)
+
+```python
+def calculate_all(
+    self,
+    api_data: Dict[str, List[Dict[str, Any]]],
+    target_domains: Optional[List[str]] = None,
+    custom_values: Optional[Dict[str, Any]] = None  # I-41: Added
+) -> Dict[str, Any]:
+    """
+    Calculate all metrics for target domains with custom metric support.
+
+    Args:
+        api_data: Fetched API responses
+        target_domains: Domain filter (None = all)
+        custom_values: Pre-calculated values for custom metrics (I-41)
+
+    Returns:
+        Dict with metrics grouped by domain
+    """
+    if custom_values is None:
+        custom_values = {}
+
+    # ... calculation logic ...
+
+    value, failure_reason = self._calculate_metric_with_reason(
+        metric, api_data, calculated_values, custom_values
+    )
+
+def _calculate_metric_with_reason(
+    self,
+    metric: Dict[str, Any],
+    api_data: Dict[str, List[Dict[str, Any]]],
+    calculated_values: Dict[str, Any],
+    custom_values: Optional[Dict[str, Any]] = None
+) -> tuple:
+    """Calculate metric and return (value, failure_reason)."""
+
+    # I-41: Handle custom metrics
+    if source == 'custom':
+        if custom_values and metric_name in custom_values:
+            value = custom_values[metric_name]
+            logger.debug(f"[MetricEngine] ✓ Custom metric {metric_name} = {value}")
+            return value, None
+        else:
+            return None, f"Custom metric '{metric_name}' not provided"
+
+    # ... existing logic ...
+```
+
+**4. priceQuantitative 계산 통합** (`backend/src/services/valuation_service.py:180-257`)
+
+```python
+# Event processing loop in process_ticker_batch()
+for event in ticker_events:
+    ticker = event['ticker']
+    event_date = event['event_date']
+    source = event['source']
+    source_id = event['source_id']
+
+    try:
+        # I-41: Prepare custom_values for priceQuantitative metric
+        custom_values = {}
+
+        # I-41: Calculate priceQuantitative if needed
+        should_calc_price_quant = (
+            calc_fair_value or
+            (metrics_list is not None and 'priceQuantitative' in metrics_list)
+        )
+
+        if should_calc_price_quant:
+            # First, calculate basic quantitative metrics to get current values
+            temp_quant_result = await calculate_quantitative_metrics_fast(
+                ticker, event_date, ticker_api_cache, engine, target_domains
+            )
+
+            # Get current price for priceQuantitative calculation
+            temp_qual_result = await calculate_qualitative_metrics_fast(
+                pool, ticker, event_date, source, source_id, consensus_summary_cache
+            )
+            current_price = temp_qual_result.get('currentPrice')
+
+            if current_price:
+                # I-41: Calculate priceQuantitative metric
+                price_quant = await calculate_price_quantitative_metric(
+                    pool, ticker, event_date,
+                    temp_quant_result.get('value'),
+                    current_price,
+                    metrics_by_domain
+                )
+
+                if price_quant is not None:
+                    custom_values['priceQuantitative'] = price_quant
+
+        # Calculate quantitative metrics with custom values
+        quant_result = await calculate_quantitative_metrics_fast(
+            ticker, event_date, ticker_api_cache, engine, target_domains,
+            custom_values=custom_values  # I-41: Pass custom metrics
+        )
+
+        # Extract priceQuantitative from value_quantitative
+        value_quant = quant_result.get('value', {})
+        price_quant_value = None
+        if value_quant and 'valuation' in value_quant:
+            price_quant_value = value_quant['valuation'].get('priceQuantitative')
+
+        # Calculate position/disparity using priceQuantitative
+        if price_quant_value is not None and current_price:
+            if price_quant_value > current_price:
+                position_quant = 'long'
+            elif price_quant_value < current_price:
+                position_quant = 'short'
+            else:
+                position_quant = 'neutral'
+
+            disparity_quant = round((price_quant_value / current_price) - 1, 4)
+```
+
+**5. 선택적 JSONB 업데이트** (`backend/src/database/queries/metrics.py:239-402`)
+
+```python
+async def batch_update_event_valuations(
+    pool: asyncpg.Pool,
+    updates: List[Dict[str, Any]],
+    overwrite: bool = False,
+    metrics: Optional[List[str]] = None,  # I-41
+    overwrite_metrics: bool = False  # I-41
+) -> int:
+    """
+    Batch update event valuations in txn_events.
+
+    Args:
+        metrics: Optional list of metric IDs to update (I-41). If specified, only these metrics
+                 are updated within value_quantitative JSONB.
+        overwrite_metrics: If True, overwrite specified metrics. If False, only update NULL
+                           values for specified metrics (I-41).
+    """
+
+    # I-41: Selective metric update support
+    if metrics is not None:
+        # Selective metric update mode (I-41)
+        # Deep merge specific metrics into value_quantitative JSONB
+        if overwrite_metrics:
+            # Overwrite mode: Deep merge, replacing specified metrics
+            query = """
+                UPDATE txn_events e
+                SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative
+                ...
+            """
+        else:
+            # Non-overwrite mode: Only merge if metric doesn't exist or is NULL
+            query = """
+                UPDATE txn_events e
+                SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative
+                ...
+            """
+    elif overwrite:
+        # Full replace mode
+        query = """
+            UPDATE txn_events e
+            SET value_quantitative = b.value_quantitative
+            ...
+        """
+    else:
+        # Partial update mode - only update NULL values
+        query = """
+            UPDATE txn_events e
+            SET value_quantitative = CASE
+                WHEN e.value_quantitative IS NULL THEN b.value_quantitative
+                ELSE e.value_quantitative
+            END
+            ...
+        """
+```
+
+**6. 사용법 예시**
+
+```bash
+# 1. priceQuantitative만 NULL 값 채우기 (기본 동작)
+POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=false
+
+# 2. priceQuantitative 강제 재계산 (모든 값 덮어쓰기)
+POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=true
+
+# 3. 특정 ticker의 priceQuantitative 업데이트
+POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative
+
+# 4. 여러 메트릭 동시 업데이트
+POST /backfillEventsTable?metrics=priceQuantitative,PER,PBR&overwriteMetrics=true
+
+# 5. 날짜 범위 + 선택적 메트릭
+POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&metrics=priceQuantitative
+```
+
+### I-41-H: 영향받는 파일 (최종)
 
 | 파일 | 변경 내용 | 상태 |
 |------|-----------|------|
-| `backend/scripts/add_priceQuantitative_metric.sql` | 메트릭 정의 INSERT | ✅ 작성 완료 |
-| `backend/DESIGN_priceQuantitative_metric.md` | 설계 문서 | ✅ 작성 완료 |
-| `history/ISSUE_priceQuantitative_MISSING.md` | 이슈 분석 문서 | ✅ 작성 완료 |
-| `backend/src/services/metric_engine.py` | source='custom' 지원 | ⏳ TODO |
-| `backend/src/services/valuation_service.py` | 메트릭 엔진 통합 | ⏳ TODO |
-| `backend/src/models/request_models.py` | calcFairValue 제거 | ⏳ TODO (I-41 배포 후) |
+| `backend/scripts/add_priceQuantitative_metric.sql` | 메트릭 정의 INSERT | ✅ 완료 |
+| `backend/DESIGN_priceQuantitative_metric.md` | 설계 문서 | ✅ 완료 |
+| `history/ISSUE_priceQuantitative_MISSING.md` | 이슈 분석 문서 | ✅ 완료 |
+| `backend/src/services/metric_engine.py` | source='custom' 지원, custom_values 파라미터 | ✅ 완료 |
+| `backend/src/services/valuation_service.py` | 메트릭 엔진 통합, 파라미터 전달 | ✅ 완료 |
+| `backend/src/database/queries/metrics.py` | 선택적 JSONB 업데이트 | ✅ 완료 |
+| `backend/src/models/request_models.py` | metrics, overwriteMetrics 파라미터 추가 | ✅ 완료 |
+| `backend/src/routers/events.py` | 파라미터 파싱 및 전달 | ✅ 완료 |
 
-### I-41-H: 다음 단계
+### I-41-I: 최종 검증 사항
+
+**테스트 시나리오**:
+
+1. **priceQuantitative 계산 검증**:
+   ```bash
+   # AAPL에 대해 priceQuantitative 계산
+   POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative
+
+   # 검증: txn_events.value_quantitative에서 priceQuantitative 확인
+   SELECT value_quantitative->'valuation'->'priceQuantitative'
+   FROM txn_events
+   WHERE ticker = 'AAPL' LIMIT 5;
+   ```
+
+2. **선택적 업데이트 검증**:
+   ```sql
+   -- Before: PER만 있음
+   {"valuation": {"PER": 28.5}}
+
+   -- POST /backfillEventsTable?metrics=priceQuantitative
+
+   -- After: priceQuantitative 추가됨 (PER 유지)
+   {"valuation": {"PER": 28.5, "priceQuantitative": 185.0}}
+   ```
+
+3. **덮어쓰기 모드 검증**:
+   ```sql
+   -- Before
+   {"valuation": {"priceQuantitative": 180.0}}
+
+   -- POST /backfillEventsTable?metrics=priceQuantitative&overwriteMetrics=true
+
+   -- After: 재계산된 값으로 덮어씀
+   {"valuation": {"priceQuantitative": 185.0}}
+   ```
+
+### I-41-J: 다음 단계
 
 **즉시**:
 1. ✅ SQL 스크립트 실행: `add_priceQuantitative_metric.sql`
-2. ⏳ Metric engine에 `source='custom'` 핸들러 추가
-3. ⏳ Valuation service와 metric engine 통합
-4. ⏳ 테스트: POST /backfillEventsTable
+2. ✅ Metric engine에 `source='custom'` 핸들러 추가
+3. ✅ Valuation service와 metric engine 통합
+4. ✅ 선택적 메트릭 업데이트 기능 추가
+5. ⏳ 테스트: POST /backfillEventsTable
 
 **배포 후**:
-1. calcFairValue 파라미터 제거
+1. calcFairValue 파라미터 제거 (deprecated)
 2. 관련 문서 업데이트
 3. 사용자 공지
 
@@ -4288,7 +4618,725 @@ if fair_value and current_price:
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated)*
+### I-41-K: Part 3 - API 단순화 (overwriteMetrics 제거)
+
+**배경**:
+- Part 2에서 `metrics` + `overwriteMetrics` 파라미터로 선택적 업데이트 구현
+- 사용자 피드백: "overwriteMetrics는 이미 모든 엔드포인트에 overwrite 파라미터가 있어 이것을 사용하면 되는 것 아닌가요?"
+- 문제: 2개의 overwrite 관련 파라미터로 인한 UX 혼란
+
+**리팩토링 내용**:
+
+1. **request_models.py** (`backend/src/models/request_models.py:224-255`):
+```python
+# BEFORE
+overwrite: bool = Field(default=False, description="If false, update only NULL values...")
+metrics: Optional[str] = Field(default=None, description="Comma-separated metric IDs...")
+overwrite_metrics: bool = Field(default=False, description="When metrics specified...")
+
+# AFTER
+overwrite: bool = Field(
+    default=False,
+    description="If false, update only NULL values. If true, overwrite existing values. "
+                "When used with 'metrics' parameter: applies to specified metrics only. "
+                "When used without 'metrics': applies to all value_* JSONB fields."
+)
+metrics: Optional[str] = Field(
+    default=None,
+    description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). "
+                "If not specified, all metrics are calculated. When specified with overwrite=true, "
+                "overwrites existing values; with overwrite=false, updates only NULL values. (I-41)"
+)
+# overwrite_metrics 필드 완전 제거
+```
+
+2. **events.py** (`backend/src/routers/events.py:136-150`):
+```python
+# BEFORE
+logger.info(f"Parameters: overwrite={params.overwrite}, ..., overwriteMetrics={params.overwrite_metrics}")
+result = await valuation_service.calculate_valuations(
+    overwrite=params.overwrite,
+    overwrite_metrics=params.overwrite_metrics,
+    ...
+)
+
+# AFTER
+logger.info(f"Parameters: overwrite={params.overwrite}, ...")  # overwriteMetrics 제거
+result = await valuation_service.calculate_valuations(
+    overwrite=params.overwrite,  # overwrite_metrics 파라미터 제거
+    ...
+)
+```
+
+3. **valuation_service.py** (`backend/src/services/valuation_service.py:479-517`):
+```python
+# BEFORE
+async def calculate_valuations(
+    overwrite: bool = False,
+    overwrite_metrics: bool = False,
+    metrics_list: Optional[List[str]] = None,
+    ...
+) -> Dict[str, Any]:
+    """
+    Args:
+        overwrite: If False, update only NULL values...
+        overwrite_metrics: If True, overwrite existing metrics when metrics_list is specified...
+    """
+
+# AFTER
+async def calculate_valuations(
+    overwrite: bool = False,  # overwrite_metrics 제거
+    metrics_list: Optional[List[str]] = None,
+    ...
+) -> Dict[str, Any]:
+    """
+    Args:
+        overwrite: If False, update only NULL values. If True, overwrite existing values.
+                   When used with metrics_list: applies to specified metrics only.
+                   When used without metrics_list: applies to all value_* JSONB fields.
+        metrics_list: Optional list of metric IDs to recalculate (I-41)...
+
+    Example:
+        # Update only priceQuantitative metric for NULL values
+        >>> await calculate_valuations(metrics_list=['priceQuantitative'], overwrite=False)
+
+        # Recalculate PER and PBR for all events (overwrite existing values)
+        >>> await calculate_valuations(metrics_list=['PER', 'PBR'], overwrite=True)
+    """
+```
+
+4. **metrics.py** (`backend/src/database/queries/metrics.py:239-318`):
+```python
+# BEFORE
+async def batch_update_event_valuations(
+    pool: asyncpg.Pool,
+    updates: List[Dict[str, Any]],
+    overwrite: bool = False,
+    metrics: Optional[List[str]] = None,
+    overwrite_metrics: bool = False
+) -> int:
+    """..."""
+
+    if metrics is not None:
+        if overwrite_metrics:
+            # SQL for overwriting specified metrics
+            query = """UPDATE txn_events e SET value_quantitative = ..."""
+        else:
+            # SQL for NULL only specified metrics
+            query = """UPDATE txn_events e SET value_quantitative = ..."""
+    elif overwrite:
+        # Full replace
+    else:
+        # NULL only
+
+# AFTER
+async def batch_update_event_valuations(
+    pool: asyncpg.Pool,
+    updates: List[Dict[str, Any]],
+    overwrite: bool = False,  # overwrite_metrics 제거
+    metrics: Optional[List[str]] = None
+) -> int:
+    """
+    Args:
+        overwrite: If False, update only NULL values. If True, overwrite existing values.
+                   When used with metrics: applies to specified metrics only.
+                   When used without metrics: applies to all value_* JSONB fields.
+    """
+
+    if metrics is not None:
+        # Single query for selective updates - filtering handled at Python level
+        query = """
+            UPDATE txn_events e
+            SET value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative,
+            ...
+        """
+        # Whether it overwrites or fills NULLs is controlled by what's in b.value_quantitative
+    elif overwrite:
+        # Full replace
+    else:
+        # NULL only
+```
+
+5. **RequestsPage.jsx** (`frontend/src/pages/RequestsPage.jsx:674-740`):
+```javascript
+queryFields={[
+  {
+    key: 'overwrite',
+    type: 'boolean',
+    control: 'checkbox',
+    required: false,
+    description: 'If false, update only NULL values. If true, overwrite existing values. When used with metrics: applies to specified metrics only.',
+  },
+  // ...
+  {
+    key: 'calcFairValue',
+    label: 'Calc Fair Value [DEPRECATED]',
+    type: 'boolean',
+    control: 'checkbox',
+    required: false,
+    description: '[DEPRECATED - I-41] Use metrics=priceQuantitative instead',
+  },
+  {
+    key: 'metrics',
+    label: 'Metrics (comma-separated)',
+    type: 'text',
+    control: 'input',
+    required: false,
+    placeholder: 'priceQuantitative,PER,PBR',
+    description: 'Selective metric update: specify metric IDs to recalculate (I-41)',
+  },
+]}
+```
+
+6. **SetRequestsPage.jsx** (`frontend/src/pages/SetRequestsPage.jsx:125-132`):
+```javascript
+parameters: [
+  { name: 'overwrite', type: 'boolean', required: false,
+    description: 'If false, update only NULL values. If true, overwrite existing values. When used with metrics: applies to specified metrics only.'
+  },
+  { name: 'from_date', type: 'date', required: false },
+  { name: 'to_date', type: 'date', required: false },
+  { name: 'tickers', type: 'array', required: false },
+  { name: 'calcFairValue', type: 'boolean', required: false,
+    description: '[DEPRECATED - I-41] Use metrics=priceQuantitative instead'
+  },
+  { name: 'metrics', type: 'string', required: false,
+    description: 'Comma-separated metric IDs (e.g., priceQuantitative,PER,PBR). Selective metric update (I-41)'
+  },
+]
+```
+
+**단순화된 동작 매트릭스**:
+```
+metrics          | overwrite | 동작
+-----------------|-----------|---------------------------------------------
+None             | false     | 전체 필드 NULL만 채우기
+None             | true      | 전체 필드 강제 덮어쓰기
+'priceQuant'     | false     | priceQuantitative만 NULL 채우기
+'priceQuant'     | true      | priceQuantitative만 강제 덮어쓰기
+'PER,PBR'        | false     | PER,PBR만 NULL 채우기 (동시)
+'PER,PBR'        | true      | PER,PBR만 강제 덮어쓰기 (동시)
+```
+
+**사용 예시**:
+```bash
+# NULL 값만 채우기 (기본 동작)
+POST /backfillEventsTable?metrics=priceQuantitative
+
+# 강제 재계산 (기존 값 덮어쓰기)
+POST /backfillEventsTable?metrics=priceQuantitative&overwrite=true
+
+# 여러 메트릭 동시 업데이트
+POST /backfillEventsTable?tickers=AAPL,MSFT&metrics=PER,PBR,PSR&overwrite=false
+```
+
+**수정된 파일**:
+- `backend/src/models/request_models.py`: overwrite_metrics 제거, overwrite/metrics description 업데이트
+- `backend/src/routers/events.py`: overwrite_metrics 파라미터 제거
+- `backend/src/services/valuation_service.py`: overwrite_metrics 파라미터 제거 (2개 함수)
+- `backend/src/database/queries/metrics.py`: SQL 로직 단순화
+- `frontend/src/pages/RequestsPage.jsx`: 파라미터 description 업데이트
+- `frontend/src/pages/SetRequestsPage.jsx`: endpoint flow 파라미터 업데이트
+
+**결과**:
+- ✅ API 파라미터 개수 감소 (3개 → 2개)
+- ✅ 직관적인 동작 (2×2 매트릭스)
+- ✅ 기존 엔드포인트와 일관된 파라미터 네이밍
+- ✅ 코드 복잡도 감소 (SQL 조건 분기 제거)
+
+---
+
+## I-42: fmp-stock-peers API schema mapping 오류 (🔄 진행중)
+
+### Part 1: Schema Mapping Error (✅ 완료)
+
+**문제 코드** (`backend/src/services/external_api.py:86`):
+```python
+# BEFORE - TypeError 발생
+def _apply_schema_mapping(self, data, schema):
+    reverse_schema = {v: k for k, v in schema.items()}  # ❌ TypeError: unhashable type: 'dict'
+    # schema.items() 중 일부 값이 dict인 경우 에러 발생
+```
+
+**원인**:
+- Database의 `config_lv1_api_list.schema`에 nested dict 구조 저장:
+  ```json
+  {
+    "ticker": "symbol",  // ✅ String mapping - OK
+    "peerTickers": {     // ❌ Dict mapping - TypeError!
+      "type": "array",
+      "items": {...}
+    }
+  }
+  ```
+- Python dict는 unhashable type이므로 dictionary key로 사용 불가
+
+**수정 코드 1** (`backend/src/services/external_api.py:64-149`):
+```python
+def _apply_schema_mapping(self, data: Any, schema: Dict[str, str]) -> Any:
+    """
+    Apply schema mapping to API response data.
+    Supports both simple string mappings and complex nested object/array mappings.
+    """
+    if not schema:
+        return data
+
+    # Handle case where schema is still a JSON string
+    import json
+    if isinstance(schema, str):
+        schema = json.loads(schema)
+
+    # Build reverse mapping for simple fields only
+    reverse_schema = {}      # String mappings: "symbol" -> "ticker"
+    nested_schemas = {}      # Complex mappings: {"type": "array", ...}
+
+    for internal_name, mapping_value in schema.items():
+        if isinstance(mapping_value, dict):
+            # This is a nested schema (for arrays/objects)
+            api_field = mapping_value.get('value')
+            if api_field:
+                nested_schemas[api_field] = {
+                    'internal_name': internal_name,
+                    'type': mapping_value.get('type'),
+                    'items': mapping_value.get('items', {})
+                }
+        elif isinstance(mapping_value, str):
+            # Simple string mapping
+            reverse_schema[mapping_value] = internal_name
+
+    def map_array_items(items: List[Any], item_schema: Dict[str, Any]) -> List[Any]:
+        """Map items in an array using the item schema."""
+        mapped_items = []
+        for item in items:
+            if isinstance(item, dict):
+                mapped_item = {}
+                for field_name, field_spec in item_schema.items():
+                    if isinstance(field_spec, dict):
+                        api_field_name = field_spec.get('value')
+                        if api_field_name and api_field_name in item:
+                            mapped_item[field_name] = item[api_field_name]
+                mapped_items.append(mapped_item)
+            else:
+                # Item is not a dict, keep as-is
+                mapped_items.append(item)
+        return mapped_items
+
+    def map_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Map a single item."""
+        mapped = {}
+
+        for api_field, value in item.items():
+            # Check if this is a nested field
+            if api_field in nested_schemas:
+                nested_info = nested_schemas[api_field]
+                internal_name = nested_info['internal_name']
+
+                if nested_info['type'] == 'array' and isinstance(value, list):
+                    # Map array items
+                    mapped[internal_name] = map_array_items(value, nested_info['items'])
+                else:
+                    # Keep as-is for other nested types
+                    mapped[internal_name] = value
+            else:
+                # Simple field mapping
+                internal_field = reverse_schema.get(api_field, api_field)
+                mapped[internal_field] = value
+
+        return mapped
+
+    if isinstance(data, list):
+        return [map_item(item) for item in data]
+    elif isinstance(data, dict):
+        return map_item(data)
+    else:
+        return data
+```
+
+**수정 코드 2** (`backend/src/services/valuation_service.py:1931-1967`):
+```python
+async def get_peer_tickers(ticker: str) -> List[str]:
+    """
+    fmp-stock-peers API를 사용하여 동종 업종 티커 목록을 조회합니다.
+    """
+    try:
+        async with FMPAPIClient() as fmp_client:
+            response = await fmp_client.call_api('fmp-stock-peers', {'ticker': ticker})
+
+            if not response or len(response) == 0:
+                logger.warning(f"[I-36] No peer tickers found for {ticker}")
+                return []
+
+            # BEFORE - Nested structure expected:
+            # for item in response:
+            #     peer_list = item.get('peerTickers', [])  # ❌ API doesn't return this
+            #     for peer in peer_list:
+            #         peer_ticker = peer['symbol']
+
+            # AFTER - Flat list structure (actual API response):
+            peer_tickers = []
+            for item in response:
+                if isinstance(item, dict):
+                    # Get ticker from mapped field name
+                    peer_ticker = item.get('ticker') or item.get('symbol')
+                    if peer_ticker and peer_ticker != ticker:  # Exclude base ticker
+                        peer_tickers.append(peer_ticker)
+
+            logger.info(f"[I-36] Found {len(peer_tickers)} peer tickers for {ticker}: {peer_tickers[:5]}...")
+            return peer_tickers
+
+    except Exception as e:
+        logger.error(f"[I-36] Failed to get peer tickers for {ticker}: {e}", exc_info=True)
+        return []
+```
+
+**Database 수정**:
+```python
+# Execute SQL or Python script
+import asyncio
+from src.database.connection import db_pool
+
+async def fix_schema():
+    pool = await db_pool.get_pool()
+    conn = await pool.acquire()
+
+    new_schema = {
+        'ticker': 'symbol',
+        'companyName': 'companyName',
+        'price': 'price',
+        'mktCap': 'mktCap'
+    }
+
+    await conn.execute('''
+        UPDATE config_lv1_api_list
+        SET schema = $1::jsonb
+        WHERE id = 'fmp-stock-peers'
+    ''', json.dumps(new_schema))
+
+    await pool.release(conn)
+    await pool.close()
+
+asyncio.run(fix_schema())
+```
+
+**검증 결과**:
+```bash
+# Test 1: API Call
+$ python backend/test_rgti_peers_api.py
+[OK] Found 9 peers: ['BILI', 'CACI', 'DUOL', 'IONQ', 'QBTS', 'QXO', 'SAIL', 'SNX', 'ZBRA']
+
+# Test 2: Sector Averages
+$ python backend/test_sector_averages.py
+[OK] Sector averages: {'PER': 20.148975226608535, 'PBR': 3.8740351157599813}
+SUCCESS: Calculated sector averages for 2 metrics
+  - PER: 20.15
+  - PBR: 3.87
+```
+
+---
+
+### Part 2: Database 저장 실패 (🔄 조사 중)
+
+**현상**:
+- Part 1 수정 후 peer ticker 조회 및 fair value 계산은 성공
+- 하지만 `POST /backfillEventsTable?overwrite=true&tickers=RGTI` 실행 후에도 `priceQuantitative`가 NULL
+
+**Database 조회 결과**:
+```sql
+SELECT
+    event_date::date,
+    value_quantitative->'valuation'->>'priceQuantitative' as price_quant,
+    position_quantitative,
+    disparity_quantitative
+FROM txn_events
+WHERE ticker = 'RGTI' AND source = 'consensus'
+ORDER BY event_date DESC
+LIMIT 5;
+
+-- Result:
+--   2025-12-17 | NULL | NULL | NULL
+--   2025-12-16 | NULL | NULL | NULL
+--   2025-12-11 | NULL | NULL | NULL
+```
+
+**조사 항목**:
+1. ✅ Fair value 계산 성공 여부 확인:
+   - `calculate_price_quantitative_metric()` 반환값 확인
+   - `custom_values` 딕셔너리 구성 확인
+
+2. 🔄 `custom_values` 전달 경로 추적:
+   - Line 204-212: `calculate_price_quantitative_metric()` 호출
+   - Line 212: `custom_values['priceQuantitative'] = price_quant` 할당
+   - Line 216-219: `calculate_quantitative_metrics_fast()` 호출 시 전달
+   - Line 957: `engine.calculate_all(api_data_filtered, target_domains, custom_values)` 전달
+   - 🔄 DB UPDATE까지 전달되는지 확인 필요
+
+3. 🔄 JSONB merge 연산 검증:
+   - `batch_update_event_valuations()` 함수의 UPDATE 쿼리 확인
+   - `value_quantitative = COALESCE(e.value_quantitative, '{}'::jsonb) || b.value_quantitative`
+   - custom_values가 올바른 domain 구조로 포함되는지 확인
+
+4. 🔄 DB UPDATE 실행 여부 확인:
+   - RETURNING 절 로그 확인
+   - UPDATE된 row 수 확인
+
+**조사 결과**:
+1. ✅ custom_values 전달 로직 검증 완료:
+   - `process_ticker_batch()` → `calculate_quantitative_metrics_fast()` 정상 전달
+   - `engine.calculate_all()` → custom_values 정상 처리
+   - Engine output: Flat structure 확인
+
+2. ✅ **근본 원인 발견**: Formatter가 데이터베이스 저장 전에 호출됨
+   - `valuation_service.py:264`: `format_value_quantitative()` 호출
+   - Engine의 flat structure → nested structure 변환
+   - 데이터베이스 쿼리 경로 불일치 발생
+
+3. ✅ 해결 방법: **Formatter 호출 제거** (옵션 B 채택)
+   - `valuation_service.py:263-287`: Formatter 호출 제거
+   - `valuation_service.py:15-16`: Formatter imports 주석 처리
+   - `metrics.py:274-279`: Debug logging 추가
+   - Raw engine output 직접 저장으로 flat structure 유지
+
+---
+
+### Part 2: Database 저장 실패 해결 (✅ 완료)
+
+#### 문제점
+
+**데이터베이스 구조 확인**:
+```sql
+-- 실제 저장된 구조 (BROKEN):
+{
+  "valuation": {
+    "values": {
+      "priceQuantitative": null,
+      "PER": -19.09,
+      "PSR": 894.28,
+      "PBR": 18.02,
+      "evEBITDA": -17.25
+    },
+    "dateInfo": {
+      "count": 4,
+      "calcType": "TTM_fullQuarter",
+      "metrics": {...}
+    }
+  }
+}
+
+-- 기대하는 구조 (CORRECT):
+{
+  "valuation": {
+    "priceQuantitative": 123.45,
+    "PER": -19.09,
+    "PSR": 894.28,
+    "PBR": 18.02,
+    "evEBITDA": -17.25,
+    "_meta": {
+      "count": 4,
+      "calcType": "TTM_fullQuarter",
+      "sources": {...}
+    }
+  }
+}
+```
+
+**데이터베이스 쿼리 실패**:
+```python
+# 쿼리 경로 불일치
+current_price = await pool.fetchval('''
+    SELECT value_qualitative->>'currentPrice'  -- NULL! (실제: value_qualitative->'values'->>'currentPrice')
+    FROM txn_events
+    WHERE ticker = $1 AND event_date = $2
+''', ticker, event_date)
+
+# Cascading failure
+if not current_price:
+    # priceQuantitative 계산 차단됨
+    return None
+```
+
+#### 해결 방법
+
+**1. valuation_service.py - Formatter 호출 제거 (Line 263-287)**:
+```python
+# I-42: DON'T format values for database storage
+# The formatter creates nested structure (values/dateInfo) which breaks database queries
+# Formatting should only be done for API responses, not database storage
+#
+# OLD CODE (BROKEN):
+# formatted_quant = format_value_quantitative(quant_result.get('value'))
+# formatted_qual = format_value_qualitative(qual_result.get('value'))
+#
+# NEW CODE: Store raw values directly
+value_quant = quant_result.get('value')
+value_qual = qual_result.get('value')
+
+# I-42 DEBUG: Log what we're about to store
+if value_quant and 'valuation' in value_quant:
+    val_keys = list(value_quant['valuation'].keys())[:5]
+    logger.info(f"[I-42 DEBUG] value_quant valuation keys: {val_keys}")
+    if 'priceQuantitative' in value_quant['valuation']:
+        logger.info(f"[I-42 DEBUG] priceQuantitative value: {value_quant['valuation']['priceQuantitative']}")
+
+# Prepare batch update
+batch_updates.append({
+    'ticker': ticker,
+    'event_date': event_date,
+    'source': source,
+    'source_id': source_id,
+    'value_quantitative': value_quant,  # Flat structure preserved!
+    'value_qualitative': value_qual,
+    'position_quantitative': position_quant,
+    'position_qualitative': position_qual,
+    'disparity_quantitative': disparity_quant,
+    'disparity_qualitative': disparity_qual
+})
+```
+
+**2. valuation_service.py - Formatter imports 주석 처리 (Line 15-16)**:
+```python
+# I-42: Removed formatter imports - formatting should only be done in API responses, not database storage
+# from .utils.response_formatter import format_value_quantitative, format_value_qualitative
+```
+
+**3. metrics.py - Debug logging 추가 (Line 274-279)**:
+```python
+import logging
+logger = logging.getLogger("alsign")
+
+async def batch_update_event_valuations(...):
+    ...
+    async with pool.acquire() as conn:
+        # I-42 DEBUG: Log what we're storing
+        if updates and len(updates) > 0:
+            first_upd = updates[0]
+            val_quant = first_upd.get('value_quantitative')
+            if val_quant and isinstance(val_quant, dict) and 'valuation' in val_quant:
+                logger.info(f"[I-42 DB DEBUG] Storing valuation keys: {list(val_quant['valuation'].keys())[:6]}")
+```
+
+#### 검증
+
+**테스트 스크립트 생성 - test_engine_output.py**:
+```python
+"""Test what the metric engine actually returns."""
+import asyncio
+import json
+from src.database.connection import db_pool
+from src.database.queries import metrics as metrics_queries
+from src.services.metric_engine import MetricCalculationEngine
+from src.services.external_api import FMPAPIClient
+from datetime import datetime
+
+async def test():
+    pool = await db_pool.get_pool()
+
+    # Load metrics
+    metrics_by_domain = await metrics_queries.select_metric_definitions(pool)
+    transforms = await metrics_queries.select_metric_transforms(pool)
+
+    # Initialize engine
+    engine = MetricCalculationEngine(metrics_by_domain, transforms)
+    engine.build_dependency_graph()
+    engine.topological_sort()
+
+    # Fetch API data for RGTI
+    ticker = 'RGTI'
+    event_date = datetime(2025, 12, 17)
+    api_cache = {}
+
+    async with FMPAPIClient() as fmp_client:
+        for api_id in engine.get_required_apis():
+            params = {'ticker': ticker}
+            if 'income-statement' in api_id or 'balance-sheet' in api_id:
+                params['period'] = 'quarter'
+                params['limit'] = 20
+            elif 'historical-market-cap' in api_id:
+                params['fromDate'] = '2000-01-01'
+                params['toDate'] = event_date.strftime('%Y-%m-%d')
+            response = await fmp_client.call_api(api_id, params)
+            if response:
+                api_cache[api_id] = response
+
+    # Calculate with custom values
+    custom_values = {'priceQuantitative': 123.45}  # Test value
+
+    result = engine.calculate_all(api_cache, ['valuation'], custom_values)
+
+    print("=== ENGINE OUTPUT ===")
+    print(json.dumps(result, indent=2))
+
+    if 'valuation' in result:
+        print("\n=== VALUATION KEYS ===")
+        print(list(result['valuation'].keys()))
+
+        if 'values' in result['valuation']:
+            print("\n**ERROR**: Result has nested 'values' key!")
+        else:
+            print("\n**OK**: Result has flat structure")
+
+        if 'priceQuantitative' in result['valuation']:
+            print(f"\npriceQuantitative: {result['valuation']['priceQuantitative']}")
+        else:
+            print("\n**ERROR**: priceQuantitative NOT in result!")
+
+    await pool.close()
+
+if __name__ == '__main__':
+    asyncio.run(test())
+```
+
+**실행 결과**:
+```bash
+$ cd backend && python test_engine_output.py
+
+=== ENGINE OUTPUT ===
+{
+  "valuation": {
+    "priceQuantitative": 123.45,
+    "PER": -19.095312852600266,
+    "PSR": 894.2844115292233,
+    "PBR": 18.023934259573025,
+    "evEBITDA": -17.24931895552705,
+    "_meta": {
+      "calcType": "TTM_fullQuarter",
+      "count": 4,
+      "sources": {...}
+    }
+  }
+}
+
+=== VALUATION KEYS ===
+['priceQuantitative', 'PER', 'PSR', 'PBR', 'evEBITDA', '_meta']
+
+**OK**: Result has flat structure
+
+priceQuantitative: 123.45
+```
+
+✅ **검증 완료**:
+- Engine이 flat structure 반환 확인
+- priceQuantitative 정상 포함
+- Nested 'values' key 없음
+- 데이터베이스 쿼리 경로 호환 가능
+
+#### 최종 통합 테스트
+
+**다음 단계**:
+1. ✅ 코드 수정 완료
+2. ⏳ 서버 재시작 (코드 변경 로드)
+3. ⏳ RGTI 이벤트 재생성
+4. ⏳ `POST /backfillEventsTable?overwrite=true&tickers=RGTI` 실행
+5. ⏳ 데이터베이스 구조 확인:
+   ```sql
+   SELECT value_quantitative->'valuation'->>'priceQuantitative' as price_quant
+   FROM txn_events
+   WHERE ticker = 'RGTI' AND event_date = '2025-12-17 11:23:25+00:00'
+   ```
+6. ⏳ priceQuantitative 값 확인 (NULL이 아니어야 함)
+
+---
+
+*최종 업데이트: 2026-01-02 KST (I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결)*
+*이전 업데이트: I-41 Part 1+2+3 구현 완료 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화, I-36/I-38/I-40 deprecated)*
 *설계 문서: backend/DESIGN_priceQuantitative_metric.md*
 *이슈 분석: history/ISSUE_priceQuantitative_MISSING.md*
-*세션 요약: history/SESSION_2026-01-02_I39_I40_SUMMARY.md*

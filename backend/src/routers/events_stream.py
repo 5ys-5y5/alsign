@@ -11,6 +11,7 @@ from typing import Dict
 
 from ..models.request_models import SetEventsTableQueryParams, BackfillEventsTableQueryParams
 from ..services import events_service, valuation_service
+from ..utils.logging_utils import log_error, log_warning
 
 logger = logging.getLogger("alsign")
 
@@ -146,19 +147,7 @@ async def stream_set_events_table(
 
                 except ValueError as e:
                     # Schema not found or invalid table name
-                    logger.error(
-                        f"Validation error: {str(e)}",
-                        extra={
-                            'endpoint': 'POST /setEventsTable',
-                            'phase': 'validation',
-                            'elapsed_ms': int((time.time() - start_time) * 1000),
-                            'counters': {},
-                            'progress': {},
-                            'rate': {},
-                            'batch': {},
-                            'warn': []
-                        }
-                    )
+                    log_error(logger, "Validation error in POST /setEventsTable", exception=e)
                     await log_queue.put(json.dumps({
                         'type': 'error',
                         'error': str(e)
@@ -328,7 +317,11 @@ async def stream_backfill_events_table(
                         }))
                         return
 
+                    # Parse metrics list (I-41)
+                    metrics_list = params.get_metrics_list()
+
                     logger.info(f"[STREAM] Calling valuation_service.calculate_valuations")
+                    logger.info(f"[STREAM] Parameters: calc_fair_value={params.calc_fair_value}, metrics={metrics_list}")
 
                     # Execute valuation calculation with cancel event
                     result = await valuation_service.calculate_valuations(
@@ -336,7 +329,9 @@ async def stream_backfill_events_table(
                         from_date=params.from_date,
                         to_date=params.to_date,
                         tickers=ticker_list,
-                        cancel_event=cancel_event
+                        cancel_event=cancel_event,
+                        calc_fair_value=params.calc_fair_value,  # FIX: Pass this parameter!
+                        metrics_list=metrics_list  # FIX: Pass this parameter!
                     )
 
                     logger.info(f"[STREAM] valuation_service.calculate_valuations completed")

@@ -175,7 +175,7 @@ async def update_consensus_phase2(
             # Build response_key.prev
             response_key_prev = upd.get('response_key_prev')
 
-            result = await conn.execute(
+            result_row = await conn.fetchrow(
                 """
                 UPDATE evt_consensus
                 SET
@@ -188,6 +188,7 @@ async def update_consensus_phase2(
                         $5::jsonb
                     )
                 WHERE id = $1
+                RETURNING id, ticker, published_date, analyst_name, analyst_company
                 """,
                 upd['id'],
                 upd.get('price_target_prev'),
@@ -196,8 +197,14 @@ async def update_consensus_phase2(
                 json.dumps(response_key_prev) if response_key_prev else None
             )
 
-            if "UPDATE" in result:
+            if result_row:
                 update_count += 1
+                logger.info(
+                    f"[DB UPDATE] evt_consensus ID={result_row['id']}, "
+                    f"ticker={result_row['ticker']}, "
+                    f"published_date={result_row['published_date'].date() if result_row['published_date'] else None}, "
+                    f"analyst={result_row['analyst_name']} ({result_row['analyst_company']})"
+                )
 
     return update_count
 
@@ -388,17 +395,26 @@ async def update_target_summary_batch(
         ids = [u['id'] for u in updates]
         summaries = [json.dumps(u['target_summary']) if u['target_summary'] else None for u in updates]
         
-        result = await conn.execute(
+        updated_rows = await conn.fetch(
             """
             UPDATE evt_consensus AS e
             SET target_summary = u.summary::jsonb
             FROM UNNEST($1::uuid[], $2::text[]) AS u(id, summary)
             WHERE e.id = u.id
+            RETURNING e.id, e.ticker, e.published_date, e.analyst_name, e.analyst_company
             """,
             ids,
             summaries
         )
-        
-        # Extract count from "UPDATE N"
-        count = int(result.split()[-1]) if result else 0
-        return count
+
+        # Log updated rows
+        if updated_rows:
+            logger.info(f"[DB UPDATE] Updated {len(updated_rows)} evt_consensus target_summary rows:")
+            for row in updated_rows:
+                logger.info(
+                    f"  - ID={row['id']}, ticker={row['ticker']}, "
+                    f"published_date={row['published_date'].date() if row['published_date'] else None}, "
+                    f"analyst={row['analyst_name']} ({row['analyst_company']})"
+                )
+
+        return len(updated_rows)
