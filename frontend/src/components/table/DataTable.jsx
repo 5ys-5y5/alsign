@@ -220,6 +220,8 @@ function applySort(data, sortConfig, columns) {
  * @param {boolean} [props.enableRowExpand] - Enable row expand on click
  * @param {boolean} [props.enableCheckboxes] - Enable row selection with checkboxes
  * @param {boolean} [props.enableFooterStats] - Enable footer statistics row
+ * @param {boolean} [props.enableServerSideSort] - If true, skip client-side sorting (data is already sorted by server)
+ * @param {boolean} [props.enableServerSideFilter] - If true, skip client-side filtering (data is already filtered by server)
  * @param {Function} [props.onSelectionChange] - Callback when row selection changes (receives Set of row IDs)
  * @returns {JSX.Element} Data table component
  */
@@ -236,6 +238,8 @@ export default function DataTable({
   enableRowExpand = false,
   enableCheckboxes = false,
   enableFooterStats = false,
+  enableServerSideSort = false,
+  enableServerSideFilter = false,
   onSelectionChange,
 }) {
   // Track expanded rows
@@ -258,10 +262,16 @@ export default function DataTable({
   // Apply filters and sorting
   const processedData = useMemo(() => {
     let result = data;
-    result = applyFilters(result, filters, columns);
-    result = applySort(result, sortConfig, columns);
+    // Only apply client-side filtering if server-side filtering is not enabled
+    if (!enableServerSideFilter) {
+      result = applyFilters(result, filters, columns);
+    }
+    // Only apply client-side sorting if server-side sorting is not enabled
+    if (!enableServerSideSort) {
+      result = applySort(result, sortConfig, columns);
+    }
     return result;
-  }, [data, filters, sortConfig, columns]);
+  }, [data, filters, sortConfig, columns, enableServerSideSort, enableServerSideFilter]);
 
   // Handle sort click: null → asc → desc → null
   const handleSort = (columnKey) => {
@@ -413,8 +423,6 @@ export default function DataTable({
       <div className="table-scroll-container">
         {loading ? (
           <div className="loading">Loading...</div>
-        ) : processedData.length === 0 ? (
-          <div className="empty-state">No data to display</div>
         ) : (
           <div className="table-wrapper">
             <table>
@@ -451,7 +459,21 @@ export default function DataTable({
                 </tr>
               </thead>
               <tbody>
-                {processedData.map((row, rowIndex) => {
+                {processedData.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={visibleColumns.length + (enableCheckboxes ? 1 : 0)}
+                      style={{
+                        textAlign: 'center',
+                        padding: 'var(--space-4)',
+                        color: 'var(--text-dim)'
+                      }}
+                    >
+                      No data to display
+                    </td>
+                  </tr>
+                ) : (
+                  processedData.map((row, rowIndex) => {
                   const isExpanded = expandedRows.has(row.id);
                   const isSelected = selectedRows.has(row.id);
 
@@ -501,9 +523,10 @@ export default function DataTable({
                       )}
                     </React.Fragment>
                   );
-                })}
+                })
+                )}
               </tbody>
-              {enableFooterStats && !loading && processedData.length > 0 && (
+              {enableFooterStats && !loading && (
                 <tfoot>
                   <tr>
                     {enableCheckboxes && <td style={{ width: '50px' }}></td>}

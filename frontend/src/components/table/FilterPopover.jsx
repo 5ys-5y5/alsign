@@ -7,6 +7,7 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 
 /**
  * Filter icon SVG (funnel shape)
@@ -55,6 +56,7 @@ export default function FilterPopover({
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [localValue, setLocalValue] = useState(value || '');
+  const [popoverPosition, setPopoverPosition] = useState({ top: 0, left: 0 });
   const popoverRef = useRef(null);
   const buttonRef = useRef(null);
 
@@ -64,6 +66,17 @@ export default function FilterPopover({
   useEffect(() => {
     setLocalValue(value || '');
   }, [value]);
+
+  // Calculate popover position when opened
+  useEffect(() => {
+    if (isOpen && buttonRef.current) {
+      const buttonRect = buttonRef.current.getBoundingClientRect();
+      setPopoverPosition({
+        top: buttonRect.bottom + 4, // 4px margin
+        left: buttonRect.right - 256, // 256px = filter panel width, align right edge
+      });
+    }
+  }, [isOpen]);
 
   // Close popover on ESC key
   useEffect(() => {
@@ -86,6 +99,7 @@ export default function FilterPopover({
         isOpen &&
         popoverRef.current &&
         !popoverRef.current.contains(e.target) &&
+        buttonRef.current &&
         !buttonRef.current.contains(e.target)
       ) {
         setIsOpen(false);
@@ -93,8 +107,15 @@ export default function FilterPopover({
     };
 
     if (isOpen) {
-      document.addEventListener('mousedown', handleClickOutside);
-      return () => document.removeEventListener('mousedown', handleClickOutside);
+      // Delay adding the listener to prevent immediate closure
+      const timeoutId = setTimeout(() => {
+        document.addEventListener('mousedown', handleClickOutside);
+      }, 100);
+
+      return () => {
+        clearTimeout(timeoutId);
+        document.removeEventListener('mousedown', handleClickOutside);
+      };
     }
   }, [isOpen]);
 
@@ -173,12 +194,61 @@ export default function FilterPopover({
     ? `Filter ${columnLabel} (active)`
     : `Filter ${columnLabel}`;
 
+  const popoverContent = isOpen ? (
+    <div
+      ref={popoverRef}
+      className="panel filter-panel open"
+      style={{
+        position: 'fixed',
+        top: `${popoverPosition.top}px`,
+        left: `${popoverPosition.left}px`,
+        zIndex: 1000,
+      }}
+    >
+      <div className="filter-panel-header">
+        <div className="filter-panel-title">Filter {columnLabel}</div>
+      </div>
+
+      <div className="filter-panel-body">
+        {renderFilterInput()}
+      </div>
+
+      <div
+        style={{
+          display: 'flex',
+          gap: 'var(--space-1)',
+          marginTop: 'var(--space-2)',
+          paddingTop: 'var(--space-2)',
+          borderTop: '1px solid var(--border)',
+        }}
+      >
+        <button
+          type="button"
+          className="btn btn-sm btn-primary"
+          onClick={handleApply}
+        >
+          Apply
+        </button>
+        <button
+          type="button"
+          className="btn btn-sm btn-outline"
+          onClick={handleReset}
+        >
+          Reset
+        </button>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div style={{ position: 'relative', display: 'inline-block' }}>
       <button
         ref={buttonRef}
         type="button"
-        onClick={() => setIsOpen(!isOpen)}
+        onClick={(e) => {
+          e.stopPropagation();
+          setIsOpen(!isOpen);
+        }}
         aria-label={ariaLabel}
         style={{
           background: 'none',
@@ -193,50 +263,7 @@ export default function FilterPopover({
         <FilterIcon active={hasActiveFilter} />
       </button>
 
-      {isOpen && (
-        <div
-          ref={popoverRef}
-          className="panel filter-panel open"
-          style={{
-            top: '100%',
-            right: 0,
-            marginTop: 'var(--space-1)',
-          }}
-        >
-          <div className="filter-panel-header">
-            <div className="filter-panel-title">Filter {columnLabel}</div>
-          </div>
-
-          <div className="filter-panel-body">
-            {renderFilterInput()}
-          </div>
-
-          <div
-            style={{
-              display: 'flex',
-              gap: 'var(--space-1)',
-              marginTop: 'var(--space-2)',
-              paddingTop: 'var(--space-2)',
-              borderTop: '1px solid var(--border)',
-            }}
-          >
-            <button
-              type="button"
-              className="btn btn-sm btn-primary"
-              onClick={handleApply}
-            >
-              Apply
-            </button>
-            <button
-              type="button"
-              className="btn btn-sm btn-outline"
-              onClick={handleReset}
-            >
-              Reset
-            </button>
-          </div>
-        </div>
-      )}
+      {popoverContent && createPortal(popoverContent, document.body)}
     </div>
   );
 }

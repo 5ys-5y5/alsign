@@ -321,7 +321,7 @@ async def stream_backfill_events_table(
                     metrics_list = params.get_metrics_list()
 
                     logger.info(f"[STREAM] Calling valuation_service.calculate_valuations")
-                    logger.info(f"[STREAM] Parameters: calc_fair_value={params.calc_fair_value}, metrics={metrics_list}")
+                    logger.info(f"[STREAM] Parameters: metrics={metrics_list}")
 
                     # Execute valuation calculation with cancel event
                     result = await valuation_service.calculate_valuations(
@@ -330,8 +330,7 @@ async def stream_backfill_events_table(
                         to_date=params.to_date,
                         tickers=ticker_list,
                         cancel_event=cancel_event,
-                        calc_fair_value=params.calc_fair_value,  # FIX: Pass this parameter!
-                        metrics_list=metrics_list  # FIX: Pass this parameter!
+                        metrics_list=metrics_list
                     )
 
                     logger.info(f"[STREAM] valuation_service.calculate_valuations completed")

@@ -289,7 +289,27 @@ async def get_events(
 
                 try:
                     # Extract price_trend data (JSONB with D-14 to D14)
-                    price_trend = row["price_trend"] or {}
+                    raw_price_trend = row["price_trend"]
+                    price_trend = {}
+
+                    # Parse based on type
+                    if isinstance(raw_price_trend, str):
+                        try:
+                            parsed = json.loads(raw_price_trend)
+                            # Check if parsed result is a dict
+                            if isinstance(parsed, dict):
+                                price_trend = parsed
+                            else:
+                                price_trend = {}
+                        except (json.JSONDecodeError, TypeError):
+                            price_trend = {}
+                    elif isinstance(raw_price_trend, dict):
+                        price_trend = raw_price_trend
+                    elif isinstance(raw_price_trend, list):
+                        # If it's a list, skip - we can't extract day offsets
+                        price_trend = {}
+                    else:
+                        price_trend = {}
 
                     # Helper function to extract day offset value
                     def get_day_value(day_offset: int) -> Optional[float]:
@@ -541,8 +561,8 @@ class BulkUpdateRequest(BaseModel):
     """Request model for bulk update events."""
 
     event_ids: List[str]
-    field: str  # "condition" or "position_quantitative" or "position_qualitative"
-    operation: str  # For condition: "append", "replace", "remove". For position: "set"
+    field: str  # "condition" or "position"
+    operation: str  # For condition: "append", "modify", "remove". For position: "set"
     value: Optional[str]  # The value to set/append/remove
 
 
@@ -559,8 +579,8 @@ async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
     Bulk update events.
 
     Supports:
-    - condition field: append (adds value with comma), replace (replaces entire value), remove (removes value from comma-separated list)
-    - position_quantitative/position_qualitative: set (sets to specified value: long/short/null/neutral)
+    - condition field: append (adds value with comma), modify (replaces entire value), remove (removes value from comma-separated list)
+    - position: set (sets to specified value: long/short/null/neutral)
     """
     logger.info(
         f"action=bulk_update_events phase=request_received "
@@ -569,7 +589,7 @@ async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
 
     try:
         # Validate field
-        allowed_fields = ["condition", "position_quantitative", "position_qualitative"]
+        allowed_fields = ["condition", "position"]
         if request.field not in allowed_fields:
             raise HTTPException(
                 status_code=400,
@@ -578,13 +598,13 @@ async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
 
         # Validate operation
         if request.field == "condition":
-            allowed_operations = ["append", "replace", "remove"]
+            allowed_operations = ["append", "modify", "remove"]
             if request.operation not in allowed_operations:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid operation for condition. Allowed: {', '.join(allowed_operations)}",
                 )
-        elif request.field in ["position_quantitative", "position_qualitative"]:
+        elif request.field == "position":
             allowed_operations = ["set"]
             if request.operation not in allowed_operations:
                 raise HTTPException(
@@ -615,8 +635,8 @@ async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
                         WHERE id = ANY($2::uuid[])
                     """
                     result = await conn.execute(update_query, request.value, request.event_ids)
-                elif request.operation == "replace":
-                    # Replace entire condition value
+                elif request.operation == "modify":
+                    # Modify (replace) entire condition value
                     update_query = """
                         UPDATE txn_events
                         SET condition = $1
@@ -650,13 +670,13 @@ async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
                 # Extract count from result
                 updated_count = int(result.split()[-1])
 
-            elif request.field in ["position_quantitative", "position_qualitative"]:
+            elif request.field == "position":
                 if request.operation == "set":
                     # Set position value (long/short/null/neutral)
                     position_value = None if request.value.lower() == "null" else request.value.lower()
-                    update_query = f"""
+                    update_query = """
                         UPDATE txn_events
-                        SET {request.field} = $1::position
+                        SET position = $1::position
                         WHERE id = ANY($2::uuid[])
                     """
                     result = await conn.execute(update_query, position_value, request.event_ids)

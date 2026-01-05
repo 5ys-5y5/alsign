@@ -5,7 +5,7 @@
  * Based on alsign/prompt/2_designSystem.ini request_contract.
  */
 
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useLog } from '../contexts/LogContext';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
@@ -515,17 +515,107 @@ export default function RequestsPage() {
   // Use global log context
   const { handleRequestStart, handleRequestComplete, handleLog } = useLog();
 
+  // State for selected endpoint
+  const [selectedEndpoint, setSelectedEndpoint] = useState('sourceData');
+
+  // State for header height to adjust sidebar position
+  const [headerHeight, setHeaderHeight] = useState(52);
+
+  // Endpoint list for navigation
+  const endpoints = [
+    { id: 'sourceData', title: 'GET /sourceData' },
+    { id: 'setEventsTable', title: 'POST /setEventsTable' },
+    { id: 'backfillEventsTable', title: 'POST /backfillEventsTable' },
+    { id: 'generatePriceTrends', title: 'POST /generatePriceTrends' },
+    { id: 'trades', title: 'POST /trades' },
+    { id: 'fillAnalyst', title: 'POST /fillAnalyst' }
+  ];
+
+  // Dynamically measure navigation height
+  useEffect(() => {
+    const measureNavHeight = () => {
+      const nav = document.querySelector('nav');
+      if (nav) {
+        setHeaderHeight(nav.offsetHeight);
+      }
+    };
+
+    measureNavHeight();
+    window.addEventListener('resize', measureNavHeight);
+    return () => window.removeEventListener('resize', measureNavHeight);
+  }, []);
+
   return (
-    <>
-      <header style={{ marginBottom: 'var(--space-4)' }}>
-        <h1>Requests</h1>
-        <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
-          Execute backend API requests
-        </p>
-      </header>
+    <div style={{ display: 'flex', minHeight: '100vh', position: 'relative' }}>
+      {/* Left Sidebar */}
+      <div style={{
+        width: '250px',
+        position: 'fixed',
+        top: `${headerHeight}px`,
+        left: 0,
+        height: `calc(100vh - ${headerHeight}px)`,
+        backgroundColor: '#f8fafc',
+        borderRight: '1px solid #e2e8f0',
+        overflowY: 'auto',
+        padding: 'var(--space-4)',
+        zIndex: 100
+      }}>
+        <h2 style={{
+          fontSize: 'var(--text-lg)',
+          fontWeight: 'var(--font-semibold)',
+          marginBottom: 'var(--space-4)',
+          color: '#1e293b'
+        }}>
+          Endpoints
+        </h2>
+        <nav style={{ marginTop: '20px' }}>
+          {endpoints.map((endpoint) => (
+            <button
+              key={endpoint.id}
+              onClick={() => setSelectedEndpoint(endpoint.id)}
+              style={{
+                display: 'block',
+                width: '100%',
+                textAlign: 'left',
+                padding: 'var(--space-2) var(--space-3)',
+                marginBottom: 'var(--space-1)',
+                backgroundColor: selectedEndpoint === endpoint.id ? '#3b82f6' : 'transparent',
+                color: selectedEndpoint === endpoint.id ? 'white' : '#475569',
+                border: 'none',
+                borderRadius: '10px',
+                cursor: 'pointer',
+                fontSize: 'var(--text-sm)',
+                fontWeight: selectedEndpoint === endpoint.id ? 'var(--font-semibold)' : 'normal',
+                transition: 'all 0.2s'
+              }}
+              onMouseEnter={(e) => {
+                if (selectedEndpoint !== endpoint.id) {
+                  e.target.style.backgroundColor = '#e2e8f0';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (selectedEndpoint !== endpoint.id) {
+                  e.target.style.backgroundColor = 'transparent';
+                }
+              }}
+            >
+              {endpoint.title}
+            </button>
+          ))}
+        </nav>
+      </div>
+
+      {/* Main Content */}
+      <div style={{ marginLeft: '250px', flex: 1, padding: 'var(--space-4)' }}>
+        <header style={{ marginBottom: 'var(--space-4)' }}>
+          <h1>Requests</h1>
+          <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
+            Execute backend API requests
+          </p>
+        </header>
 
         {/* GET /sourceData */}
-        <RequestForm
+        {selectedEndpoint === 'sourceData' && <RequestForm
           title="GET /sourceData"
           method="GET"
           path="/sourceData"
@@ -630,10 +720,10 @@ export default function RequestsPage() {
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
-        />
+        />}
 
         {/* POST /setEventsTable */}
-        <RequestForm
+        {selectedEndpoint === 'setEventsTable' && <RequestForm
           title="POST /setEventsTable"
           method="POST"
           path="/setEventsTable"
@@ -669,10 +759,10 @@ export default function RequestsPage() {
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
-        />
+        />}
 
         {/* POST /backfillEventsTable */}
-        <RequestForm
+        {selectedEndpoint === 'backfillEventsTable' && <RequestForm
           title="POST /backfillEventsTable"
           method="POST"
           path="/backfillEventsTable"
@@ -709,14 +799,6 @@ export default function RequestsPage() {
               placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
             },
             {
-              key: 'calcFairValue',
-              label: 'Calc Fair Value [DEPRECATED]',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: '[DEPRECATED - I-41] Use metrics=priceQuantitative instead',
-            },
-            {
               key: 'metrics',
               label: 'Metrics (comma-separated)',
               type: 'text',
@@ -737,10 +819,94 @@ export default function RequestsPage() {
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
-        />
+        />}
+
+        {/* POST /generatePriceTrends */}
+        {selectedEndpoint === 'generatePriceTrends' && <RequestForm
+          title="POST /generatePriceTrends"
+          method="POST"
+          path="/generatePriceTrends"
+          queryFields={[
+            {
+              key: 'overwrite',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: 'If false, update only NULL values. If true, overwrite existing values.',
+            },
+            {
+              key: 'from',
+              label: 'From Date',
+              type: 'date',
+              control: 'input',
+              required: false,
+              placeholder: 'YYYY-MM-DD',
+            },
+            {
+              key: 'to',
+              label: 'To Date',
+              type: 'date',
+              control: 'input',
+              required: false,
+              placeholder: 'YYYY-MM-DD',
+            },
+            {
+              key: 'tickers',
+              label: 'Tickers (comma-separated)',
+              type: 'text',
+              control: 'input',
+              required: false,
+              placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
+            },
+          ]}
+          bodyFields={[
+            {
+              key: '__body__',
+              label: 'Request Body (JSON)',
+              type: 'json',
+              default: '{}',
+            }
+          ]}
+          onRequestStart={handleRequestStart}
+          onRequestComplete={handleRequestComplete}
+          onLog={handleLog}
+        />}
+
+        {/* POST /trades */}
+        {selectedEndpoint === 'trades' && <RequestForm
+          title="POST /trades"
+          method="POST"
+          path="/trades"
+          queryFields={[]}
+          bodyFields={[
+            {
+              key: '__body__',
+              label: 'Request Body (JSON)',
+              type: 'json',
+              default: JSON.stringify({
+                "trades": [
+                  {
+                    "ticker": "AAPL",
+                    "trade_date": "2024-01-15",
+                    "model": "default",
+                    "source": "consensus",
+                    "position": "long",
+                    "entry_price": 185.50,
+                    "exit_price": null,
+                    "quantity": 100,
+                    "notes": "Entry based on consensus signal"
+                  }
+                ]
+              }, null, 2),
+            }
+          ]}
+          onRequestStart={handleRequestStart}
+          onRequestComplete={handleRequestComplete}
+          onLog={handleLog}
+        />}
 
         {/* POST /fillAnalyst */}
-        <RequestForm
+        {selectedEndpoint === 'fillAnalyst' && <RequestForm
           title="POST /fillAnalyst"
           method="POST"
           path="/fillAnalyst"
@@ -771,7 +937,8 @@ export default function RequestsPage() {
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
-        />
-    </>
+        />}
+      </div>
+    </div>
   );
 }

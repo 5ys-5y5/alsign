@@ -103,6 +103,11 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000
  * @param {number} props.pageSize - Page size
  * @param {Function} props.onPageChange - Page change callback
  * @param {Function} props.onPageSizeChange - Page size change callback
+ * @param {Object} props.sortConfig - Sort configuration from parent
+ * @param {Function} props.onSortChange - Sort change callback
+ * @param {Object} props.filters - Filters from parent
+ * @param {Function} props.onFiltersChange - Filters change callback
+ * @param {Function} props.onRefresh - Refresh data callback
  * @returns {JSX.Element} Events table component
  */
 export default function EventsTable({
@@ -113,6 +118,11 @@ export default function EventsTable({
   pageSize = 100,
   onPageChange,
   onPageSizeChange,
+  sortConfig,
+  onSortChange,
+  filters,
+  onFiltersChange,
+  onRefresh,
 }) {
   // Initialize state from localStorage or defaults
   const [selectedColumns, setSelectedColumns] = useState(() => {
@@ -121,16 +131,6 @@ export default function EventsTable({
       persisted.selectedColumns ||
       EVENTS_COLUMNS.filter((col) => col.isDefault).map((col) => col.key)
     );
-  });
-
-  const [filters, setFilters] = useState(() => {
-    const persisted = getTxnEventsState();
-    return persisted.filters || {};
-  });
-
-  const [sortConfig, setSortConfig] = useState(() => {
-    const persisted = getTxnEventsState();
-    return persisted.sort || { key: null, direction: null };
   });
 
   // Track selected rows for bulk operations
@@ -143,19 +143,64 @@ export default function EventsTable({
   const [bulkEditValue, setBulkEditValue] = useState('');
   const [bulkEditLoading, setBulkEditLoading] = useState(false);
   const [bulkEditMessage, setBulkEditMessage] = useState('');
+  const [bulkEditConflicts, setBulkEditConflicts] = useState([]);
 
   // Persist state changes to localStorage
   useEffect(() => {
     setTxnEventsState({ selectedColumns });
   }, [selectedColumns]);
 
+  // Auto-populate current values when using modify operation
   useEffect(() => {
-    setTxnEventsState({ filters });
-  }, [filters]);
+    if (bulkEditOperation !== 'modify' || selectedRowIds.size === 0) {
+      setBulkEditConflicts([]);
+      return;
+    }
 
-  useEffect(() => {
-    setTxnEventsState({ sort: sortConfig });
-  }, [sortConfig]);
+    // Get selected rows from current data
+    const selectedRows = data.filter(row => selectedRowIds.has(row.id));
+
+    // Check if all selected rows have the same current value for the field
+    const values = new Map();
+    selectedRows.forEach(row => {
+      const currentValue = row[bulkEditField];
+      const valueKey = currentValue === null || currentValue === undefined ? 'null' : String(currentValue);
+      if (!values.has(valueKey)) {
+        values.set(valueKey, []);
+      }
+      values.get(valueKey).push(row.id);
+    });
+
+    if (values.size === 1) {
+      // All selected rows have the same value - auto-populate it
+      const singleValue = Array.from(values.keys())[0];
+      if (singleValue === 'null') {
+        setBulkEditValue('');
+      } else {
+        setBulkEditValue(singleValue);
+      }
+      setBulkEditConflicts([]);
+      setBulkEditMessage('');
+    } else if (values.size > 1) {
+      // Found conflicts - show which rows have different values
+      const conflicts = Array.from(values.entries()).map(([value, ids]) => ({
+        value: value === 'null' ? '(empty)' : value,
+        rawValue: value === 'null' ? '' : value,
+        ids: ids,
+        count: ids.length
+      }));
+      setBulkEditConflicts(conflicts);
+      setBulkEditMessage(`Info: Selected rows have different ${bulkEditField} values. Select a value below or enter a new one.`);
+      setBulkEditValue('');
+    }
+  }, [bulkEditOperation, bulkEditField, selectedRowIds, data]);
+
+  // Handle selecting a conflict value
+  const handleSelectConflictValue = (rawValue) => {
+    setBulkEditValue(rawValue);
+    setBulkEditConflicts([]);
+    setBulkEditMessage('');
+  };
 
   // Handle bulk edit submission
   const handleBulkEdit = async () => {
@@ -195,10 +240,13 @@ export default function EventsTable({
       // Reset form
       setBulkEditValue('');
       setSelectedRowIds(new Set());
+      setBulkEditConflicts([]);
 
-      // Optionally reload data here
+      // Refresh data while preserving filters and sorting
       setTimeout(() => {
-        window.location.reload();
+        if (onRefresh) {
+          onRefresh();
+        }
       }, 1500);
     } catch (error) {
       console.error('Bulk edit failed:', error);
@@ -233,13 +281,15 @@ export default function EventsTable({
             Bulk Edit {selectedRowIds.size} Events
           </h3>
 
-          <div style={{ display: 'flex', gap: 'var(--space-2)', marginBottom: 'var(--space-2)', flexWrap: 'wrap' }}>
-            <div>
+          <div style={{ display: 'flex', marginBottom: 'var(--space-2)', flexFlow: 'column', gap: '15px' }}>
+            <div style={{ display: 'flex', flexFlow: 'column' }}>
               <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)' }}>Field:</label>
               <select
                 value={bulkEditField}
                 onChange={(e) => {
                   setBulkEditField(e.target.value);
+                  setBulkEditMessage('');
+                  setBulkEditConflicts([]);
                   // Reset operation based on field
                   if (e.target.value === 'condition') {
                     setBulkEditOperation('append');
@@ -247,36 +297,43 @@ export default function EventsTable({
                     setBulkEditOperation('set');
                   }
                 }}
-                style={{ marginLeft: 'var(--space-1)' }}
+                style={{ marginLeft: '0px' }}
               >
                 <option value="condition">Condition</option>
-                <option value="position_quantitative">Position (Q)</option>
-                <option value="position_qualitative">Position (QL)</option>
+                <option value="position">Position</option>
               </select>
             </div>
 
-            {bulkEditField === 'condition' && (
-              <div>
-                <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)' }}>Operation:</label>
-                <select
-                  value={bulkEditOperation}
-                  onChange={(e) => setBulkEditOperation(e.target.value)}
-                  style={{ marginLeft: 'var(--space-1)' }}
-                >
-                  <option value="append">Append (add with comma)</option>
-                  <option value="replace">Replace</option>
-                  <option value="remove">Remove</option>
-                </select>
-              </div>
-            )}
+            <div style={{ display: 'flex', flexFlow: 'column' }}>
+              <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)' }}>Operation:</label>
+              <select
+                value={bulkEditOperation}
+                onChange={(e) => {
+                  setBulkEditOperation(e.target.value);
+                  setBulkEditMessage('');
+                  setBulkEditConflicts([]);
+                }}
+                style={{ marginLeft: '0px', height: '39px' }}
+              >
+                {bulkEditField === 'condition' ? (
+                  <>
+                    <option value="append">Append (add with comma)</option>
+                    <option value="modify">Modify (replace existing)</option>
+                    <option value="remove">Remove</option>
+                  </>
+                ) : (
+                  <option value="set">Set</option>
+                )}
+              </select>
+            </div>
 
-            <div style={{ flexGrow: 1 }}>
+            <div style={{ flexGrow: 1, display: 'flex', flexFlow: 'column' }}>
               <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)' }}>Value:</label>
-              {bulkEditField.startsWith('position') ? (
+              {bulkEditField === 'position' ? (
                 <select
                   value={bulkEditValue}
                   onChange={(e) => setBulkEditValue(e.target.value)}
-                  style={{ marginLeft: 'var(--space-1)' }}
+                  style={{ marginLeft: '0px' }}
                 >
                   <option value="">Select...</option>
                   <option value="long">long</option>
@@ -290,16 +347,17 @@ export default function EventsTable({
                   value={bulkEditValue}
                   onChange={(e) => setBulkEditValue(e.target.value)}
                   placeholder="Enter value"
-                  style={{ marginLeft: 'var(--space-1)', width: '200px' }}
+                  style={{ marginLeft: '0px', width: '100%' }}
                 />
               )}
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 'var(--space-1)' }}>
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 'var(--space-1)', flexFlow: 'row', boxSizing: 'border-box', marginTop: '15px' }}>
               <button
                 className="btn btn-sm btn-success"
                 onClick={handleBulkEdit}
                 disabled={bulkEditLoading}
+                style={{ height: '39px', width: '100%' }}
               >
                 {bulkEditLoading ? 'Updating...' : 'Apply'}
               </button>
@@ -309,6 +367,7 @@ export default function EventsTable({
                   setShowBulkEdit(false);
                   setBulkEditMessage('');
                 }}
+                style={{ height: '39px', width: '100%' }}
               >
                 Cancel
               </button>
@@ -320,11 +379,77 @@ export default function EventsTable({
               marginTop: 'var(--space-2)',
               padding: 'var(--space-2)',
               borderRadius: 'var(--rounded-lg)',
-              backgroundColor: bulkEditMessage.startsWith('Error') ? 'rgb(254 226 226)' : 'rgb(220 252 231)',
-              color: bulkEditMessage.startsWith('Error') ? 'rgb(127 29 29)' : 'rgb(22 101 52)',
+              backgroundColor: bulkEditMessage.startsWith('Error') ? 'rgb(254 226 226)' :
+                               bulkEditMessage.startsWith('Warning') ? 'rgb(254 243 199)' :
+                               bulkEditMessage.startsWith('Info') ? 'rgb(219 234 254)' :
+                               'rgb(220 252 231)',
+              color: bulkEditMessage.startsWith('Error') ? 'rgb(127 29 29)' :
+                     bulkEditMessage.startsWith('Warning') ? 'rgb(120 53 15)' :
+                     bulkEditMessage.startsWith('Info') ? 'rgb(30 58 138)' :
+                     'rgb(22 101 52)',
               fontSize: 'var(--text-sm)'
             }}>
               {bulkEditMessage}
+            </div>
+          )}
+
+          {bulkEditConflicts.length > 0 && (
+            <div style={{
+              marginTop: 'var(--space-2)',
+              padding: 'var(--space-2)',
+              borderRadius: 'var(--rounded-lg)',
+              backgroundColor: 'white',
+              border: '1px solid var(--border)',
+              fontSize: 'var(--text-sm)'
+            }}>
+              <h4 style={{ marginBottom: 'var(--space-2)', fontWeight: 'var(--font-semibold)' }}>
+                Current Values in Selected Rows:
+              </h4>
+              {bulkEditConflicts.map((conflict, idx) => (
+                <div key={idx} style={{
+                  marginBottom: 'var(--space-2)',
+                  padding: 'var(--space-2)',
+                  backgroundColor: 'rgb(249 250 251)',
+                  borderRadius: 'var(--rounded-lg)',
+                  border: '1px solid var(--border)'
+                }}>
+                  <div style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginBottom: 'var(--space-1)'
+                  }}>
+                    <div style={{ fontWeight: 'var(--font-medium)' }}>
+                      Value: {conflict.value} ({conflict.count} rows)
+                    </div>
+                    <button
+                      className="btn btn-sm btn-primary"
+                      onClick={() => handleSelectConflictValue(conflict.rawValue)}
+                      style={{ minWidth: '80px' }}
+                    >
+                      Select
+                    </button>
+                  </div>
+                  <div style={{
+                    color: 'var(--text-dim)',
+                    fontSize: 'var(--text-xs)',
+                    maxHeight: '100px',
+                    overflowY: 'auto'
+                  }}>
+                    IDs: {conflict.ids.slice(0, 10).join(', ')}
+                    {conflict.ids.length > 10 && ` ... and ${conflict.ids.length - 10} more`}
+                  </div>
+                </div>
+              ))}
+              <div style={{
+                marginTop: 'var(--space-2)',
+                paddingTop: 'var(--space-2)',
+                borderTop: '1px solid var(--border)',
+                fontSize: 'var(--text-sm)',
+                color: 'var(--text-dim)'
+              }}>
+                Click "Select" to use one of the existing values, or enter a new value in the field above.
+              </div>
             </div>
           )}
         </div>
@@ -336,13 +461,15 @@ export default function EventsTable({
         selectedColumns={selectedColumns}
         onSelectedColumnsChange={setSelectedColumns}
         filters={filters}
-        onFiltersChange={setFilters}
+        onFiltersChange={onFiltersChange}
         sortConfig={sortConfig}
-        onSortChange={setSortConfig}
+        onSortChange={onSortChange}
         loading={loading}
         enableRowExpand={true}
         enableCheckboxes={true}
         enableFooterStats={true}
+        enableServerSideSort={true}
+        enableServerSideFilter={true}
         onSelectionChange={setSelectedRowIds}
       />
 

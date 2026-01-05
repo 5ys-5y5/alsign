@@ -138,7 +138,7 @@ async def health_check():
 
 
 # Import and include routers
-from .routers import source_data, source_data_stream, events, events_stream, analyst, condition_group, dashboard, control
+from .routers import source_data, source_data_stream, events, events_stream, analyst, condition_group, dashboard, control, price_trends, trades
 app.include_router(source_data.router)
 app.include_router(source_data_stream.router)
 app.include_router(events.router)
@@ -147,3 +147,5 @@ app.include_router(analyst.router)
 app.include_router(condition_group.router)
 app.include_router(dashboard.router)
 app.include_router(control.router)
+app.include_router(price_trends.router)
+app.include_router(trades.router)

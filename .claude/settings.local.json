@@ -95,7 +95,16 @@
       "Bash(cmd //c \"tasklist | findstr uvicorn\")",
       "Bash(cmd //c \"for %p in \\(16732 36424\\) do taskkill /F /PID %p 2>nul\")",
       "Bash(else)",
-      "Bash(cmd //c \"for %p in \\(43120 36908\\) do taskkill /F /PID %p 2>nul\")"
+      "Bash(cmd //c \"for %p in \\(43120 36908\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"tasklist | findstr python\")",
+      "Bash(cmd //c \"for %p in \\(26488 30908\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(22308 37048 17900 30788 52180 47208 46648\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(17900 6192 30788 22308 37048 46648 47208 52180\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(22308 17900 6192 37048 51868 30788 47208 34880 52180 46648\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(6192 30788 37048 51868 17900 22308 46648 34880 47208 52180\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for /f \"\"tokens=5\"\" %a in \\(''netstat -ano ^| findstr \"\":8000\"\" ^| findstr \"\"LISTENING\"\"''\\) do taskkill /F /PID %a 2>nul\")",
+      "Bash(start /B python:*)",
+      "Bash(cmd //c \"for %p in \\(37048 22308 6192 30788 51868 17900 46648 44788 47208\\) do taskkill /F /PID %p 2>nul\")"
     ]
   }
 }

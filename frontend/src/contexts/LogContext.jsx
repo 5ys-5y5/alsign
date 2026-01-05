@@ -15,8 +15,8 @@ const LogContext = createContext(null);
 export function LogProvider({ children }) {
   const [requests, setRequests] = useState([]);
   const [logs, setLogs] = useState([]);
-  const [panelOpen, setPanelOpen] = useState(true);
-  const [panelPosition, setPanelPosition] = useState('bottom'); // 'bottom' | 'right'
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [panelPosition, setPanelPosition] = useState('right'); // 'bottom' | 'right'
   const [panelSize, setPanelSize] = useState(400);
 
   const handlePositionChange = useCallback((newPosition) => {

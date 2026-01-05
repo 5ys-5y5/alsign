@@ -244,11 +244,6 @@ class BackfillEventsTableQueryParams(BaseModel):
         default=None,
         description="Comma-separated list of ticker symbols to process (e.g., 'AAPL,MSFT,GOOGL'). If not specified, processes all tickers."
     )
-    calc_fair_value: bool = Field(
-        default=True,
-        alias="calcFairValue",
-        description="[DEPRECATED - I-41] If true, calculate sector-average-based fair value for position_quantitative and disparity_quantitative. This requires additional API calls to fmp-stock-peers and peer financials. (I-36, I-38: default changed to True). Use 'metrics=priceQuantitative' instead."
-    )
     metrics: Optional[str] = Field(
         default=None,
         description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. When specified with overwrite=true, overwrites existing values; with overwrite=false, updates only NULL values. (I-41)"
@@ -306,4 +301,80 @@ class FillAnalystQueryParams(BaseModel):
     overwrite: bool = Field(
         default=False,
         description="If false, update only NULL values in analyst performance data. If true, recalculate all metrics."
+    )
+
+
+class TradeRecord(BaseModel):
+    """Individual trade record for bulk insertion."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    ticker: str = Field(
+        ...,
+        description="Stock ticker symbol (e.g., AAPL, MSFT)"
+    )
+
+    trade_date: date = Field(
+        ...,
+        description="Date when the trade was executed (YYYY-MM-DD)"
+    )
+
+    model: str = Field(
+        default='default',
+        description="Trading model/strategy identifier"
+    )
+
+    source: Optional[str] = Field(
+        default=None,
+        description="Event source: 'consensus' or 'earning'"
+    )
+
+    position: Optional[str] = Field(
+        default=None,
+        description="Trade position: 'long', 'short', or 'neutral'"
+    )
+
+    entry_price: Optional[float] = Field(
+        default=None,
+        description="Entry price (optional)"
+    )
+
+    exit_price: Optional[float] = Field(
+        default=None,
+        description="Exit price (optional)"
+    )
+
+    quantity: Optional[int] = Field(
+        default=None,
+        description="Trade quantity (optional)"
+    )
+
+    notes: Optional[str] = Field(
+        default=None,
+        description="Additional notes (optional)"
+    )
+
+    @validator('source')
+    def validate_source(cls, v):
+        """Validate source parameter."""
+        if v is not None and v not in ('consensus', 'earning'):
+            raise ValueError("source must be 'consensus' or 'earning'")
+        return v
+
+    @validator('position')
+    def validate_position(cls, v):
+        """Validate position parameter."""
+        if v is not None and v not in ('long', 'short', 'neutral'):
+            raise ValueError("position must be 'long', 'short', or 'neutral'")
+        return v
+
+
+class BulkTradesRequest(BaseModel):
+    """Request body for POST /trades endpoint."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    trades: List[TradeRecord] = Field(
+        ...,
+        description="List of trade records to insert"
     )

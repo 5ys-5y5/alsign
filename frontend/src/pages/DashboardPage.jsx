@@ -46,6 +46,9 @@ export default function DashboardPage() {
   const [eventsPageSize, setEventsPageSize] = useState(100);
   const [eventsLoading, setEventsLoading] = useState(true);
   const [eventsError, setEventsError] = useState(null);
+  const [eventsSortConfig, setEventsSortConfig] = useState({ key: null, direction: null });
+  const [eventsFilters, setEventsFilters] = useState({});
+  const [eventsRefreshTrigger, setEventsRefreshTrigger] = useState(0);
 
   // Fetch KPIs
   useEffect(() => {
@@ -83,8 +86,39 @@ export default function DashboardPage() {
       try {
         setEventsLoading(true);
         setEventsError(null);
+
+        // Build query parameters
+        const params = new URLSearchParams({
+          page: eventsPage.toString(),
+          pageSize: eventsPageSize.toString(),
+        });
+
+        // Add sort parameters if sorting is active
+        if (eventsSortConfig.key && eventsSortConfig.direction) {
+          params.append('sortBy', eventsSortConfig.key);
+          params.append('sortOrder', eventsSortConfig.direction);
+        }
+
+        // Add filter parameters
+        // Backend supports: ticker, sector, industry, source, condition
+        if (eventsFilters.ticker) {
+          params.append('ticker', eventsFilters.ticker);
+        }
+        if (eventsFilters.sector) {
+          params.append('sector', eventsFilters.sector);
+        }
+        if (eventsFilters.industry) {
+          params.append('industry', eventsFilters.industry);
+        }
+        if (eventsFilters.source) {
+          params.append('source', eventsFilters.source);
+        }
+        if (eventsFilters.condition) {
+          params.append('condition', eventsFilters.condition);
+        }
+
         const response = await fetch(
-          `${API_BASE_URL}/dashboard/events?page=${eventsPage}&pageSize=${eventsPageSize}`
+          `${API_BASE_URL}/dashboard/events?${params.toString()}`
         );
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
@@ -108,7 +142,7 @@ export default function DashboardPage() {
     }
 
     fetchEvents();
-  }, [eventsPage, eventsPageSize]);
+  }, [eventsPage, eventsPageSize, eventsSortConfig, eventsFilters, eventsRefreshTrigger]);
 
 
   return (
@@ -169,6 +203,17 @@ export default function DashboardPage() {
               setEventsPageSize(newSize);
               setEventsPage(1); // Reset to first page
             }}
+            sortConfig={eventsSortConfig}
+            onSortChange={(newSortConfig) => {
+              setEventsSortConfig(newSortConfig);
+              setEventsPage(1); // Reset to first page when sorting changes
+            }}
+            filters={eventsFilters}
+            onFiltersChange={(newFilters) => {
+              setEventsFilters(newFilters);
+              setEventsPage(1); // Reset to first page when filters change
+            }}
+            onRefresh={() => setEventsRefreshTrigger(prev => prev + 1)}
           />
         )}
       </section>

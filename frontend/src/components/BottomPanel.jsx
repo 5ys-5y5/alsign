@@ -111,13 +111,13 @@ export default function BottomPanel() {
   const panelStyles = isRightPanel
     ? {
         position: 'fixed',
-        top: headerHeightPx,
+        top: 0,
         right: 0,
         bottom: 0,
         width: `${panelSize}px`,
         backgroundColor: 'var(--bg-secondary)',
         borderLeft: '2px solid var(--border)',
-        zIndex: 'var(--z-toolbar)',
+        zIndex: 1000,
         display: 'flex',
         flexDirection: 'column',
         transition: isResizing ? 'none' : 'width 0.1s ease-out',
@@ -130,7 +130,7 @@ export default function BottomPanel() {
         height: `${panelSize}px`,
         backgroundColor: 'var(--bg-secondary)',
         borderTop: '2px solid var(--border)',
-        zIndex: 'var(--z-toolbar)',
+        zIndex: 1000,
         display: 'flex',
         flexDirection: 'column',
         transition: isResizing ? 'none' : 'height 0.1s ease-out',
@@ -139,13 +139,13 @@ export default function BottomPanel() {
   const collapsedStyles = isRightPanel
     ? {
         position: 'fixed',
-        top: headerHeightPx,
+        top: 0,
         right: 0,
         bottom: 0,
         width: '48px',
         backgroundColor: 'var(--bg-secondary)',
         borderLeft: '2px solid var(--border)',
-        zIndex: 'var(--z-toolbar)',
+        zIndex: 1000,
         display: 'flex',
         flexDirection: 'column',
         alignItems: 'center',
@@ -160,7 +160,7 @@ export default function BottomPanel() {
         right: 0,
         backgroundColor: 'var(--bg-secondary)',
         borderTop: '2px solid var(--border)',
-        zIndex: 'var(--z-toolbar)',
+        zIndex: 1000,
         transition: 'all 0.2s ease-in-out',
       };
 

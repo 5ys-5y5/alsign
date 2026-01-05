@@ -2,7 +2,8 @@
 
 > **목적**: txn_events 테이블의 이벤트들에 대해 valuation metrics를 계산하고 저장
 >
-> **최종 업데이트**: 2026-01-02 (I-41 Part 1+2+3 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화)
+> **최종 업데이트**: 2026-01-05 (I-43 설계 - txn_price_trend 테이블 분리, price_trend JSONB → 별도 테이블)
+> **이전 업데이트**: 2026-01-02 (I-41 Part 1+2+3 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화)
 
 ---
 
@@ -628,5 +629,131 @@ POST /backfillEventsTable?tickers=AAPL,MSFT&metrics=PER,PBR,PSR&overwrite=true
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-41 추가, I-36/I-38/I-40 deprecated)*
+## 8. I-43: txn_price_trend 테이블 분리 (2026-01-05) 🔄
+
+**목적**: Dashboard Events 표 로딩 성능 개선 (85-92% 응답 속도 향상)
+
+### 변경 사항
+
+#### Phase 5 수정: generate_price_trends()
+
+**현재 구현**:
+```python
+# txn_events.price_trend JSONB 컬럼에 저장
+UPDATE txn_events SET price_trend = $1 WHERE id = $2
+```
+
+**I-43 개선 후**:
+```python
+# txn_price_trend 테이블에 UPSERT
+INSERT INTO txn_price_trend (
+    ticker, event_date,
+    d_neg14, d_neg13, ..., d_0, ..., d_pos14,
+    wts_long, wts_short
+) VALUES (...)
+ON CONFLICT (ticker, event_date) DO UPDATE
+SET d_neg14 = EXCLUDED.d_neg14, ...
+```
+
+#### 새로운 테이블: txn_price_trend
+
+```sql
+CREATE TABLE txn_price_trend (
+    ticker VARCHAR(20) NOT NULL,
+    event_date DATE NOT NULL,
+
+    -- 29개 dayOffset 컬럼 (D-14 ~ D14, D0 포함)
+    d_neg14 JSONB,
+    ...
+    d_0 JSONB,
+    ...
+    d_pos14 JSONB,
+
+    -- WTS 미리 계산
+    wts_long INT,
+    wts_short INT,
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (ticker, event_date)
+);
+```
+
+**JSONB 구조**:
+```json
+{
+  "price_trend": {"low": 25.29, "high": 26.53, "open": 26.37, "close": 25.57},
+  "dayOffset0": {"close": 28.57},
+  "performance": {"close": -0.0018796992}
+}
+```
+
+### 로직 변경
+
+1. **ticker + event_date 그룹화**: 중복 제거
+2. **D0 close 조회**: base_close로 사용
+3. **각 dayOffset 계산**: D-14 ~ D14 (0 포함)
+   - `performance = (close - dayOffset0.close) / dayOffset0.close`
+4. **WTS 계산**:
+   - `wts_long`: long position 최대 수익 dayOffset
+   - `wts_short`: short position 최대 수익 dayOffset
+5. **UPSERT**: txn_price_trend 테이블
+
+### 기능 유지 사항
+
+- ✅ ticker별 1회 호출 (OHLC API)
+- ✅ 날짜 범위 필터 (from, to)
+- ✅ ticker 필터
+- ✅ overwrite 파라미터
+- ✅ 거래일 캐싱 (I-24)
+- ✅ 배치 업데이트
+
+### null 값 처리 및 WTS 업데이트
+
+**시나리오**: 미래 날짜 데이터가 아직 없는 경우
+```python
+# 초기 backfill (2024-12-25 이벤트, 현재 2024-12-28)
+# D1, D2, D3은 데이터 있음, D4~D14는 미래라 null
+{
+  "d_pos1": {"price_trend": {...}, "performance": {...}},
+  "d_pos2": {"price_trend": {...}, "performance": {...}},
+  "d_pos3": {"price_trend": {...}, "performance": {...}},
+  "d_pos4": null,  # 미래 날짜
+  ...
+  "d_pos14": null,
+  "wts_long": 2,  # 현재까지 데이터로 계산된 WTS
+  "wts_short": -1
+}
+
+# 나중에 재실행 (2025-01-10, 모든 데이터 available)
+# null → 값 채워짐
+# WTS 재계산 (wts_long: 2 → 7로 업데이트)
+```
+
+### 구현 체크리스트
+
+- [ ] DDL 스크립트: `backend/scripts/create_txn_price_trend.sql`
+- [ ] 마이그레이션: `backend/scripts/migrate_price_trend_to_table.py`
+- [ ] valuation_service.py 수정: generate_price_trends() 함수
+- [ ] 성능 테스트 스크립트
+- [ ] 문서 업데이트
+
+### 예상 성능
+
+| 작업 | 개선 효과 |
+|------|----------|
+| GET /dashboard/events | 2-5초 → 0.2-0.4초 (85-92% 개선) |
+| POST /backfillEventsTable | 영향 없음 (ticker당 1회 호출 유지) |
+
+### 참조
+
+- **설계 문서**: `history/I-43_FLOW.md`
+- **체크리스트**: `history/1_CHECKLIST.md#I-43`
+- **엔드포인트**: `history/0_endpointFlow/GET_dashboard_events.md`
+
+---
+
+*최종 업데이트: 2026-01-05 KST (I-43 설계 추가 - txn_price_trend 테이블 분리)*
+*이전 업데이트: 2026-01-02 KST (I-41 추가, I-36/I-38/I-40 deprecated)*
 

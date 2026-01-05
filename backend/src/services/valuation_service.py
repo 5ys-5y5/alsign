@@ -49,15 +49,17 @@ async def process_ticker_batch(
     overwrite: bool = False,
     total_events_count: int = 0,
     completed_events_count: Dict[str, int] = None,
-    calc_fair_value: bool = False,
-    metrics_list: Optional[List[str]] = None
+    metrics_list: Optional[List[str]] = None,
+    global_peer_cache: Dict[str, Dict[str, Any]] = None,
+    ticker_to_peers: Dict[str, List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Process all events for a single ticker (with REAL API caching).
-    
+    Process all events for a single ticker (with REAL API caching + GLOBAL PEER CACHE).
+
     This function:
     1. Fetches ALL required API data ONCE for the ticker
-    2. Processes all events for this ticker using the SAME cached API data
+    2. Uses GLOBAL PEER CACHE for sector averages (no per-ticker peer fetching)
+    3. Processes all events for this ticker using the SAME cached API data
     3. Returns batch results for DB update
     
     Args:
@@ -143,7 +145,7 @@ async def process_ticker_batch(
         logger.info(f"[Ticker Batch] {ticker}: MetricEngine initialized (60 metrics)")
 
         # ========================================
-        # CRITICAL: Fetch peer data ONCE for ticker (PERFORMANCE FIX)
+        # CRITICAL: Use GLOBAL PEER CACHE (PERFORMANCE OPTIMIZATION)
         # ========================================
         # IMPORTANT: Always calculate priceQuantitative for ALL events (source-agnostic)
         # per user requirement: "quantitative columns must be filled regardless of source value"
@@ -152,29 +154,55 @@ async def process_ticker_batch(
         peer_count = 0
 
         try:
-            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER TICKER DATA CACHING START ==========")
+            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER DATA PROCESSING START ==========")
 
-            # Get peer tickers ONCE for this ticker (ALWAYS, not just for consensus events)
-            peer_tickers = await get_peer_tickers(ticker, event_id=ticker_context_id)
-            peer_count = len(peer_tickers)
+            # USE GLOBAL PEER CACHE if available (PERFORMANCE OPTIMIZATION)
+            if global_peer_cache and ticker_to_peers:
+                # Get pre-collected peer list for this ticker
+                peer_tickers = ticker_to_peers.get(ticker, [])
+                peer_count = len(peer_tickers)
 
-            if peer_tickers and ticker_events:
-                logger.info(f"[table: txn_events | id: {ticker_context_id}] | Found {peer_count} peer tickers: {peer_tickers}")
+                if peer_tickers:
+                    logger.info(f"[PERF-OPT] {ticker}: Using global peer cache ({peer_count} peers)")
 
-                # Use first event's date as reference for sector averages
-                reference_date = ticker_events[0]['event_date']
-                sector_averages = await calculate_sector_average_metrics(
-                    pool, peer_tickers, reference_date, metrics_by_domain, event_id=ticker_context_id
-                )
-                logger.info(
-                    f"[table: txn_events | id: {ticker_context_id}] | Peer data cached: "
-                    f"{peer_count} peers, sector averages={list(sector_averages.keys())}"
-                )
-                logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER TICKER DATA CACHING END ==========")
+                    # Calculate sector averages from GLOBAL CACHE (no API calls!)
+                    sector_averages = await calculate_sector_average_from_cache(
+                        peer_tickers, global_peer_cache
+                    )
+
+                    logger.info(
+                        f"[PERF-OPT] {ticker}: Sector averages calculated from cache: {list(sector_averages.keys())}"
+                    )
+                else:
+                    logger.warning(f"[PERF-OPT] {ticker}: No peers in global cache")
+
             else:
-                logger.warning(f"[PERF] {ticker}: No peer tickers found, priceQuantitative will be NULL")
+                # FALLBACK: Use per-ticker peer fetching (old method)
+                logger.info(f"[FALLBACK] {ticker}: Global cache not available, fetching peers individually")
+
+                # Get peer tickers ONCE for this ticker
+                peer_tickers = await get_peer_tickers(ticker, event_id=ticker_context_id)
+                peer_count = len(peer_tickers)
+
+                if peer_tickers and ticker_events:
+                    logger.info(f"[FALLBACK] {ticker}: Found {peer_count} peer tickers: {peer_tickers}")
+
+                    # Use first event's date as reference for sector averages
+                    reference_date = ticker_events[0]['event_date']
+                    sector_averages = await calculate_sector_average_metrics(
+                        pool, peer_tickers, reference_date, metrics_by_domain, event_id=ticker_context_id
+                    )
+                    logger.info(f"[FALLBACK] {ticker}: Sector averages calculated: {list(sector_averages.keys())}")
+                else:
+                    logger.warning(f"[FALLBACK] {ticker}: No peer tickers found")
+
+            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER DATA PROCESSING END ==========")
+
+            if not sector_averages:
+                logger.warning(f"[PERF] {ticker}: No sector averages available, priceQuantitative will be NULL")
+
         except Exception as e:
-            logger.warning(f"[PERF] {ticker}: Failed to fetch peer data: {e}")
+            logger.warning(f"[PERF] {ticker}: Failed to process peer data: {e}")
             sector_averages = {}
 
     except Exception as e:
@@ -413,7 +441,24 @@ async def process_ticker_batch(
                 'price_quantitative': price_quant_col,
                 'peer_quantitative': peer_quant_col
             })
-            
+
+            # INCREMENTAL DB UPDATE: Save progress every N events (PERFORMANCE OPTIMIZATION)
+            INCREMENTAL_UPDATE_BATCH_SIZE = 20
+            if len(batch_updates) >= INCREMENTAL_UPDATE_BATCH_SIZE:
+                try:
+                    logger.info(f"[INCR-UPDATE] {ticker}: Saving {len(batch_updates)} events to DB (checkpoint at {idx}/{total_events})")
+                    incr_updated_count = await metrics.batch_update_event_valuations(
+                        pool, batch_updates, overwrite=overwrite, metrics=metrics_list
+                    )
+                    logger.info(f"[INCR-UPDATE] {ticker}: ✓ {incr_updated_count} events saved successfully")
+
+                    # Clear batch after successful update
+                    batch_updates.clear()
+
+                except Exception as e:
+                    logger.warning(f"[INCR-UPDATE] {ticker}: Incremental DB update failed: {e}")
+                    # Don't clear batch_updates on failure - will retry at end
+
             # Track success/fail
             if quant_result['status'] == 'success':
                 quant_success += 1
@@ -618,7 +663,6 @@ async def calculate_valuations(
     to_date: Optional[date] = None,
     tickers: Optional[List[str]] = None,
     cancel_event: Optional[asyncio.Event] = None,
-    calc_fair_value: bool = True,
     metrics_list: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
@@ -639,7 +683,6 @@ async def calculate_valuations(
         to_date: Optional end date for filtering events by event_date.
         tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
         cancel_event: Optional asyncio.Event for cancellation.
-        calc_fair_value: [DEPRECATED - I-41] If True, calculate sector-average-based fair value (I-36).
         metrics_list: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
 
     Returns:
@@ -778,6 +821,52 @@ async def calculate_valuations(
     logger.info(f"[backfillEventsTable] Phase 3: Grouping {len(events)} events by ticker")
     ticker_groups = group_events_by_ticker(events)
     logger.info(f"[backfillEventsTable] Grouped into {len(ticker_groups)} tickers")
+
+    # Phase 3.5: Global Peer Collection & Parallel Fetching (PERFORMANCE OPTIMIZATION)
+    logger.info("=" * 80)
+    logger.info(f"[backfillEventsTable] Phase 3.5: GLOBAL PEER COLLECTION & PARALLEL FETCHING")
+    logger.info("=" * 80)
+
+    global_peer_cache = {}
+    ticker_to_peers = {}
+
+    try:
+        # Step 1: Collect all peer tickers
+        peer_collect_start = time.time()
+        ticker_to_peers, unique_peers = await collect_all_peer_tickers(ticker_groups)
+        peer_collect_elapsed = time.time() - peer_collect_start
+
+        logger.info(f"[PERF-OPT] Peer collection completed in {peer_collect_elapsed:.2f}s")
+        logger.info(f"[PERF-OPT] Found {len(ticker_to_peers)} tickers with peers, {len(unique_peers)} unique peers total")
+
+        # Step 2: Fetch peer financials in parallel
+        if unique_peers:
+            # Use first event date as reference for all peers (reasonable approximation)
+            reference_date = events[0]['event_date']
+
+            peer_fetch_start = time.time()
+            global_peer_cache = await fetch_peer_financials_parallel(
+                unique_peers,
+                pool,
+                metrics_by_domain,
+                reference_date,
+                max_concurrent=20  # Parallel fetching limit
+            )
+            peer_fetch_elapsed = time.time() - peer_fetch_start
+
+            logger.info("=" * 80)
+            logger.info(f"[PERF-OPT] ✓ Global peer cache ready: {len(global_peer_cache)} peers cached")
+            logger.info(f"[PERF-OPT] ✓ Total peer fetching time: {peer_fetch_elapsed:.2f}s (parallelized)")
+            logger.info(f"[PERF-OPT] ✓ Estimated time saved vs sequential: {peer_fetch_elapsed * 10:.2f}s → {peer_fetch_elapsed:.2f}s (~{(1 - peer_fetch_elapsed/(peer_fetch_elapsed*10))*100:.0f}% faster)")
+            logger.info("=" * 80)
+        else:
+            logger.warning("[PERF-OPT] No peer tickers found for any ticker")
+
+    except Exception as e:
+        logger.error(f"[PERF-OPT] Failed to build global peer cache: {e}", exc_info=True)
+        logger.warning("[PERF-OPT] Falling back to per-ticker peer fetching")
+        global_peer_cache = {}
+        ticker_to_peers = {}
     
     logger.info(
         f"Processing {len(ticker_groups)} ticker groups",
@@ -828,8 +917,10 @@ async def calculate_valuations(
         async with semaphore:
             result = await process_ticker_batch(
                 pool, ticker, ticker_events, metrics_by_domain, overwrite,
-                total_events_count, completed_events_count, calc_fair_value,
-                metrics_list  # I-41: Pass selective update parameters
+                total_events_count, completed_events_count,
+                metrics_list,  # I-41: Pass selective update parameters
+                global_peer_cache,  # PERF-OPT: Global peer cache
+                ticker_to_peers  # PERF-OPT: Ticker to peers mapping
             )
             
             # Update progress
@@ -991,21 +1082,6 @@ async def calculate_valuations(
         }
     )
 
-    try:
-        price_trend_result = await generate_price_trends(
-            from_date=from_date,
-            to_date=to_date,
-            tickers=tickers
-        )
-        logger.info(f"[backfillEventsTable] Price trends generated: success={price_trend_result.get('success', 0)}, fail={price_trend_result.get('fail', 0)}")
-    except Exception as e:
-        logger.error(f"[backfillEventsTable] Price trend generation failed: {e}")
-        price_trend_result = {
-            'success': 0,
-            'fail': 0,
-            'error': str(e)
-        }
-
     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
     # Build summary
@@ -1015,8 +1091,6 @@ async def calculate_valuations(
         'quantitativeFail': quantitative_fail,
         'qualitativeSuccess': qualitative_success,
         'qualitativeFail': qualitative_fail,
-        'priceTrendSuccess': price_trend_result.get('success', 0),
-        'priceTrendFail': price_trend_result.get('fail', 0),
         'elapsedMs': total_elapsed_ms
     }
 
@@ -1746,18 +1820,20 @@ async def generate_price_trends(
     tickers: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Generate price_trend arrays for all events in txn_events.
+    Generate price_trend arrays for events in txn_events and trades in txn_trades.
 
     Fetches policy configuration, generates dayOffset scaffolds,
-    fetches OHLC data from FMP, and populates price_trend field.
+    fetches OHLC data from FMP, and populates txn_price_trend table for:
+    1. All events from txn_events (existing behavior)
+    2. Trades from txn_trades that don't exist in txn_events (new behavior)
 
     Args:
-        from_date: Optional start date for filtering events by event_date
-        to_date: Optional end date for filtering events by event_date
-        tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
+        from_date: Optional start date for filtering by event_date/trade_date
+        to_date: Optional end date for filtering by event_date/trade_date
+        tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
 
     Returns:
-        Dict with summary and statistics
+        Dict with summary and statistics including events and trades counts
     """
     start_time = time.time()
 
@@ -1767,7 +1843,7 @@ async def generate_price_trends(
     logger.info(
         "Loading price trend policies",
         extra={
-            'endpoint': 'POST /backfillEventsTable',
+            'endpoint': 'POST /generatePriceTrends',
             'phase': 'load_policy',
             'elapsed_ms': 0,
             'counters': {},
@@ -1805,13 +1881,24 @@ async def generate_price_trends(
         tickers=tickers
     )
 
+    # Load trades from txn_trades that are NOT in txn_events
+    trades = await metrics.select_trades_for_price_trends(
+        pool,
+        from_date=from_date,
+        to_date=to_date,
+        tickers=tickers
+    )
+
+    # Merge events and trades for processing
+    all_records = events + trades
+
     logger.info(
-        f"Processing price trends for {len(events)} events",
+        f"Processing price trends for {len(events)} events and {len(trades)} trades (total: {len(all_records)})",
         extra={
-            'endpoint': 'POST /backfillEventsTable',
+            'endpoint': 'POST /generatePriceTrends',
             'phase': 'process_price_trends',
             'elapsed_ms': int((time.time() - start_time) * 1000),
-            'counters': {'total': len(events)},
+            'counters': {'events': len(events), 'trades': len(trades), 'total': len(all_records)},
             'progress': {},
             'rate': {},
             'batch': {},
@@ -1819,13 +1906,13 @@ async def generate_price_trends(
         }
     )
 
-    # Group events by ticker for efficient OHLC fetching
+    # Group all records (events + trades) by ticker for efficient OHLC fetching
     events_by_ticker = {}
-    for event in events:
-        ticker = event['ticker']
+    for record in all_records:
+        ticker = record['ticker']
         if ticker not in events_by_ticker:
             events_by_ticker[ticker] = []
-        events_by_ticker[ticker].append(event)
+        events_by_ticker[ticker].append(record)
 
     # Calculate OHLC fetch ranges per ticker
     # Guideline line 986-987: fromDate = min_event_date + countStart, toDate = max_event_date + countEnd
@@ -1837,8 +1924,11 @@ async def generate_price_trends(
         max_date = max(event_dates)
 
         # Apply priceEodOHLC_dateRange policy (countStart/countEnd are calendar day offsets)
-        fetch_start = min_date + timedelta(days=ohlc_count_start)
-        fetch_end = max_date + timedelta(days=ohlc_count_end)
+        # I-43: Add extra buffer to ensure we have data for all dayOffset values (-14 to +14 trading days)
+        # Trading days -14/+14 require approximately -25/+25 calendar days (accounting for weekends + holidays)
+        extra_buffer_days = 15  # Additional buffer on each side
+        fetch_start = min_date + timedelta(days=ohlc_count_start - extra_buffer_days)
+        fetch_end = max_date + timedelta(days=ohlc_count_end + extra_buffer_days)
 
         ohlc_ranges[ticker] = (fetch_start, fetch_end)
 
@@ -1849,7 +1939,7 @@ async def generate_price_trends(
             logger.info(
                 f"Fetching OHLC for {ticker} from {fetch_start} to {fetch_end}",
                 extra={
-                    'endpoint': 'POST /backfillEventsTable',
+                    'endpoint': 'POST /generatePriceTrends',
                     'phase': 'fetch_ohlc',
                     'elapsed_ms': int((time.time() - start_time) * 1000),
                     'counters': {},
@@ -1900,19 +1990,40 @@ async def generate_price_trends(
         trading_days_set = set()
     
     # ========================================
-    # OPTIMIZATION: Process events and build batch updates
+    # I-43: Group events by (ticker, event_date) for txn_price_trend
+    # ========================================
+    # Deduplicate events by (ticker, event_date) since txn_price_trend is indexed by this combination
+    unique_ticker_dates = {}
+    for event in events:
+        ticker = event['ticker']
+        event_date = event['event_date'].date() if hasattr(event['event_date'], 'date') else event['event_date']
+        key = (ticker, event_date)
+        if key not in unique_ticker_dates:
+            unique_ticker_dates[key] = event
+
+    logger.info(
+        f"Deduplicated {len(all_records)} records into {len(unique_ticker_dates)} unique (ticker, event_date) pairs",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'deduplicate_events',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {'records': len(all_records), 'events': len(events), 'trades': len(trades), 'unique_pairs': len(unique_ticker_dates)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
+    # ========================================
+    # I-43: Process unique pairs and build txn_price_trend inserts
     # ========================================
     success_count = 0
     fail_count = 0
-    batch_updates = []  # Collect all updates for batch processing
+    batch_inserts = []  # Collect all inserts for batch processing
 
-    for idx, event in enumerate(events):
+    for idx, ((ticker, event_date), event) in enumerate(unique_ticker_dates.items()):
         try:
-            ticker = event['ticker']
-            event_date = event['event_date'].date() if hasattr(event['event_date'], 'date') else event['event_date']
-            source = event['source']
-            source_id = event['source_id']
-
             # OPTIMIZED: Use cached trading days (NO DB CALL per event!)
             dayoffset_dates = calculate_dayOffset_dates_cached(
                 event_date,
@@ -1921,41 +2032,156 @@ async def generate_price_trends(
                 trading_days_set
             )
 
-            # Build price_trend array
-            price_trend = []
+
+            # Build dayOffset OHLC map with target_date
+            dayoffset_ohlc = {}
+            dayoffset_target_dates = {}  # Store target dates separately
+
             for dayoffset, target_date in dayoffset_dates:
-                # Look up OHLC data
                 date_str = target_date.isoformat()
+                dayoffset_target_dates[dayoffset] = date_str
                 ohlc = ohlc_cache.get(ticker, {}).get(date_str)
 
                 if ohlc:
-                    # Fill with actual data
-                    price_trend.append({
-                        'dayOffset': dayoffset,
-                        'targetDate': date_str,
+                    dayoffset_ohlc[dayoffset] = {
                         'open': float(ohlc.get('open')) if ohlc.get('open') else None,
                         'high': float(ohlc.get('high')) if ohlc.get('high') else None,
                         'low': float(ohlc.get('low')) if ohlc.get('low') else None,
                         'close': float(ohlc.get('close')) if ohlc.get('close') else None
-                    })
+                    }
                 else:
-                    # Future date or missing data - progressive null-filling
-                    price_trend.append({
-                        'dayOffset': dayoffset,
-                        'targetDate': date_str,
-                        'open': None,
-                        'high': None,
-                        'low': None,
-                        'close': None
-                    })
+                    # Missing data - will fill later
+                    dayoffset_ohlc[dayoffset] = None
 
-            # Collect for batch update instead of individual updates
-            batch_updates.append({
+            # Fill missing data with forward/backward fill
+            # For negative offsets: use previous trading day (backward fill)
+            # For positive offsets: use next trading day (forward fill)
+            for offset in range(-14, 15):
+                if dayoffset_ohlc.get(offset) is None:
+                    if offset < 0:
+                        # Backward fill: use earlier trading day
+                        for prev_offset in range(offset - 1, -15, -1):
+                            if dayoffset_ohlc.get(prev_offset) is not None:
+                                dayoffset_ohlc[offset] = dayoffset_ohlc[prev_offset].copy()
+                                break
+                    else:
+                        # Forward fill: use later trading day
+                        for next_offset in range(offset + 1, 15):
+                            if dayoffset_ohlc.get(next_offset) is not None:
+                                dayoffset_ohlc[offset] = dayoffset_ohlc[next_offset].copy()
+                                break
+
+            # Get D0 close as base_close for performance calculation
+            # If D0 close is None, set base_close to None but continue (record with null values)
+            d0_data = dayoffset_ohlc.get(0)
+            base_close = d0_data['close'] if d0_data and d0_data.get('close') is not None else None
+
+
+            if base_close is None:
+                logger.warning(f"No D0 close for {ticker} on {event_date}, recording with null values")
+                # Continue processing but all will be null
+
+            # Build JSONB columns for each dayOffset (-14 to 14)
+            jsonb_columns = {}
+            day_performances = {}  # For WTS calculation
+
+            for offset in range(-14, 15):  # -14 to 14 inclusive
+                ohlc = dayoffset_ohlc.get(offset)
+                target_date = dayoffset_target_dates.get(offset)
+
+                if ohlc and ohlc.get('close') is not None and base_close is not None:
+                    # Has data and base_close available
+                    close_price = ohlc['close']
+                    performance = (close_price - base_close) / base_close if base_close != 0 else 0
+                    day_performances[offset] = performance
+
+                    jsonb_data = {
+                        'targetDate': target_date,
+                        'price_trend': {
+                            'low': ohlc['low'],
+                            'high': ohlc['high'],
+                            'open': ohlc['open'],
+                            'close': ohlc['close']
+                        },
+                        'dayOffset0': {
+                            'close': base_close
+                        },
+                        'performance': {
+                            'close': performance
+                        }
+                    }
+                elif ohlc and ohlc.get('close') is not None and base_close is None:
+                    # Has data but no base_close - record price without performance
+                    day_performances[offset] = None
+
+                    jsonb_data = {
+                        'targetDate': target_date,
+                        'price_trend': {
+                            'low': ohlc['low'],
+                            'high': ohlc['high'],
+                            'open': ohlc['open'],
+                            'close': ohlc['close']
+                        },
+                        'dayOffset0': {
+                            'close': None
+                        },
+                        'performance': {
+                            'close': None
+                        }
+                    }
+                else:
+                    # No data - record with targetDate only
+                    jsonb_data = {
+                        'targetDate': target_date,
+                        'price_trend': None,
+                        'dayOffset0': {
+                            'close': base_close
+                        },
+                        'performance': {
+                            'close': None
+                        }
+                    } if target_date else None
+                    day_performances[offset] = None
+
+                # Map offset to column name
+                if offset < 0:
+                    col_name = f'd_neg{abs(offset)}'
+                elif offset == 0:
+                    col_name = 'd_0'
+                else:
+                    col_name = f'd_pos{offset}'
+
+                # Convert to JSON string for UNNEST (asyncpg requires str for array parameters)
+                jsonb_columns[col_name] = json.dumps(jsonb_data) if jsonb_data else None
+
+            # Calculate WTS (Which Trading day to Sell)
+            # wts_long: best dayOffset for long position (max performance)
+            # wts_short: best dayOffset for short position (max negative performance = min performance)
+            wts_long = None
+            wts_short = None
+            max_performance = None
+            min_performance = None
+
+            for offset, perf in day_performances.items():
+                if perf is not None:
+                    # Long position: maximize performance
+                    if max_performance is None or perf > max_performance:
+                        max_performance = perf
+                        wts_long = offset
+
+                    # Short position: maximize negative performance (minimize performance)
+                    if min_performance is None or perf < min_performance:
+                        min_performance = perf
+                        wts_short = offset
+
+
+            # Collect for batch insert
+            batch_inserts.append({
                 'ticker': ticker,
-                'event_date': event['event_date'],
-                'source': source,
-                'source_id': source_id,
-                'price_trend': json.dumps(price_trend)
+                'event_date': event_date,
+                'jsonb_columns': jsonb_columns,
+                'wts_long': wts_long,
+                'wts_short': wts_short
             })
             success_count += 1
 
@@ -1964,79 +2190,246 @@ async def generate_price_trends(
             fail_count += 1
             continue
 
-        # Log progress every 50 events (faster now, so less frequent logging)
-        if (idx + 1) % 50 == 0 or (idx + 1) == len(events):
+        # Log progress every 50 pairs
+        if (idx + 1) % 50 == 0 or (idx + 1) == len(unique_ticker_dates):
             logger.info(
-                f"Processed {idx + 1}/{len(events)} price trends",
+                f"Processed {idx + 1}/{len(unique_ticker_dates)} unique pairs",
                 extra={
-                    'endpoint': 'POST /backfillEventsTable',
+                    'endpoint': 'POST /generatePriceTrends',
                     'phase': 'process_price_trends',
                     'elapsed_ms': int((time.time() - start_time) * 1000),
                     'counters': {
                         'processed': idx + 1,
-                        'total': len(events),
+                        'total': len(unique_ticker_dates),
                         'success': success_count,
                         'fail': fail_count
                     },
                     'progress': {
                         'done': idx + 1,
-                        'total': len(events),
-                        'pct': round((idx + 1) / len(events) * 100, 1)
+                        'total': len(unique_ticker_dates),
+                        'pct': round((idx + 1) / len(unique_ticker_dates) * 100, 1)
                     },
                     'rate': {},
                     'batch': {},
                     'warn': []
                 }
             )
-    
+
     # ========================================
-    # OPTIMIZATION: Batch DB update (single query for all events)
+    # I-43: Batch UPSERT into txn_price_trend
     # ========================================
-    if batch_updates:
-        logger.info(f"[PriceTrends] Executing batch update for {len(batch_updates)} events")
+    logger.info(f"[PriceTrends] I-43: Prepared {len(batch_inserts)} rows for txn_price_trend table")
+
+    if not batch_inserts:
+        logger.warning("[PriceTrends] I-43: No data to insert into txn_price_trend (all events skipped due to missing D0 data)")
+        total_elapsed_ms = int((time.time() - start_time) * 1000)
+        return {
+            'success': 0,
+            'fail': fail_count
+        }
+
+    if batch_inserts:
+        logger.info(f"[PriceTrends] I-43: Executing batch UPSERT for {len(batch_inserts)} unique pairs")
         batch_start = time.time()
-        
+
+        conn = None
         try:
             async with pool.acquire() as conn:
-                # Use UNNEST for batch update
-                tickers = [u['ticker'] for u in batch_updates]
-                event_dates = [u['event_date'] for u in batch_updates]
-                sources = [u['source'] for u in batch_updates]
-                source_ids = [u['source_id'] for u in batch_updates]
-                price_trends = [u['price_trend'] for u in batch_updates]
-                
+                # I-43: Start transaction explicitly
+                await conn.execute("BEGIN")
+
+                # Prepare arrays for UNNEST
+                tickers = []
+                event_dates = []
+                d_neg14_list = []
+                d_neg13_list = []
+                d_neg12_list = []
+                d_neg11_list = []
+                d_neg10_list = []
+                d_neg9_list = []
+                d_neg8_list = []
+                d_neg7_list = []
+                d_neg6_list = []
+                d_neg5_list = []
+                d_neg4_list = []
+                d_neg3_list = []
+                d_neg2_list = []
+                d_neg1_list = []
+                d_0_list = []
+                d_pos1_list = []
+                d_pos2_list = []
+                d_pos3_list = []
+                d_pos4_list = []
+                d_pos5_list = []
+                d_pos6_list = []
+                d_pos7_list = []
+                d_pos8_list = []
+                d_pos9_list = []
+                d_pos10_list = []
+                d_pos11_list = []
+                d_pos12_list = []
+                d_pos13_list = []
+                d_pos14_list = []
+                wts_long_list = []
+                wts_short_list = []
+
+                for insert in batch_inserts:
+                    tickers.append(insert['ticker'])
+                    event_dates.append(insert['event_date'])
+
+                    jsonb_cols = insert['jsonb_columns']
+                    d_neg14_list.append(jsonb_cols.get('d_neg14'))
+                    d_neg13_list.append(jsonb_cols.get('d_neg13'))
+                    d_neg12_list.append(jsonb_cols.get('d_neg12'))
+                    d_neg11_list.append(jsonb_cols.get('d_neg11'))
+                    d_neg10_list.append(jsonb_cols.get('d_neg10'))
+                    d_neg9_list.append(jsonb_cols.get('d_neg9'))
+                    d_neg8_list.append(jsonb_cols.get('d_neg8'))
+                    d_neg7_list.append(jsonb_cols.get('d_neg7'))
+                    d_neg6_list.append(jsonb_cols.get('d_neg6'))
+                    d_neg5_list.append(jsonb_cols.get('d_neg5'))
+                    d_neg4_list.append(jsonb_cols.get('d_neg4'))
+                    d_neg3_list.append(jsonb_cols.get('d_neg3'))
+                    d_neg2_list.append(jsonb_cols.get('d_neg2'))
+                    d_neg1_list.append(jsonb_cols.get('d_neg1'))
+                    d_0_list.append(jsonb_cols.get('d_0'))
+                    d_pos1_list.append(jsonb_cols.get('d_pos1'))
+                    d_pos2_list.append(jsonb_cols.get('d_pos2'))
+                    d_pos3_list.append(jsonb_cols.get('d_pos3'))
+                    d_pos4_list.append(jsonb_cols.get('d_pos4'))
+                    d_pos5_list.append(jsonb_cols.get('d_pos5'))
+                    d_pos6_list.append(jsonb_cols.get('d_pos6'))
+                    d_pos7_list.append(jsonb_cols.get('d_pos7'))
+                    d_pos8_list.append(jsonb_cols.get('d_pos8'))
+                    d_pos9_list.append(jsonb_cols.get('d_pos9'))
+                    d_pos10_list.append(jsonb_cols.get('d_pos10'))
+                    d_pos11_list.append(jsonb_cols.get('d_pos11'))
+                    d_pos12_list.append(jsonb_cols.get('d_pos12'))
+                    d_pos13_list.append(jsonb_cols.get('d_pos13'))
+                    d_pos14_list.append(jsonb_cols.get('d_pos14'))
+
+                    wts_long_list.append(insert['wts_long'])
+                    wts_short_list.append(insert['wts_short'])
+
+                # Use text[] for JSONB columns, then cast to jsonb in SELECT
                 result = await conn.execute(
                     """
-                    UPDATE txn_events e
-                    SET price_trend = b.price_trend::jsonb
-                    FROM (
-                        SELECT * FROM UNNEST($1::text[], $2::timestamptz[], $3::text[], $4::text[], $5::text[])
-                        AS t(ticker, event_date, source, source_id, price_trend)
-                    ) b
-                    WHERE e.ticker = b.ticker
-                      AND e.event_date = b.event_date
-                      AND e.source = b.source
-                      AND e.source_id = b.source_id
+                    INSERT INTO txn_price_trend (
+                        ticker, event_date,
+                        d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
+                        d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
+                        d_neg4, d_neg3, d_neg2, d_neg1,
+                        d_0,
+                        d_pos1, d_pos2, d_pos3, d_pos4, d_pos5,
+                        d_pos6, d_pos7, d_pos8, d_pos9, d_pos10,
+                        d_pos11, d_pos12, d_pos13, d_pos14,
+                        wts_long, wts_short
+                    )
+                    SELECT
+                        ticker, event_date,
+                        NULLIF(d_neg14, '')::jsonb, NULLIF(d_neg13, '')::jsonb, NULLIF(d_neg12, '')::jsonb, NULLIF(d_neg11, '')::jsonb, NULLIF(d_neg10, '')::jsonb,
+                        NULLIF(d_neg9, '')::jsonb, NULLIF(d_neg8, '')::jsonb, NULLIF(d_neg7, '')::jsonb, NULLIF(d_neg6, '')::jsonb, NULLIF(d_neg5, '')::jsonb,
+                        NULLIF(d_neg4, '')::jsonb, NULLIF(d_neg3, '')::jsonb, NULLIF(d_neg2, '')::jsonb, NULLIF(d_neg1, '')::jsonb,
+                        NULLIF(d_0, '')::jsonb,
+                        NULLIF(d_pos1, '')::jsonb, NULLIF(d_pos2, '')::jsonb, NULLIF(d_pos3, '')::jsonb, NULLIF(d_pos4, '')::jsonb, NULLIF(d_pos5, '')::jsonb,
+                        NULLIF(d_pos6, '')::jsonb, NULLIF(d_pos7, '')::jsonb, NULLIF(d_pos8, '')::jsonb, NULLIF(d_pos9, '')::jsonb, NULLIF(d_pos10, '')::jsonb,
+                        NULLIF(d_pos11, '')::jsonb, NULLIF(d_pos12, '')::jsonb, NULLIF(d_pos13, '')::jsonb, NULLIF(d_pos14, '')::jsonb,
+                        wts_long, wts_short
+                    FROM UNNEST(
+                        $1::text[], $2::date[],
+                        $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
+                        $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
+                        $13::text[], $14::text[], $15::text[], $16::text[],
+                        $17::text[],
+                        $18::text[], $19::text[], $20::text[], $21::text[], $22::text[],
+                        $23::text[], $24::text[], $25::text[], $26::text[], $27::text[],
+                        $28::text[], $29::text[], $30::text[], $31::text[],
+                        $32::int[], $33::int[]
+                    ) AS t(
+                        ticker, event_date,
+                        d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
+                        d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
+                        d_neg4, d_neg3, d_neg2, d_neg1,
+                        d_0,
+                        d_pos1, d_pos2, d_pos3, d_pos4, d_pos5,
+                        d_pos6, d_pos7, d_pos8, d_pos9, d_pos10,
+                        d_pos11, d_pos12, d_pos13, d_pos14,
+                        wts_long, wts_short
+                    )
+                    ON CONFLICT (ticker, event_date) DO UPDATE
+                    SET
+                        d_neg14 = EXCLUDED.d_neg14,
+                        d_neg13 = EXCLUDED.d_neg13,
+                        d_neg12 = EXCLUDED.d_neg12,
+                        d_neg11 = EXCLUDED.d_neg11,
+                        d_neg10 = EXCLUDED.d_neg10,
+                        d_neg9 = EXCLUDED.d_neg9,
+                        d_neg8 = EXCLUDED.d_neg8,
+                        d_neg7 = EXCLUDED.d_neg7,
+                        d_neg6 = EXCLUDED.d_neg6,
+                        d_neg5 = EXCLUDED.d_neg5,
+                        d_neg4 = EXCLUDED.d_neg4,
+                        d_neg3 = EXCLUDED.d_neg3,
+                        d_neg2 = EXCLUDED.d_neg2,
+                        d_neg1 = EXCLUDED.d_neg1,
+                        d_0 = EXCLUDED.d_0,
+                        d_pos1 = EXCLUDED.d_pos1,
+                        d_pos2 = EXCLUDED.d_pos2,
+                        d_pos3 = EXCLUDED.d_pos3,
+                        d_pos4 = EXCLUDED.d_pos4,
+                        d_pos5 = EXCLUDED.d_pos5,
+                        d_pos6 = EXCLUDED.d_pos6,
+                        d_pos7 = EXCLUDED.d_pos7,
+                        d_pos8 = EXCLUDED.d_pos8,
+                        d_pos9 = EXCLUDED.d_pos9,
+                        d_pos10 = EXCLUDED.d_pos10,
+                        d_pos11 = EXCLUDED.d_pos11,
+                        d_pos12 = EXCLUDED.d_pos12,
+                        d_pos13 = EXCLUDED.d_pos13,
+                        d_pos14 = EXCLUDED.d_pos14,
+                        wts_long = EXCLUDED.wts_long,
+                        wts_short = EXCLUDED.wts_short,
+                        updated_at = CURRENT_TIMESTAMP
                     """,
-                    tickers,
-                    event_dates,
-                    sources,
-                    source_ids,
-                    price_trends
+                    tickers, event_dates,
+                    d_neg14_list, d_neg13_list, d_neg12_list, d_neg11_list, d_neg10_list,
+                    d_neg9_list, d_neg8_list, d_neg7_list, d_neg6_list, d_neg5_list,
+                    d_neg4_list, d_neg3_list, d_neg2_list, d_neg1_list,
+                    d_0_list,
+                    d_pos1_list, d_pos2_list, d_pos3_list, d_pos4_list, d_pos5_list,
+                    d_pos6_list, d_pos7_list, d_pos8_list, d_pos9_list, d_pos10_list,
+                    d_pos11_list, d_pos12_list, d_pos13_list, d_pos14_list,
+                    wts_long_list, wts_short_list
                 )
-                
-                # Parse update count from result
-                if "UPDATE" in result:
-                    updated_count = int(result.split()[-1])
-                    logger.info(f"[PriceTrends] Batch update completed: {updated_count} rows in {int((time.time() - batch_start) * 1000)}ms")
-                    
-                    # Adjust counts based on actual updates
-                    if updated_count < len(batch_updates):
-                        fail_count += (len(batch_updates) - updated_count)
-                        success_count = updated_count
+
+                # Parse insert count from result
+                if "INSERT" in result:
+                    # Result format: "INSERT 0 N" where N is the number of inserted rows
+                    inserted_count = int(result.split()[-1])
+                    logger.info(f"[PriceTrends] I-43: Batch UPSERT completed: {inserted_count} rows in {int((time.time() - batch_start) * 1000)}ms")
+
+                    # Adjust counts based on actual inserts
+                    if inserted_count < len(batch_inserts):
+                        fail_count += (len(batch_inserts) - inserted_count)
+                        success_count = inserted_count
+                else:
+                    logger.warning(f"[PriceTrends] I-43: Unexpected result format: {result}")
+
+                # I-43: Commit transaction
+                await conn.execute("COMMIT")
+                logger.info(f"[PriceTrends] I-43: Transaction committed successfully")
+
         except Exception as e:
-            logger.error(f"[PriceTrends] Batch update failed: {e}")
-            fail_count += len(batch_updates)
+            # I-43: Rollback on error
+            if conn is not None:
+                try:
+                    await conn.execute("ROLLBACK")
+                    logger.error(f"[PriceTrends] I-43: Transaction rolled back due to error")
+                except:
+                    pass
+            logger.error(f"[PriceTrends] I-43: Batch UPSERT failed: {e}", exc_info=True)
+            logger.error(f"[PriceTrends] I-43: Sample data (first row): {batch_inserts[0] if batch_inserts else 'N/A'}")
+            fail_count += len(batch_inserts)
             success_count = 0
 
     total_elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2044,10 +2437,10 @@ async def generate_price_trends(
     logger.info(
         f"Price trend generation completed",
         extra={
-            'endpoint': 'POST /backfillEventsTable',
+            'endpoint': 'POST /generatePriceTrends',
             'phase': 'complete_price_trends',
             'elapsed_ms': total_elapsed_ms,
-            'counters': {'success': success_count, 'fail': fail_count},
+            'counters': {'success': success_count, 'fail': fail_count, 'events': len(events), 'trades': len(trades)},
             'progress': {},
             'rate': {},
             'batch': {},
@@ -2103,6 +2496,248 @@ async def get_peer_tickers(ticker: str, event_id: Optional[str] = None) -> List[
     except Exception as e:
         logger.error(f"[I-36] Failed to get peer tickers for {ticker}: {e}", exc_info=True)
         return []
+
+
+async def collect_all_peer_tickers(
+    ticker_groups: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[str]]:
+    """
+    모든 ticker의 peer를 수집하고, unique peer set을 반환합니다.
+
+    Args:
+        ticker_groups: {ticker: [event1, event2, ...]} 형태의 딕셔너리
+
+    Returns:
+        {ticker: [peer1, peer2, ...]} 형태의 딕셔너리 (각 ticker의 peer 목록)
+    """
+    logger.info(f"[PERF-OPT] Collecting peers for {len(ticker_groups)} tickers...")
+
+    ticker_to_peers = {}
+
+    # Collect peers for each ticker
+    for ticker in ticker_groups.keys():
+        try:
+            peer_tickers = await get_peer_tickers(ticker)
+            if peer_tickers:
+                ticker_to_peers[ticker] = peer_tickers[:10]  # Limit to 10 peers per ticker
+                logger.info(f"[PERF-OPT] {ticker}: Found {len(ticker_to_peers[ticker])} peers")
+        except Exception as e:
+            logger.warning(f"[PERF-OPT] Failed to get peers for {ticker}: {e}")
+            ticker_to_peers[ticker] = []
+
+    # Get unique peer set for parallel fetching
+    all_peers = set()
+    for peers in ticker_to_peers.values():
+        all_peers.update(peers)
+
+    logger.info(f"[PERF-OPT] Total unique peers across all tickers: {len(all_peers)}")
+    logger.info(f"[PERF-OPT] Peer ticker mapping: {len(ticker_to_peers)} tickers -> {len(all_peers)} unique peers")
+
+    return ticker_to_peers, list(all_peers)
+
+
+async def fetch_single_peer_financials(
+    peer_ticker: str,
+    pool,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    reference_date
+) -> Dict[str, Any]:
+    """
+    단일 peer의 financial data를 fetch합니다.
+
+    Args:
+        peer_ticker: Peer ticker symbol
+        pool: Database pool
+        metrics_by_domain: Metric definitions
+        reference_date: Reference date for filtering
+
+    Returns:
+        {peer_ticker: {api_data, calculated_metrics}} 또는 None
+    """
+    try:
+        # Transform 정의 로드
+        transforms = await metrics.select_metric_transforms(pool)
+
+        # 메트릭 계산 엔진 초기화
+        engine = MetricCalculationEngine(metrics_by_domain, transforms)
+        engine.build_dependency_graph()
+        engine.topological_sort()
+
+        # 필요한 API 목록
+        required_apis = engine.get_required_apis()
+
+        # API 데이터 조회
+        peer_api_cache = {}
+        async with FMPAPIClient() as fmp_client:
+            for api_id in required_apis:
+                params = {'ticker': peer_ticker}
+
+                # API별 파라미터 설정
+                if 'income-statement' in api_id or 'balance-sheet' in api_id or 'cash-flow' in api_id:
+                    params['period'] = 'quarter'
+                    params['limit'] = 20
+                elif 'historical-market-cap' in api_id:
+                    params['fromDate'] = '2000-01-01'
+                    if isinstance(reference_date, str):
+                        params['toDate'] = reference_date[:10]
+                    elif hasattr(reference_date, 'strftime'):
+                        params['toDate'] = reference_date.strftime('%Y-%m-%d')
+                    else:
+                        params['toDate'] = str(reference_date)
+
+                api_response = await fmp_client.call_api(api_id, params, event_id=f"peer-cache-{peer_ticker}")
+                if api_response:
+                    peer_api_cache[api_id] = api_response
+
+        if not peer_api_cache:
+            logger.debug(f"[PERF-OPT] No API data for peer {peer_ticker}")
+            return None
+
+        # event_date 기준 필터링
+        if isinstance(reference_date, str):
+            event_date_obj = datetime.fromisoformat(reference_date.replace('Z', '+00:00')).date()
+        elif hasattr(reference_date, 'date'):
+            event_date_obj = reference_date.date()
+        else:
+            event_date_obj = reference_date
+
+        # 날짜 필터링
+        filtered_cache = {}
+        for api_id, records in peer_api_cache.items():
+            if isinstance(records, list):
+                filtered_cache[api_id] = [
+                    r for r in records
+                    if _get_record_date(r) is None or _get_record_date(r) <= event_date_obj
+                ]
+            else:
+                filtered_cache[api_id] = records
+
+        # 메트릭 계산
+        result = engine.calculate_all(filtered_cache, ['valuation'])
+
+        logger.debug(f"[PERF-OPT] Successfully fetched and calculated metrics for peer {peer_ticker}")
+
+        return {
+            'ticker': peer_ticker,
+            'api_cache': peer_api_cache,
+            'filtered_cache': filtered_cache,
+            'calculated_metrics': result
+        }
+
+    except Exception as e:
+        logger.debug(f"[PERF-OPT] Failed to fetch financials for peer {peer_ticker}: {e}")
+        return None
+
+
+async def fetch_peer_financials_parallel(
+    unique_peers: List[str],
+    pool,
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    reference_date,
+    max_concurrent: int = 20
+) -> Dict[str, Dict[str, Any]]:
+    """
+    여러 peer의 financial data를 병렬로 fetch합니다.
+
+    Args:
+        unique_peers: Unique peer ticker list
+        pool: Database pool
+        metrics_by_domain: Metric definitions
+        reference_date: Reference date for filtering
+        max_concurrent: Maximum concurrent API calls
+
+    Returns:
+        {peer_ticker: {api_cache, calculated_metrics}} 형태의 global cache
+    """
+    logger.info(f"[PERF-OPT] Fetching financial data for {len(unique_peers)} peers in parallel (max_concurrent={max_concurrent})...")
+
+    # Use semaphore to limit concurrency
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def fetch_with_semaphore(peer_ticker):
+        async with semaphore:
+            return await fetch_single_peer_financials(peer_ticker, pool, metrics_by_domain, reference_date)
+
+    # Fetch all peers in parallel
+    start_time = time.time()
+    results = await asyncio.gather(*[fetch_with_semaphore(peer) for peer in unique_peers], return_exceptions=True)
+    elapsed = time.time() - start_time
+
+    # Build global cache
+    global_peer_cache = {}
+    success_count = 0
+    for result in results:
+        if result and isinstance(result, dict) and 'ticker' in result:
+            global_peer_cache[result['ticker']] = result
+            success_count += 1
+        elif isinstance(result, Exception):
+            logger.debug(f"[PERF-OPT] Peer fetch exception: {result}")
+
+    logger.info(f"[PERF-OPT] Parallel fetching completed: {success_count}/{len(unique_peers)} peers fetched successfully in {elapsed:.2f}s")
+    logger.info(f"[PERF-OPT] Average time per peer: {elapsed/len(unique_peers):.2f}s (with parallelization)")
+
+    return global_peer_cache
+
+
+async def calculate_sector_average_from_cache(
+    peer_tickers: List[str],
+    global_peer_cache: Dict[str, Dict[str, Any]],
+    target_metrics: List[str] = ['PER', 'PBR']
+) -> Dict[str, float]:
+    """
+    캐시된 peer data로 sector average를 계산합니다.
+
+    Args:
+        peer_tickers: Peer ticker list for this ticker
+        global_peer_cache: Global peer financial data cache
+        target_metrics: Metrics to calculate average for
+
+    Returns:
+        {'PER': 25.5, 'PBR': 3.2, ...} 형태의 업종 평균
+    """
+    if not peer_tickers or not global_peer_cache:
+        return {}
+
+    # Collect metrics from cached peer data
+    peer_metrics = {metric: [] for metric in target_metrics}
+
+    for peer_ticker in peer_tickers[:10]:  # Limit to 10 peers
+        peer_data = global_peer_cache.get(peer_ticker)
+        if not peer_data:
+            continue
+
+        result = peer_data.get('calculated_metrics', {})
+        if 'valuation' in result:
+            valuation = result['valuation']
+            for metric in target_metrics:
+                value = valuation.get(metric)
+                if value is not None and isinstance(value, (int, float)) and value > 0:
+                    peer_metrics[metric].append(value)
+
+    # Calculate averages with IQR outlier removal
+    sector_averages = {}
+    for metric, values in peer_metrics.items():
+        if values:
+            # IQR 방식 이상치 제거
+            values_sorted = sorted(values)
+            n = len(values_sorted)
+            if n >= 4:
+                q1 = values_sorted[n // 4]
+                q3 = values_sorted[3 * n // 4]
+                iqr = q3 - q1
+                lower = q1 - 1.5 * iqr
+                upper = q3 + 1.5 * iqr
+                filtered_values = [v for v in values if lower <= v <= upper]
+                if filtered_values:
+                    sector_averages[metric] = sum(filtered_values) / len(filtered_values)
+                else:
+                    sector_averages[metric] = sum(values) / len(values)
+            else:
+                sector_averages[metric] = sum(values) / len(values)
+
+            logger.debug(f"[PERF-OPT] Sector average {metric}: {sector_averages[metric]:.2f} (from {len(values)} cached peers)")
+
+    return sector_averages
 
 
 async def calculate_sector_average_metrics(

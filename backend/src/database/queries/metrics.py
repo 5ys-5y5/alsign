@@ -137,6 +137,66 @@ async def select_events_for_valuation(
         return [dict(row) for row in rows]
 
 
+async def select_trades_for_price_trends(
+    pool: asyncpg.Pool,
+    from_date = None,
+    to_date = None,
+    tickers: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Select trades from txn_trades that are NOT in txn_events.
+
+    Used by generatePriceTrends to process trades that don't have corresponding events.
+
+    Args:
+        pool: Database connection pool
+        from_date: Optional start date for filtering by trade_date
+        to_date: Optional end date for filtering by trade_date
+        tickers: Optional list of ticker symbols to filter
+
+    Returns:
+        List of trade dictionaries with ticker and trade_date (aliased as event_date for compatibility)
+    """
+    async with pool.acquire() as conn:
+        query = """
+            SELECT
+                t.ticker,
+                t.trade_date AS event_date,
+                t.model,
+                t.source,
+                t.position
+            FROM txn_trades t
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM txn_events e
+                WHERE e.ticker = t.ticker
+                  AND (e.event_date AT TIME ZONE 'UTC')::date = t.trade_date
+            )
+        """
+        params = []
+        param_idx = 1
+
+        if from_date is not None:
+            query += f" AND t.trade_date >= ${param_idx}"
+            params.append(from_date)
+            param_idx += 1
+
+        if to_date is not None:
+            query += f" AND t.trade_date <= ${param_idx}"
+            params.append(to_date)
+            param_idx += 1
+
+        if tickers is not None and len(tickers) > 0:
+            query += f" AND t.ticker = ANY(${param_idx})"
+            params.append(tickers)
+            param_idx += 1
+
+        query += " ORDER BY t.ticker, t.trade_date"
+
+        rows = await conn.fetch(query, *params)
+        return [dict(row) for row in rows]
+
+
 async def select_event_by_id(
     pool: asyncpg.Pool,
     ticker: str,
