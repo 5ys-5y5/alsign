@@ -6,7 +6,7 @@ cd "$(dirname "$0")/backend"
 
 # Ensure dependencies are installed (idempotent if already cached by build step)
 if [ -f requirements.txt ]; then
-  pip install --no-cache-dir -r requirements.txt
+  python3 -m pip install --no-cache-dir -r requirements.txt
 fi
 
 # Start FastAPI with Uvicorn, honoring Railway-provided PORT
