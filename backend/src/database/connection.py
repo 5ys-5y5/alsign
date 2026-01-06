@@ -21,7 +21,7 @@ class DatabasePool:
                 dsn=settings.DATABASE_URL,
                 min_size=settings.DB_POOL_MIN_SIZE,
                 max_size=settings.DB_POOL_MAX_SIZE,
-                command_timeout=60,
+                command_timeout=300,  # Increased from 60s to 300s for large queries
                 statement_cache_size=0,
                 server_settings={
                     'application_name': 'alsign_api'

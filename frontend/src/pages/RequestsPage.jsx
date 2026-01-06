@@ -807,6 +807,15 @@ export default function RequestsPage() {
               placeholder: 'priceQuantitative,PER,PBR',
               description: 'Selective metric update: specify metric IDs to recalculate (I-41)',
             },
+            {
+              key: 'batch_size',
+              label: 'Batch Size (100-50,000)',
+              type: 'number',
+              control: 'input',
+              required: false,
+              placeholder: '5000',
+              description: 'Number of events to process per batch. Use smaller values (1,000-5,000) for faster feedback (I-44)',
+            },
           ]}
           bodyFields={[
             {

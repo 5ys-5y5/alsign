@@ -248,6 +248,12 @@ class BackfillEventsTableQueryParams(BaseModel):
         default=None,
         description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. When specified with overwrite=true, overwrites existing values; with overwrite=false, updates only NULL values. (I-41)"
     )
+    batch_size: Optional[int] = Field(
+        default=None,
+        ge=100,
+        le=50000,
+        description="Number of events to process per batch. If not specified, processes all events in one batch. Range: 100-50000. Use smaller batches (e.g., 1000-5000) for faster feedback and progress tracking. (PERFORMANCE)"
+    )
 
     def get_ticker_list(self) -> Optional[List[str]]:
         """

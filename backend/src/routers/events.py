@@ -111,7 +111,7 @@ async def backfill_events_table(
 
     logger.info("=" * 80)
     logger.info(f"[ROUTER] POST /backfillEventsTable RECEIVED - reqId={req_id}")
-    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, metrics={metrics_list}")
+    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, metrics={metrics_list}, batch_size={params.batch_size}")
     logger.info("=" * 80)
 
     try:
@@ -121,7 +121,8 @@ async def backfill_events_table(
             from_date=params.from_date,
             to_date=params.to_date,
             tickers=ticker_list,
-            metrics_list=metrics_list
+            metrics_list=metrics_list,
+            batch_size=params.batch_size
         )
         logger.info(f"[ROUTER] valuation_service.calculate_valuations completed successfully")
 

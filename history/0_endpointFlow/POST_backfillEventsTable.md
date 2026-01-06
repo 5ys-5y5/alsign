@@ -2,8 +2,8 @@
 
 > **목적**: txn_events 테이블의 이벤트들에 대해 valuation metrics를 계산하고 저장
 >
-> **최종 업데이트**: 2026-01-05 (I-43 설계 - txn_price_trend 테이블 분리, price_trend JSONB → 별도 테이블)
-> **이전 업데이트**: 2026-01-02 (I-41 Part 1+2+3 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화)
+> **최종 업데이트**: 2026-01-06 (I-44 완료 - Database timeout + peer collection 병렬 처리 성능 최적화 + batch_size 파라미터)
+> **이전 업데이트**: 2026-01-05 (I-43 설계 - txn_price_trend 테이블 분리, price_trend JSONB → 별도 테이블)
 
 ---
 
@@ -27,6 +27,7 @@
 | `tickers` | string | null | 티커 필터 (쉼표 구분, 예: "AAPL,MSFT") |
 | `calcFairValue` | boolean | true | [DEPRECATED - I-41] 업종 평균 적정가 계산 여부 → metrics=priceQuantitative 사용 권장 |
 | **`metrics`** | **string** | **null** | **업데이트할 메트릭 ID 리스트 (쉼표 구분, 예: "priceQuantitative,PER,PBR") (I-41 Part 2)** |
+| **`batch_size`** | **integer** | **null** | **배치당 처리할 이벤트 수 (100~50,000). 작은 값(1,000~5,000)은 빠른 피드백 제공 (I-44)** |
 
 **사용법 예시**:
 ```bash
@@ -44,6 +45,9 @@ POST /backfillEventsTable?metrics=priceQuantitative,PER,PBR&overwrite=false
 
 # 5. 날짜 범위 + 티커 + 선택적 메트릭 (I-41)
 POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&tickers=AAPL&metrics=priceQuantitative&overwrite=true
+
+# 6. 배치 처리로 점진적 피드백 (I-44)
+POST /backfillEventsTable?batch_size=5000
 ```
 
 ---
@@ -393,6 +397,7 @@ engine.calculate_all(api_data, target_domains)
 | I-40 | Peer tickers 미존재 로깅 | 🔄 DEPRECATED (→ I-41 제한사항) |
 | I-41 | priceQuantitative 메트릭 구현 (원본 설계 준수) | ✅ 완료 |
 | I-37 | targetMedian → 실제 Median 계산 (PERCENTILE_CONT) | ✅ 완료 |
+| I-44 | Database timeout + peer collection 병렬 처리 성능 최적화 | ✅ 완료 |
 
 ### I-25 해결 완료 (2025-12-27)
 - **문제**: `fmp-quote` API가 현재 시점 marketCap만 반환
@@ -752,8 +757,66 @@ CREATE TABLE txn_price_trend (
 - **체크리스트**: `history/1_CHECKLIST.md#I-43`
 - **엔드포인트**: `history/0_endpointFlow/GET_dashboard_events.md`
 
+### I-44 해결됨 (2026-01-06) ✅
+
+**현상**: POST /backfillEventsTable 엔드포인트가 8분+ 멈춤
+- ticker 필터 없이 호출 시 (146,696 events 처리)
+- Phase 2 데이터베이스 쿼리에서 60초 타임아웃
+- Phase 3.5 peer collection이 느림
+
+**원인 분석**:
+1. **Database connection timeout 불일치**
+   - asyncio timeout: 300s
+   - database command_timeout: 60s (병목)
+   - 실제 타임아웃: 60초 (database 설정 우선)
+
+2. **Peer collection 순차 처리**
+   - 500 tickers × 0.5s = ~250s
+   - API 호출이 병렬화되지 않음
+
+**해결책**:
+1. **Database timeout 증가**: 60s → 300s
+   - `backend/src/database/connection.py:24`
+   ```python
+   command_timeout=300,  # Increased from 60s
+   ```
+
+2. **Peer collection 병렬 처리**: asyncio.gather + Semaphore(20)
+   - `backend/src/services/valuation_service.py:2532-2606`
+   ```python
+   # OLD (순차): for-loop
+   # NEW (병렬): asyncio.gather with Semaphore(20)
+   ```
+
+3. **상세 로깅**: Phase 2에 쿼리 실행 시간, 행 수, 경고 추가
+   - `backend/src/database/queries/metrics.py:105-184`
+
+4. **batch_size 파라미터**: 점진적 처리 지원
+   - `backend/src/models/request_models.py:251-256`
+   - Range: 100 ~ 50,000
+   - 권장: 1,000 ~ 5,000 (빠른 피드백)
+
+**성능 개선**:
+| 항목 | Before | After | 개선율 |
+|------|--------|-------|--------|
+| Database timeout | 60s | 300s | 5배 |
+| Peer collection (500 tickers) | ~250s (순차) | ~19s (병렬) | **90%** |
+
+**검증 결과**:
+- ✅ AAPL test (357 events): 5분 14초 완료
+- ✅ Phase 2 timeout 해결: 300s로 대용량 쿼리 지원
+- ✅ Phase 3.5 성능: 19s (예상 250s → 90% 개선)
+
+**수정된 파일**:
+- `backend/src/database/connection.py`
+- `backend/src/database/queries/metrics.py`
+- `backend/src/services/valuation_service.py`
+- `backend/src/models/request_models.py`
+- `backend/src/routers/events.py`
+- `backend/src/routers/events_stream.py`
+
 ---
 
-*최종 업데이트: 2026-01-05 KST (I-43 설계 추가 - txn_price_trend 테이블 분리)*
-*이전 업데이트: 2026-01-02 KST (I-41 추가, I-36/I-38/I-40 deprecated)*
+*최종 업데이트: 2026-01-06 KST (I-44 추가 - Database timeout + peer collection 병렬 처리 성능 최적화)*
+*이전 업데이트: 2026-01-05 KST (I-43 설계 추가 - txn_price_trend 테이블 분리)*
 

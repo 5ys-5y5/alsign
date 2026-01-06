@@ -167,6 +167,8 @@ async def get_events(
     industry: Optional[str] = Query(None, description="Filter by industry (contains)"),
     source: Optional[str] = Query(None, description="Filter by source (contains)"),
     condition: Optional[str] = Query(None, description="Filter by condition (contains)"),
+    event_date_from: Optional[str] = Query(None, alias="eventDateFrom", description="Filter by event_date >= (YYYY-MM-DD)"),
+    event_date_to: Optional[str] = Query(None, alias="eventDateTo", description="Filter by event_date <= (YYYY-MM-DD)"),
 ):
     """
     Get events from txn_events table with pagination, filtering, and sorting.
@@ -188,28 +190,38 @@ async def get_events(
         param_count = 1
 
         if ticker:
-            where_conditions.append(f"ticker ILIKE ${param_count}")
+            where_conditions.append(f"e.ticker ILIKE ${param_count}")
             params.append(f"%{ticker}%")
             param_count += 1
 
         if sector:
-            where_conditions.append(f"sector ILIKE ${param_count}")
+            where_conditions.append(f"e.sector ILIKE ${param_count}")
             params.append(f"%{sector}%")
             param_count += 1
 
         if industry:
-            where_conditions.append(f"industry ILIKE ${param_count}")
+            where_conditions.append(f"e.industry ILIKE ${param_count}")
             params.append(f"%{industry}%")
             param_count += 1
 
         if source:
-            where_conditions.append(f"source ILIKE ${param_count}")
+            where_conditions.append(f"e.source ILIKE ${param_count}")
             params.append(f"%{source}%")
             param_count += 1
 
         if condition:
-            where_conditions.append(f"condition ILIKE ${param_count}")
+            where_conditions.append(f"e.condition ILIKE ${param_count}")
             params.append(f"%{condition}%")
+            param_count += 1
+
+        if event_date_from:
+            where_conditions.append(f"e.event_date >= ${param_count}::date")
+            params.append(event_date_from)
+            param_count += 1
+
+        if event_date_to:
+            where_conditions.append(f"e.event_date <= ${param_count}::date")
+            params.append(event_date_to)
             param_count += 1
 
         where_clause = " AND ".join(where_conditions) if where_conditions else "TRUE"
@@ -231,14 +243,14 @@ async def get_events(
             "condition",
         ]
 
-        order_clause = "id ASC"  # Default sort
+        order_clause = "e.id ASC"  # Default sort
         if sortBy and sortOrder:
             if sortBy not in allowed_sort_columns:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Invalid sort column. Allowed: {', '.join(allowed_sort_columns)}",
                 )
-            order_clause = f"{sortBy} {sortOrder.upper()}"
+            order_clause = f"e.{sortBy} {sortOrder.upper()}"
 
         # Calculate offset
         offset = (page - 1) * pageSize
@@ -246,28 +258,38 @@ async def get_events(
         pool = await db_pool.get_pool()
         async with pool.acquire() as conn:
             # Get total count
-            count_query = f"SELECT COUNT(*) FROM txn_events WHERE {where_clause}"
+            count_query = f"SELECT COUNT(*) FROM txn_events e WHERE {where_clause}"
             total = await conn.fetchval(count_query, *params)
 
-            # Get data with price_trend extraction
+            # Get data with txn_price_trend JOIN (price_trend JSONB is deprecated)
             data_query = f"""
                 SELECT
-                    id::text,
-                    ticker,
-                    TO_CHAR(event_date, 'YYYY-MM-DD') as event_date,
-                    sector,
-                    industry,
-                    source,
-                    source_id,
-                    position_quantitative::text,
-                    disparity_quantitative,
-                    position_qualitative::text,
-                    disparity_qualitative,
-                    condition,
-                    price_trend,
-                    position_quantitative as pos_q_enum,
-                    position_qualitative as pos_ql_enum
-                FROM txn_events
+                    e.id::text,
+                    e.ticker,
+                    TO_CHAR(e.event_date, 'YYYY-MM-DD') as event_date,
+                    e.sector,
+                    e.industry,
+                    e.source,
+                    e.source_id,
+                    e.position_quantitative::text,
+                    e.disparity_quantitative,
+                    e.position_qualitative::text,
+                    e.disparity_qualitative,
+                    e.condition,
+                    e.position_quantitative as pos_q_enum,
+                    e.position_qualitative as pos_ql_enum,
+                    -- Price trend data from txn_price_trend table
+                    pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
+                    pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
+                    pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1,
+                    pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
+                    pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
+                    pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14
+                FROM txn_events e
+                LEFT JOIN txn_price_trend pt ON (
+                    e.ticker = pt.ticker
+                    AND e.event_date::date = pt.event_date
+                )
                 WHERE {where_clause}
                 ORDER BY {order_clause}
                 LIMIT {pageSize}
@@ -281,49 +303,43 @@ async def get_events(
                 f"rows_fetched={len(rows)} page={page} pageSize={pageSize}"
             )
 
-            # Process rows and extract price_trend data
+            # Process rows and extract price_trend data from txn_price_trend
             data = []
             for row in rows:
                 row_id = str(row["id"])
                 logger.debug(f"Processing row: id={row_id}, type={type(row_id)}, ticker={row['ticker']}")
 
                 try:
-                    # Extract price_trend data (JSONB with D-14 to D14)
-                    raw_price_trend = row["price_trend"]
-                    price_trend = {}
-
-                    # Parse based on type
-                    if isinstance(raw_price_trend, str):
-                        try:
-                            parsed = json.loads(raw_price_trend)
-                            # Check if parsed result is a dict
-                            if isinstance(parsed, dict):
-                                price_trend = parsed
-                            else:
-                                price_trend = {}
-                        except (json.JSONDecodeError, TypeError):
-                            price_trend = {}
-                    elif isinstance(raw_price_trend, dict):
-                        price_trend = raw_price_trend
-                    elif isinstance(raw_price_trend, list):
-                        # If it's a list, skip - we can't extract day offsets
-                        price_trend = {}
-                    else:
-                        price_trend = {}
-
-                    # Helper function to extract day offset value
+                    # Helper function to extract performance.close from JSONB
                     def get_day_value(day_offset: int) -> Optional[float]:
-                        """Extract value for day offset from price_trend."""
-                        if not price_trend:
-                            return None
-                        # Try different key formats: "D-14", "D+1", etc.
-                        key = f"D{day_offset:+d}" if day_offset != 0 else "D0"
-                        # Also try without sign for negative
-                        alt_key = f"D{day_offset}"
+                        """Extract performance.close value for day offset from txn_price_trend JSONB."""
+                        # Map offset to column name
+                        if day_offset < 0:
+                            col_name = f"d_neg{abs(day_offset)}"
+                        else:
+                            col_name = f"d_pos{day_offset}"
 
-                        value = price_trend.get(key) or price_trend.get(alt_key)
-                        if value is not None:
-                            return float(value)
+                        raw_data = row.get(col_name)
+                        if not raw_data:
+                            return None
+
+                        # Parse JSONB
+                        try:
+                            if isinstance(raw_data, str):
+                                data_obj = json.loads(raw_data)
+                            elif isinstance(raw_data, dict):
+                                data_obj = raw_data
+                            else:
+                                return None
+
+                            # Extract performance.close
+                            performance = data_obj.get('performance', {})
+                            close_value = performance.get('close')
+                            if close_value is not None:
+                                return float(close_value)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+
                         return None
 
                     # Extract all day offsets (D-14 to D14, excluding D0)
@@ -571,6 +587,335 @@ class BulkUpdateResponse(BaseModel):
 
     updated_count: int
     message: str
+
+
+class TradeRow(BaseModel):
+    """Response model for a single trade row."""
+
+    ticker: str
+    trade_date: str
+    model: str
+    source: Optional[str]
+    position: Optional[str]
+    entry_price: Optional[float]
+    exit_price: Optional[float]
+    quantity: Optional[int]
+    notes: Optional[str]
+    # WTS - which day offset (D+N) has the maximum return
+    wts: Optional[int]
+    # Day offset returns D-14 to D14 (excluding D0)
+    d_neg14: Optional[float]
+    d_neg13: Optional[float]
+    d_neg12: Optional[float]
+    d_neg11: Optional[float]
+    d_neg10: Optional[float]
+    d_neg9: Optional[float]
+    d_neg8: Optional[float]
+    d_neg7: Optional[float]
+    d_neg6: Optional[float]
+    d_neg5: Optional[float]
+    d_neg4: Optional[float]
+    d_neg3: Optional[float]
+    d_neg2: Optional[float]
+    d_neg1: Optional[float]
+    d_pos1: Optional[float]
+    d_pos2: Optional[float]
+    d_pos3: Optional[float]
+    d_pos4: Optional[float]
+    d_pos5: Optional[float]
+    d_pos6: Optional[float]
+    d_pos7: Optional[float]
+    d_pos8: Optional[float]
+    d_pos9: Optional[float]
+    d_pos10: Optional[float]
+    d_pos11: Optional[float]
+    d_pos12: Optional[float]
+    d_pos13: Optional[float]
+    d_pos14: Optional[float]
+
+
+class TradesResponse(BaseModel):
+    """Response model for trades with pagination."""
+
+    data: List[TradeRow]
+    total: int
+    page: int
+    pageSize: int
+
+
+@router.get("/trades", response_model=TradesResponse)
+async def get_trades(
+    page: int = Query(1, ge=1, description="Page number starting from 1"),
+    pageSize: int = Query(50, ge=1, le=1000, description="Number of rows per page"),
+    sortBy: Optional[str] = Query(None, description="Column to sort by"),
+    sortOrder: Optional[str] = Query(
+        None, regex="^(asc|desc)$", description="Sort order: asc or desc"
+    ),
+    ticker: Optional[str] = Query(None, description="Filter by ticker (contains)"),
+    model: Optional[str] = Query(None, description="Filter by model (contains)"),
+    source: Optional[str] = Query(None, description="Filter by source (contains)"),
+    position: Optional[str] = Query(None, description="Filter by position (contains)"),
+    trade_date_from: Optional[str] = Query(None, alias="tradeDateFrom", description="Filter by trade_date >= (YYYY-MM-DD)"),
+    trade_date_to: Optional[str] = Query(None, alias="tradeDateTo", description="Filter by trade_date <= (YYYY-MM-DD)"),
+):
+    """
+    Get trades from txn_trades table with pagination, filtering, and sorting.
+
+    Supports:
+    - Pagination via page and pageSize
+    - Filtering by ticker, model, source, position (case-insensitive contains)
+    - Sorting by any column (asc/desc)
+    - LEFT JOIN with txn_price_trend for day offset returns
+    """
+    logger.info(
+        f"action=get_trades phase=request_received "
+        f"page={page} pageSize={pageSize} sortBy={sortBy} sortOrder={sortOrder} "
+        f"ticker={ticker} model={model} source={source} position={position}"
+    )
+    try:
+        # Build WHERE clause
+        where_conditions = []
+        params = []
+        param_count = 1
+
+        if ticker:
+            where_conditions.append(f"t.ticker ILIKE ${param_count}")
+            params.append(f"%{ticker}%")
+            param_count += 1
+
+        if model:
+            where_conditions.append(f"t.model ILIKE ${param_count}")
+            params.append(f"%{model}%")
+            param_count += 1
+
+        if source:
+            where_conditions.append(f"t.source ILIKE ${param_count}")
+            params.append(f"%{source}%")
+            param_count += 1
+
+        if position:
+            where_conditions.append(f"t.position ILIKE ${param_count}")
+            params.append(f"%{position}%")
+            param_count += 1
+
+        if trade_date_from:
+            where_conditions.append(f"t.trade_date >= ${param_count}::date")
+            params.append(trade_date_from)
+            param_count += 1
+
+        if trade_date_to:
+            where_conditions.append(f"t.trade_date <= ${param_count}::date")
+            params.append(trade_date_to)
+            param_count += 1
+
+        where_clause = " AND ".join(where_conditions) if where_conditions else "TRUE"
+
+        # Build ORDER BY clause
+        allowed_sort_columns = [
+            "ticker",
+            "trade_date",
+            "model",
+            "source",
+            "position",
+            "entry_price",
+            "exit_price",
+            "quantity",
+        ]
+
+        order_clause = "t.ticker ASC, t.trade_date ASC"  # Default sort
+        if sortBy and sortOrder:
+            if sortBy not in allowed_sort_columns:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid sort column. Allowed: {', '.join(allowed_sort_columns)}",
+                )
+            order_clause = f"t.{sortBy} {sortOrder.upper()}"
+
+        # Calculate offset
+        offset = (page - 1) * pageSize
+
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            # Get total count
+            count_query = f"SELECT COUNT(*) FROM txn_trades t WHERE {where_clause}"
+            total = await conn.fetchval(count_query, *params)
+
+            # Get data with txn_price_trend JOIN
+            data_query = f"""
+                SELECT
+                    t.ticker,
+                    TO_CHAR(t.trade_date, 'YYYY-MM-DD') as trade_date,
+                    t.model,
+                    t.source,
+                    t.position,
+                    t.entry_price,
+                    t.exit_price,
+                    t.quantity,
+                    t.notes,
+                    -- Price trend data from txn_price_trend table (JOIN on trade_date = event_date)
+                    pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
+                    pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
+                    pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1,
+                    pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
+                    pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
+                    pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14
+                FROM txn_trades t
+                LEFT JOIN txn_price_trend pt ON (
+                    t.ticker = pt.ticker
+                    AND t.trade_date = pt.event_date
+                )
+                WHERE {where_clause}
+                ORDER BY {order_clause}
+                LIMIT {pageSize}
+                OFFSET {offset}
+            """
+
+            rows = await conn.fetch(data_query, *params)
+
+            logger.debug(
+                f"action=get_trades phase=query_complete "
+                f"rows_fetched={len(rows)} page={page} pageSize={pageSize}"
+            )
+
+            # Process rows and extract price_trend data from txn_price_trend
+            data = []
+            for row in rows:
+                try:
+                    # Helper function to extract performance.close from JSONB
+                    def get_day_value(day_offset: int) -> Optional[float]:
+                        """Extract performance.close value for day offset from txn_price_trend JSONB."""
+                        # Map offset to column name
+                        if day_offset < 0:
+                            col_name = f"d_neg{abs(day_offset)}"
+                        else:
+                            col_name = f"d_pos{day_offset}"
+
+                        raw_data = row.get(col_name)
+                        if not raw_data:
+                            return None
+
+                        # Parse JSONB
+                        try:
+                            if isinstance(raw_data, str):
+                                data_obj = json.loads(raw_data)
+                            elif isinstance(raw_data, dict):
+                                data_obj = raw_data
+                            else:
+                                return None
+
+                            # Extract performance.close
+                            performance = data_obj.get('performance', {})
+                            close_value = performance.get('close')
+                            if close_value is not None:
+                                return float(close_value)
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+
+                        return None
+
+                    # Extract all day offsets (D-14 to D14, excluding D0)
+                    day_values = {}
+                    for offset in range(-14, 15):
+                        if offset == 0:
+                            continue
+                        day_values[offset] = get_day_value(offset)
+
+                    # Calculate WTS: day offset with maximum return
+                    # For trades, use position to determine multiplier
+                    position_multiplier = 1
+                    pos = row["position"]
+                    if pos:
+                        pos_str = str(pos).lower()
+                        if pos_str == "short":
+                            position_multiplier = -1
+                        elif pos_str == "neutral" or pos_str == "null":
+                            position_multiplier = 0
+
+                    wts = None
+                    if position_multiplier != 0:
+                        max_return = None
+                        max_offset = None
+                        for offset, value in day_values.items():
+                            if value is not None:
+                                adjusted_return = value * position_multiplier
+                                if max_return is None or adjusted_return > max_return:
+                                    max_return = adjusted_return
+                                    max_offset = offset
+                        wts = max_offset
+
+                    row_data = TradeRow(
+                        ticker=row["ticker"],
+                        trade_date=row["trade_date"],
+                        model=row["model"],
+                        source=row["source"],
+                        position=row["position"],
+                        entry_price=row["entry_price"],
+                        exit_price=row["exit_price"],
+                        quantity=row["quantity"],
+                        notes=row["notes"],
+                        wts=wts,
+                        # Day offset values
+                        d_neg14=day_values.get(-14),
+                        d_neg13=day_values.get(-13),
+                        d_neg12=day_values.get(-12),
+                        d_neg11=day_values.get(-11),
+                        d_neg10=day_values.get(-10),
+                        d_neg9=day_values.get(-9),
+                        d_neg8=day_values.get(-8),
+                        d_neg7=day_values.get(-7),
+                        d_neg6=day_values.get(-6),
+                        d_neg5=day_values.get(-5),
+                        d_neg4=day_values.get(-4),
+                        d_neg3=day_values.get(-3),
+                        d_neg2=day_values.get(-2),
+                        d_neg1=day_values.get(-1),
+                        d_pos1=day_values.get(1),
+                        d_pos2=day_values.get(2),
+                        d_pos3=day_values.get(3),
+                        d_pos4=day_values.get(4),
+                        d_pos5=day_values.get(5),
+                        d_pos6=day_values.get(6),
+                        d_pos7=day_values.get(7),
+                        d_pos8=day_values.get(8),
+                        d_pos9=day_values.get(9),
+                        d_pos10=day_values.get(10),
+                        d_pos11=day_values.get(11),
+                        d_pos12=day_values.get(12),
+                        d_pos13=day_values.get(13),
+                        d_pos14=day_values.get(14),
+                    )
+                    data.append(row_data)
+                except Exception as e:
+                    logger.error(f"Failed to create TradeRow: {e}, ticker={row['ticker']}, trade_date={row['trade_date']}")
+                    raise
+
+            # Log warning if no data found
+            if total == 0:
+                logger.warning(
+                    "action=get_trades status=empty_result message='No trades in txn_trades table. "
+                    "Please insert trades using POST /trades endpoint.'"
+                )
+
+            logger.info(
+                f"action=get_trades status=success page={page} "
+                f"pageSize={pageSize} total={total} returned={len(data)}"
+            )
+
+            return TradesResponse(
+                data=data, total=total, page=page, pageSize=pageSize
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"action=get_trades status=error error={str(e)} "
+            f"error_type={type(e).__name__} page={page} pageSize={pageSize}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch trades: {str(e)}"
+        )
 
 
 @router.post("/bulkUpdate", response_model=BulkUpdateResponse)

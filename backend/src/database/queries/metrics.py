@@ -1,8 +1,10 @@
 """Database queries for metric definitions and event valuations."""
 
+import asyncio
 import asyncpg
 import json
 import logging
+import time
 from typing import List, Dict, Any, Optional
 
 from ...utils.logging_utils import log_db_update, log_row_update
@@ -100,7 +102,13 @@ async def select_events_for_valuation(
     Returns:
         List of event dictionaries with ticker, event_date, source, source_id
     """
+    start_time = time.time()
+    logger.info("=" * 80)
+    logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}")
+
     async with pool.acquire() as conn:
+        logger.info(f"[select_events_for_valuation] Database connection acquired in {time.time() - start_time:.2f}s")
+
         query = """
             SELECT id, ticker, event_date, source, source_id,
                    sector, industry,
@@ -133,8 +141,49 @@ async def select_events_for_valuation(
         if limit:
             query += f" LIMIT {limit}"
 
-        rows = await conn.fetch(query, *params)
-        return [dict(row) for row in rows]
+        logger.info(f"[select_events_for_valuation] Query built in {time.time() - start_time:.2f}s")
+        logger.info(f"[select_events_for_valuation] Query params: {params}")
+        logger.info(f"[select_events_for_valuation] Executing database query (timeout=120s)...")
+
+        query_start = time.time()
+
+        try:
+            # Add timeout to prevent long-running queries (increased for large datasets)
+            QUERY_TIMEOUT = 300.0  # 5 minutes timeout (increased from 2 minutes)
+            logger.info(f"[select_events_for_valuation] Query timeout set to {QUERY_TIMEOUT}s")
+
+            rows = await asyncio.wait_for(
+                conn.fetch(query, *params),
+                timeout=QUERY_TIMEOUT
+            )
+            query_elapsed = time.time() - query_start
+            total_elapsed = time.time() - start_time
+            logger.info(f"[select_events_for_valuation] ✓ Query executed in {query_elapsed:.2f}s - fetched {len(rows)} rows")
+
+            # Performance warning for slow queries
+            if query_elapsed > 60:
+                logger.warning(f"[select_events_for_valuation] ⚠️ Slow query detected ({query_elapsed:.2f}s > 60s). Consider adding indexes or using filters.")
+
+            logger.info(f"[select_events_for_valuation] Converting {len(rows)} rows to dict...")
+            convert_start = time.time()
+
+            result = [dict(row) for row in rows]
+
+            convert_elapsed = time.time() - convert_start
+            logger.info(f"[select_events_for_valuation] ✓ Conversion completed in {convert_elapsed:.2f}s - total time: {total_elapsed:.2f}s")
+            logger.info("=" * 80)
+            return result
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            logger.error("=" * 80)
+            logger.error(f"[select_events_for_valuation] ✗ Query TIMEOUT after {elapsed:.2f}s (timeout={QUERY_TIMEOUT}s)")
+            logger.error(f"[select_events_for_valuation] ⚠️ This query is taking too long.")
+            logger.error(f"[select_events_for_valuation] 💡 Recommendations:")
+            logger.error(f"[select_events_for_valuation]    1. Add date filters: ?from_date=2024-01-01&to_date=2024-12-31")
+            logger.error(f"[select_events_for_valuation]    2. Add ticker filters: ?tickers=AAPL,MSFT,GOOGL")
+            logger.error(f"[select_events_for_valuation]    3. Check database indexes on txn_events(ticker, event_date)")
+            logger.error("=" * 80)
+            raise Exception(f"Database query timeout after {elapsed:.2f}s - the query is taking too long. Consider adding date/ticker filters or checking database performance.")
 
 
 async def select_trades_for_price_trends(

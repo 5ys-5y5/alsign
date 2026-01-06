@@ -190,7 +190,7 @@ export default function EventsTable({
         count: ids.length
       }));
       setBulkEditConflicts(conflicts);
-      setBulkEditMessage(`Info: Selected rows have different ${bulkEditField} values. Select a value below or enter a new one.`);
+      setBulkEditMessage(`Info: Selected rows have different ${bulkEditField} values. Click "Use This Value" to fill the input field, or enter a custom value. The new value will be applied to ALL ${selectedRowIds.size} selected rows.`);
       setBulkEditValue('');
     }
   }, [bulkEditOperation, bulkEditField, selectedRowIds, data]);
@@ -198,8 +198,9 @@ export default function EventsTable({
   // Handle selecting a conflict value
   const handleSelectConflictValue = (rawValue) => {
     setBulkEditValue(rawValue);
+    // Keep original selectedRowIds - do NOT change selection scope
     setBulkEditConflicts([]);
-    setBulkEditMessage('');
+    setBulkEditMessage(`Info: Selected value "${rawValue === '' ? '(empty)' : rawValue}" will be applied to ALL ${selectedRowIds.size} selected row(s)`);
   };
 
   // Handle bulk edit submission
@@ -269,6 +270,51 @@ export default function EventsTable({
         </button>
       </div>
 
+      {/* Date Range Filter */}
+      <div style={{
+        display: 'flex',
+        gap: 'var(--space-2)',
+        alignItems: 'center',
+        marginBottom: 'var(--space-3)',
+        padding: 'var(--space-2)',
+        backgroundColor: 'var(--surface)',
+        borderRadius: 'var(--rounded-lg)',
+        border: '1px solid var(--border)'
+      }}>
+        <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)', whiteSpace: 'nowrap' }}>
+          Filter event_date:
+        </label>
+        <input
+          type="date"
+          value={filters.eventDateFrom || ''}
+          onChange={(e) => onFiltersChange({ ...filters, eventDateFrom: e.target.value })}
+          placeholder="From"
+          style={{ flex: '1', minWidth: '140px' }}
+        />
+        <span style={{ color: 'var(--text-dim)' }}>to</span>
+        <input
+          type="date"
+          value={filters.eventDateTo || ''}
+          onChange={(e) => onFiltersChange({ ...filters, eventDateTo: e.target.value })}
+          placeholder="To"
+          style={{ flex: '1', minWidth: '140px' }}
+        />
+        {(filters.eventDateFrom || filters.eventDateTo) && (
+          <button
+            className="btn btn-sm btn-outline"
+            onClick={() => {
+              const newFilters = { ...filters };
+              delete newFilters.eventDateFrom;
+              delete newFilters.eventDateTo;
+              onFiltersChange(newFilters);
+            }}
+            style={{ whiteSpace: 'nowrap' }}
+          >
+            Clear Dates
+          </button>
+        )}
+      </div>
+
       {showBulkEdit && selectedRowIds.size > 0 && (
         <div style={{
           padding: 'var(--space-3)',
@@ -277,8 +323,18 @@ export default function EventsTable({
           marginBottom: 'var(--space-3)',
           border: '1px solid var(--border)'
         }}>
-          <h3 style={{ marginBottom: 'var(--space-2)', fontSize: 'var(--text-base)' }}>
-            Bulk Edit {selectedRowIds.size} Events
+          <h3 style={{ marginBottom: 'var(--space-2)', fontSize: 'var(--text-base)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span>Bulk Edit</span>
+            <span style={{
+              backgroundColor: '#1e40af',
+              color: 'white',
+              padding: '2px 8px',
+              borderRadius: 'var(--rounded)',
+              fontSize: 'var(--text-sm)',
+              fontWeight: 'var(--font-bold)'
+            }}>
+              {selectedRowIds.size} rows
+            </span>
           </h3>
 
           <div style={{ display: 'flex', marginBottom: 'var(--space-2)', flexFlow: 'column', gap: '15px' }}>
@@ -427,7 +483,7 @@ export default function EventsTable({
                       onClick={() => handleSelectConflictValue(conflict.rawValue)}
                       style={{ minWidth: '80px' }}
                     >
-                      Select
+                      Use This Value
                     </button>
                   </div>
                   <div style={{
@@ -446,9 +502,10 @@ export default function EventsTable({
                 paddingTop: 'var(--space-2)',
                 borderTop: '1px solid var(--border)',
                 fontSize: 'var(--text-sm)',
-                color: 'var(--text-dim)'
+                color: 'var(--text-dim)',
+                fontWeight: 'var(--font-medium)'
               }}>
-                Click "Select" to use one of the existing values, or enter a new value in the field above.
+                ⚠️ Important: Click "Use This Value" to copy an existing value to the input field, or enter a custom value. The final value will be applied to ALL {selectedRowIds.size} selected rows when you click Apply.
               </div>
             </div>
           )}

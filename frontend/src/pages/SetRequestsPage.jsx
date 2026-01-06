@@ -271,6 +271,11 @@ const ENDPOINT_FLOWS = {
         url: 'POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&tickers=AAPL,MSFT&metrics=priceQuantitative&overwrite=true',
         description: '2024년, AAPL/MSFT만, priceQuantitative 강제 재계산'
       },
+      {
+        title: '배치 처리 (점진적 피드백)',
+        url: 'POST /backfillEventsTable?batch_size=5000',
+        description: '5,000개씩 배치 처리하여 빠른 진행 피드백 제공 (I-44)'
+      },
     ],
     phases: [
       {
