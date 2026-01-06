@@ -14,6 +14,8 @@ class DatabasePool:
     async def connect(self) -> asyncpg.Pool:
         """Create and return connection pool."""
         if self._pool is None:
+            if not settings.DATABASE_URL:
+                raise RuntimeError("DATABASE_URL is not configured; cannot create database pool.")
             # Supabase requires SSL for connections
             # asyncpg will automatically use SSL when connecting to Supabase
             # statement_cache_size=0 is required for Supabase connection pooler compatibility

@@ -31,8 +31,11 @@ async def lifespan(app: FastAPI):
     """
     # Startup
     logger.info("Starting application...")
-    await db_pool.connect()
-    logger.info("Database connection pool created")
+    if settings.DATABASE_URL:
+        await db_pool.connect()
+        logger.info("Database connection pool created")
+    else:
+        logger.warning("DATABASE_URL not set; skipping database connection pool creation")
 
     yield
 
@@ -105,27 +108,33 @@ async def health_check():
     }
 
     # Check database connection
-    try:
-        pool = await db_pool.get_pool()
-        async with pool.acquire() as conn:
-            # Test connection and get database version
-            db_version = await conn.fetchval("SELECT version()")
-            await conn.fetchval("SELECT 1")
-
-        health_status["checks"]["database"] = {
-            "status": "healthy",
-            "message": "Connected",
-            "details": {
-                "pool_size": pool.get_size(),
-                "pool_max_size": pool.get_max_size(),
-            }
-        }
-    except Exception as e:
-        logger.error(f"Health check database failure: {e}")
+    if not settings.DATABASE_URL:
         health_status["checks"]["database"] = {
             "status": "unhealthy",
-            "message": str(e)
+            "message": "DATABASE_URL not configured",
         }
+    else:
+        try:
+            pool = await db_pool.get_pool()
+            async with pool.acquire() as conn:
+                # Test connection and get database version
+                await conn.fetchval("SELECT version()")
+                await conn.fetchval("SELECT 1")
+
+            health_status["checks"]["database"] = {
+                "status": "healthy",
+                "message": "Connected",
+                "details": {
+                    "pool_size": pool.get_size(),
+                    "pool_max_size": pool.get_max_size(),
+                }
+            }
+        except Exception as e:
+            logger.error(f"Health check database failure: {e}")
+            health_status["checks"]["database"] = {
+                "status": "unhealthy",
+                "message": str(e)
+            }
 
     # Overall status
     all_healthy = all(

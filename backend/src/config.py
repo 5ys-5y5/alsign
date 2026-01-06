@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # Database Configuration
-    DATABASE_URL: str
+    DATABASE_URL: str | None = None
     DB_POOL_MIN_SIZE: int = 10
     DB_POOL_MAX_SIZE: int = 20
 
