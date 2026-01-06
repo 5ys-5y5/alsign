@@ -5,7 +5,7 @@ import json
 from fastapi import APIRouter, HTTPException, Query, Body
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, date
 from uuid import UUID
 
 from ..database.connection import db_pool
@@ -167,6 +167,12 @@ async def get_events(
     industry: Optional[str] = Query(None, description="Filter by industry (contains)"),
     source: Optional[str] = Query(None, description="Filter by source (contains)"),
     condition: Optional[str] = Query(None, description="Filter by condition (contains)"),
+    position_quantitative: Optional[str] = Query(None, description="Filter by position_quantitative (exact match)"),
+    position_qualitative: Optional[str] = Query(None, description="Filter by position_qualitative (exact match)"),
+    disparity_quantitative_min: Optional[float] = Query(None, description="Filter by disparity_quantitative >= value"),
+    disparity_quantitative_max: Optional[float] = Query(None, description="Filter by disparity_quantitative <= value"),
+    disparity_qualitative_min: Optional[float] = Query(None, description="Filter by disparity_qualitative >= value"),
+    disparity_qualitative_max: Optional[float] = Query(None, description="Filter by disparity_qualitative <= value"),
     event_date_from: Optional[str] = Query(None, alias="eventDateFrom", description="Filter by event_date >= (YYYY-MM-DD)"),
     event_date_to: Optional[str] = Query(None, alias="eventDateTo", description="Filter by event_date <= (YYYY-MM-DD)"),
 ):
@@ -176,12 +182,14 @@ async def get_events(
     Supports:
     - Pagination via page and pageSize
     - Filtering by ticker, sector, industry, source, condition (case-insensitive contains)
+    - Date range filtering with eventDateFrom and eventDateTo
     - Sorting by any column (asc/desc)
     """
     logger.info(
         f"action=get_events phase=request_received "
         f"page={page} pageSize={pageSize} sortBy={sortBy} sortOrder={sortOrder} "
-        f"ticker={ticker} sector={sector} industry={industry} source={source} condition={condition}"
+        f"ticker={ticker} sector={sector} industry={industry} source={source} condition={condition} "
+        f"event_date_from={event_date_from} event_date_to={event_date_to}"
     )
     try:
         # Build WHERE clause
@@ -190,38 +198,90 @@ async def get_events(
         param_count = 1
 
         if ticker:
-            where_conditions.append(f"e.ticker ILIKE ${param_count}")
-            params.append(f"%{ticker}%")
+            if ticker.startswith('='):
+                # Exact match: =AAPL
+                where_conditions.append(f"e.ticker = ${param_count}")
+                params.append(ticker[1:])
+            else:
+                # Partial match: AAPL or dit (matches EDIT)
+                where_conditions.append(f"e.ticker ILIKE ${param_count}")
+                params.append(f"%{ticker}%")
             param_count += 1
 
         if sector:
-            where_conditions.append(f"e.sector ILIKE ${param_count}")
-            params.append(f"%{sector}%")
+            if sector.startswith('='):
+                where_conditions.append(f"e.sector = ${param_count}")
+                params.append(sector[1:])
+            else:
+                where_conditions.append(f"e.sector ILIKE ${param_count}")
+                params.append(f"%{sector}%")
             param_count += 1
 
         if industry:
-            where_conditions.append(f"e.industry ILIKE ${param_count}")
-            params.append(f"%{industry}%")
+            if industry.startswith('='):
+                where_conditions.append(f"e.industry = ${param_count}")
+                params.append(industry[1:])
+            else:
+                where_conditions.append(f"e.industry ILIKE ${param_count}")
+                params.append(f"%{industry}%")
             param_count += 1
 
         if source:
-            where_conditions.append(f"e.source ILIKE ${param_count}")
-            params.append(f"%{source}%")
+            if source.startswith('='):
+                where_conditions.append(f"e.source = ${param_count}")
+                params.append(source[1:])
+            else:
+                where_conditions.append(f"e.source ILIKE ${param_count}")
+                params.append(f"%{source}%")
             param_count += 1
 
         if condition:
-            where_conditions.append(f"e.condition ILIKE ${param_count}")
-            params.append(f"%{condition}%")
+            if condition.startswith('='):
+                where_conditions.append(f"e.condition = ${param_count}")
+                params.append(condition[1:])
+            else:
+                where_conditions.append(f"e.condition ILIKE ${param_count}")
+                params.append(f"%{condition}%")
+            param_count += 1
+
+        if position_quantitative:
+            where_conditions.append(f"e.position_quantitative::text = ${param_count}")
+            params.append(position_quantitative)
+            param_count += 1
+
+        if position_qualitative:
+            where_conditions.append(f"e.position_qualitative::text = ${param_count}")
+            params.append(position_qualitative)
+            param_count += 1
+
+        if disparity_quantitative_min is not None:
+            where_conditions.append(f"e.disparity_quantitative >= ${param_count}")
+            params.append(disparity_quantitative_min)
+            param_count += 1
+
+        if disparity_quantitative_max is not None:
+            where_conditions.append(f"e.disparity_quantitative <= ${param_count}")
+            params.append(disparity_quantitative_max)
+            param_count += 1
+
+        if disparity_qualitative_min is not None:
+            where_conditions.append(f"e.disparity_qualitative >= ${param_count}")
+            params.append(disparity_qualitative_min)
+            param_count += 1
+
+        if disparity_qualitative_max is not None:
+            where_conditions.append(f"e.disparity_qualitative <= ${param_count}")
+            params.append(disparity_qualitative_max)
             param_count += 1
 
         if event_date_from:
-            where_conditions.append(f"e.event_date >= ${param_count}::date")
-            params.append(event_date_from)
+            where_conditions.append(f"e.event_date >= ${param_count}")
+            params.append(date.fromisoformat(event_date_from))
             param_count += 1
 
         if event_date_to:
-            where_conditions.append(f"e.event_date <= ${param_count}::date")
-            params.append(event_date_to)
+            where_conditions.append(f"e.event_date <= ${param_count}")
+            params.append(date.fromisoformat(event_date_to))
             param_count += 1
 
         where_clause = " AND ".join(where_conditions) if where_conditions else "TRUE"
@@ -259,6 +319,7 @@ async def get_events(
         async with pool.acquire() as conn:
             # Get total count
             count_query = f"SELECT COUNT(*) FROM txn_events e WHERE {where_clause}"
+            logger.debug(f"Executing count_query: {count_query} with params: {params} (types: {[type(p) for p in params]})")
             total = await conn.fetchval(count_query, *params)
 
             # Get data with txn_price_trend JOIN (price_trend JSONB is deprecated)
@@ -699,13 +760,13 @@ async def get_trades(
             param_count += 1
 
         if trade_date_from:
-            where_conditions.append(f"t.trade_date >= ${param_count}::date")
-            params.append(trade_date_from)
+            where_conditions.append(f"t.trade_date >= ${param_count}")
+            params.append(date.fromisoformat(trade_date_from))
             param_count += 1
 
         if trade_date_to:
-            where_conditions.append(f"t.trade_date <= ${param_count}::date")
-            params.append(trade_date_to)
+            where_conditions.append(f"t.trade_date <= ${param_count}")
+            params.append(date.fromisoformat(trade_date_to))
             param_count += 1
 
         where_clause = " AND ".join(where_conditions) if where_conditions else "TRUE"

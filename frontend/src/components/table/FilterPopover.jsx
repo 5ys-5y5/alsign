@@ -38,9 +38,9 @@ function FilterIcon({ active }) {
  * @param {Object} props - Component props
  * @param {string} props.columnKey - The column key being filtered
  * @param {string} props.columnLabel - The column label for display
- * @param {string} props.filterType - Filter type: 'string' | 'date' | 'number' | 'enum'
+ * @param {string} props.filterType - Filter type: 'string' | 'date' | 'daterange' | 'number' | 'enum' | 'dayoffset'
  * @param {Array} [props.enumOptions] - Options for enum filter type
- * @param {*} props.value - Current filter value
+ * @param {*} props.value - Current filter value (for daterange: { from: '2024-01-01', to: '2024-12-31' })
  * @param {Function} props.onChange - Callback when filter changes (value) => void
  * @param {Function} props.onReset - Callback to reset this filter () => void
  * @returns {JSX.Element} Filter button with popover
@@ -56,16 +56,26 @@ export default function FilterPopover({
 }) {
   const [isOpen, setIsOpen] = useState(false);
   const [localValue, setLocalValue] = useState(value || '');
+  // For daterange filter
+  const [localDateFrom, setLocalDateFrom] = useState(value?.from || '');
+  const [localDateTo, setLocalDateTo] = useState(value?.to || '');
   const [popoverPosition, setPopoverPosition] = useState({ top: 0, left: 0 });
   const popoverRef = useRef(null);
   const buttonRef = useRef(null);
 
-  const hasActiveFilter = value !== null && value !== undefined && value !== '';
+  const hasActiveFilter = filterType === 'daterange'
+    ? (value?.from || value?.to)
+    : (value !== null && value !== undefined && value !== '');
 
   // Update local value when prop changes
   useEffect(() => {
-    setLocalValue(value || '');
-  }, [value]);
+    if (filterType === 'daterange') {
+      setLocalDateFrom(value?.from || '');
+      setLocalDateTo(value?.to || '');
+    } else {
+      setLocalValue(value || '');
+    }
+  }, [value, filterType]);
 
   // Calculate popover position when opened
   useEffect(() => {
@@ -120,12 +130,21 @@ export default function FilterPopover({
   }, [isOpen]);
 
   const handleApply = () => {
-    onChange(localValue);
+    if (filterType === 'daterange') {
+      onChange({ from: localDateFrom, to: localDateTo });
+    } else {
+      onChange(localValue);
+    }
     setIsOpen(false);
   };
 
   const handleReset = () => {
-    setLocalValue('');
+    if (filterType === 'daterange') {
+      setLocalDateFrom('');
+      setLocalDateTo('');
+    } else {
+      setLocalValue('');
+    }
     onReset();
     setIsOpen(false);
   };
@@ -138,13 +157,18 @@ export default function FilterPopover({
     switch (filterType) {
       case 'string':
         return (
-          <input
-            type="text"
-            value={localValue}
-            onChange={handleInputChange}
-            placeholder={`Filter ${columnLabel}...`}
-            autoFocus
-          />
+          <div>
+            <input
+              type="text"
+              value={localValue}
+              onChange={handleInputChange}
+              placeholder={`Filter ${columnLabel}...`}
+              autoFocus
+            />
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)', marginTop: 'var(--space-1)' }}>
+              Tip: Use = prefix for exact match (e.g., =AAPL)
+            </div>
+          </div>
         );
 
       case 'date':
@@ -157,7 +181,35 @@ export default function FilterPopover({
           />
         );
 
+      case 'daterange':
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+            <div>
+              <label style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)', display: 'block', marginBottom: 'var(--space-1)' }}>
+                From:
+              </label>
+              <input
+                type="date"
+                value={localDateFrom}
+                onChange={(e) => setLocalDateFrom(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div>
+              <label style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)', display: 'block', marginBottom: 'var(--space-1)' }}>
+                To:
+              </label>
+              <input
+                type="date"
+                value={localDateTo}
+                onChange={(e) => setLocalDateTo(e.target.value)}
+              />
+            </div>
+          </div>
+        );
+
       case 'number':
+      case 'dayoffset':
         return (
           <div>
             <input

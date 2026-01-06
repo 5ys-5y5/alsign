@@ -111,8 +111,7 @@ export default function DashboardPage() {
           params.append('sortOrder', eventsSortConfig.direction);
         }
 
-        // Add filter parameters
-        // Backend supports: ticker, sector, industry, source, condition, eventDateFrom, eventDateTo
+        // Map column filters to backend API parameters
         if (eventsFilters.ticker) {
           params.append('ticker', eventsFilters.ticker);
         }
@@ -128,11 +127,58 @@ export default function DashboardPage() {
         if (eventsFilters.condition) {
           params.append('condition', eventsFilters.condition);
         }
-        if (eventsFilters.eventDateFrom) {
-          params.append('eventDateFrom', eventsFilters.eventDateFrom);
+        if (eventsFilters.position_quantitative) {
+          params.append('position_quantitative', eventsFilters.position_quantitative);
         }
-        if (eventsFilters.eventDateTo) {
-          params.append('eventDateTo', eventsFilters.eventDateTo);
+        if (eventsFilters.position_qualitative) {
+          params.append('position_qualitative', eventsFilters.position_qualitative);
+        }
+
+        // Parse disparity_quantitative number filter (e.g., "0.1-0.5", ">0.2", "<0.8")
+        if (eventsFilters.disparity_quantitative) {
+          const val = eventsFilters.disparity_quantitative.trim();
+          if (val.includes('-')) {
+            const [min, max] = val.split('-').map(v => v.trim());
+            if (min) params.append('disparity_quantitative_min', min);
+            if (max) params.append('disparity_quantitative_max', max);
+          } else if (val.startsWith('>')) {
+            params.append('disparity_quantitative_min', val.substring(1));
+          } else if (val.startsWith('<')) {
+            params.append('disparity_quantitative_max', val.substring(1));
+          } else {
+            // Exact value - use min=max
+            params.append('disparity_quantitative_min', val);
+            params.append('disparity_quantitative_max', val);
+          }
+        }
+
+        // Parse disparity_qualitative number filter
+        if (eventsFilters.disparity_qualitative) {
+          const val = eventsFilters.disparity_qualitative.trim();
+          if (val.includes('-')) {
+            const [min, max] = val.split('-').map(v => v.trim());
+            if (min) params.append('disparity_qualitative_min', min);
+            if (max) params.append('disparity_qualitative_max', max);
+          } else if (val.startsWith('>')) {
+            params.append('disparity_qualitative_min', val.substring(1));
+          } else if (val.startsWith('<')) {
+            params.append('disparity_qualitative_max', val.substring(1));
+          } else {
+            params.append('disparity_qualitative_min', val);
+            params.append('disparity_qualitative_max', val);
+          }
+        }
+
+        // Handle event_date daterange filter
+        if (eventsFilters.event_date) {
+          if (typeof eventsFilters.event_date === 'object') {
+            if (eventsFilters.event_date.from) {
+              params.append('eventDateFrom', eventsFilters.event_date.from);
+            }
+            if (eventsFilters.event_date.to) {
+              params.append('eventDateTo', eventsFilters.event_date.to);
+            }
+          }
         }
 
         const response = await fetch(

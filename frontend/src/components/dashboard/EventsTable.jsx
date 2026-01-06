@@ -15,7 +15,7 @@ import { getTxnEventsState, setTxnEventsState } from '../../services/localStorag
  */
 const EVENTS_COLUMNS = [
   { key: 'ticker', label: 'ticker', type: 'string', width: 110, isDefault: true },
-  { key: 'event_date', label: 'event_date', type: 'date', width: 160, isDefault: true },
+  { key: 'event_date', label: 'event_date', type: 'daterange', width: 160, isDefault: true },
   { key: 'source', label: 'source', type: 'string', width: 140, isDefault: true },
   { key: 'sector', label: 'sector', type: 'string', width: 180, isDefault: true },
   { key: 'industry', label: 'industry', type: 'string', width: 200, isDefault: true },
@@ -268,51 +268,6 @@ export default function EventsTable({
         >
           Bulk Edit ({selectedRowIds.size} selected)
         </button>
-      </div>
-
-      {/* Date Range Filter */}
-      <div style={{
-        display: 'flex',
-        gap: 'var(--space-2)',
-        alignItems: 'center',
-        marginBottom: 'var(--space-3)',
-        padding: 'var(--space-2)',
-        backgroundColor: 'var(--surface)',
-        borderRadius: 'var(--rounded-lg)',
-        border: '1px solid var(--border)'
-      }}>
-        <label style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-medium)', whiteSpace: 'nowrap' }}>
-          Filter event_date:
-        </label>
-        <input
-          type="date"
-          value={filters.eventDateFrom || ''}
-          onChange={(e) => onFiltersChange({ ...filters, eventDateFrom: e.target.value })}
-          placeholder="From"
-          style={{ flex: '1', minWidth: '140px' }}
-        />
-        <span style={{ color: 'var(--text-dim)' }}>to</span>
-        <input
-          type="date"
-          value={filters.eventDateTo || ''}
-          onChange={(e) => onFiltersChange({ ...filters, eventDateTo: e.target.value })}
-          placeholder="To"
-          style={{ flex: '1', minWidth: '140px' }}
-        />
-        {(filters.eventDateFrom || filters.eventDateTo) && (
-          <button
-            className="btn btn-sm btn-outline"
-            onClick={() => {
-              const newFilters = { ...filters };
-              delete newFilters.eventDateFrom;
-              delete newFilters.eventDateTo;
-              onFiltersChange(newFilters);
-            }}
-            style={{ whiteSpace: 'nowrap' }}
-          >
-            Clear Dates
-          </button>
-        )}
       </div>
 
       {showBulkEdit && selectedRowIds.size > 0 && (

@@ -107,7 +107,13 @@
       "Bash(cmd //c \"for %p in \\(37048 22308 6192 30788 51868 17900 46648 44788 47208\\) do taskkill /F /PID %p 2>nul\")",
       "Bash(cmd //c \"for %p in \\(37856 17016\\) do taskkill /F /PID %p 2>nul\")",
       "Bash(cmd //c \"for %p in \\(22232 29220\\) do taskkill /F /PID %p 2>nul\")",
-      "Bash(cmd //c \"taskkill /F /PID 44264 2>&1\")"
+      "Bash(cmd //c \"taskkill /F /PID 44264 2>&1\")",
+      "Bash(cmd //c \"for %p in \\(8000\\) do netstat -ano | findstr \":%p\" | findstr \"LISTENING\"\")",
+      "Bash(cmd //c \"netstat -ano | findstr \"\":3000\"\" | findstr \"\"LISTENING\"\"\")",
+      "Bash(cmd //c \"for /f \"\"tokens=5\"\" %a in \\(''netstat -ano ^| findstr \"\":8000\"\" ^| findstr \"\"LISTENING\"\"''\\) do @taskkill /F /PID %a 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 7504 && taskkill /F /PID 52468\")",
+      "Bash(cmd //c \"for %p in \\(8000\\) do for /f \"\"tokens=5\"\" %a in \\(''netstat -ano ^| findstr \"\":%p\"\" ^| findstr \"\"LISTENING\"\"''\\) do taskkill /F /PID %a 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 52468\")"
     ]
   }
 }
