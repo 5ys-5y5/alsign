@@ -18,9 +18,99 @@ logger = logging.getLogger("alsign")
 
 # Concurrency settings for API calls (considering FMP rate limits)
 API_CONCURRENCY = 5   # Max concurrent API calls (conservative for stability)
+PEER_MAX_CONCURRENCY = 50
 API_BATCH_SIZE = 20   # Batch size for progress logging
 API_RETRY_COUNT = 2   # Number of retries for failed API calls
 
+def _extract_peer_tickers(base_ticker: str, response: Any) -> List[str]:
+    """
+    Extract peer ticker list from fmp-stock-peers response.
+    """
+    peer_candidates: List[Any] = []
+    if isinstance(response, dict):
+        peer_candidates = (
+            response.get('peersList')
+            or response.get('peers')
+            or response.get('peerList')
+            or response.get('data')
+            or []
+        )
+    elif isinstance(response, list):
+        peer_candidates = response
+
+    peers: List[str] = []
+    for item in peer_candidates:
+        if isinstance(item, str):
+            peer = item
+        elif isinstance(item, dict):
+            peer = item.get('ticker') or item.get('symbol')
+        else:
+            peer = None
+
+        if peer:
+            peer_upper = peer.upper()
+            if peer_upper != base_ticker:
+                peers.append(peer_upper)
+
+    return list(dict.fromkeys(peers))
+
+
+async def _fetch_peer_tickers(
+    fmp_client: FMPAPIClient,
+    ticker: str,
+    semaphore: asyncio.Semaphore
+) -> Tuple[str, List[str], bool]:
+    async with semaphore:
+        try:
+            response = await fmp_client.call_api('fmp-stock-peers', {'ticker': ticker})
+            peers = _extract_peer_tickers(ticker.upper(), response)
+            return ticker, peers, True
+        except Exception as exc:
+            logger.warning(f"[get_targets] Failed to fetch peers for {ticker}: {exc}")
+            return ticker, [], False
+
+
+async def collect_target_peers(
+    fmp_client: FMPAPIClient,
+    tickers: List[str]
+) -> Tuple[Dict[str, List[str]], int]:
+    """
+    Collect peer tickers for all targets using fmp-stock-peers API.
+
+    Returns:
+        Tuple of (peer_updates dict, failed_count)
+    """
+    if not tickers:
+        return {}, 0
+
+    peer_updates: Dict[str, List[str]] = {}
+    failed_count = 0
+    total = len(tickers)
+    index = 0
+    while index < total:
+        remaining = total - index
+        batch_size, mode = fmp_client.rate_limiter.calculate_dynamic_batch_size(remaining)
+        batch_size = min(batch_size, remaining)
+        batch = tickers[index:index + batch_size]
+
+        rate_limit = fmp_client.get_rate_limit()
+        max_concurrent = min(rate_limit, PEER_MAX_CONCURRENCY, batch_size)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        logger.info(
+            f"[get_targets] Peer batch: size={batch_size}, mode={mode}, "
+            f"rate_limit={rate_limit}, max_concurrent={max_concurrent}"
+        )
+        tasks = [_fetch_peer_tickers(fmp_client, ticker, semaphore) for ticker in batch]
+        results = await asyncio.gather(*tasks)
+        for ticker, peers, ok in results:
+            if ok:
+                peer_updates[ticker] = peers
+            else:
+                failed_count += 1
+
+        index += batch_size
+
+    return peer_updates, failed_count
 
 async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
     """
@@ -90,6 +180,21 @@ async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
             logger.info(f"[get_targets] DB result value: {result}")
             logger.info(f"[get_targets] DB result - Insert: {result.get('insert', 0)}, Update: {result.get('update', 0)}")
 
+            logger.info("[get_targets] Step 9: Fetching peer tickers via fmp-stock-peers")
+            peer_update_result = {"update": 0}
+            if companies:
+                target_tickers = await targets.get_all_tickers(pool)
+                logger.info(f"[get_targets] Found {len(target_tickers)} tickers for peer collection")
+                peer_updates, failed_count = await collect_target_peers(fmp_client, target_tickers)
+                if failed_count:
+                    warn_codes.append("PEER_FETCH_FAILED")
+                peer_update_result = await targets.update_target_peers(pool, peer_updates)
+                logger.info(
+                    f"[get_targets] Peer updates complete: updated={peer_update_result.get('update', 0)}, failed={failed_count}"
+                )
+            else:
+                logger.warning("[get_targets] No companies available for peer collection")
+
     except Exception as e:
         logger.error("=" * 80)
         logger.error(f"[get_targets] EXCEPTION CAUGHT: {type(e).__name__}")
@@ -99,6 +204,7 @@ async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
         logger.error("=" * 80)
         warn_codes.append("EXCEPTION_IN_GET_TARGETS")
         result = {"insert": 0, "update": 0}
+        peer_update_result = {"update": 0}
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -126,6 +232,12 @@ async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
                 "insert": result.get("insert", 0),
                 "update": result.get("update", 0),
                 "total": result.get("insert", 0) + result.get("update", 0)
+            },
+            {
+                "table": "config_lv3_targets",
+                "insert": 0,
+                "update": peer_update_result.get("update", 0),
+                "total": peer_update_result.get("update", 0)
             }
         ]
     }

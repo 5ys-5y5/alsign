@@ -19,7 +19,7 @@ const ENDPOINT_FLOWS = {
   sourceData: {
     id: 'sourceData',
     title: 'GET /sourceData',
-    description: '외부 FMP API에서 금융 데이터를 수집하여 DB에 저장',
+    description: '외부 FMP API에서 금융 데이터를 수집하여 DB에 저장 (target 모드는 peer 컬럼 업데이트 포함)',
     parameters: [
       {
         name: 'mode',
@@ -178,7 +178,7 @@ const ENDPOINT_FLOWS = {
         ]
       },
       target: {
-        description: '분석 대상 종목 수집',
+        description: '분석 대상 종목 수집 및 peer 데이터 채움',
         outputTable: 'config_lv3_targets',
         phases: [
           {
@@ -194,6 +194,12 @@ const ENDPOINT_FLOWS = {
             title: 'DB 저장',
             description: 'config_lv3_targets에 UPSERT',
             apiId: null
+          },
+          {
+            id: 'peer',
+            title: 'Peer 업데이트',
+            description: 'FMP stock peers API 호출 후 peer 컬럼 업데이트',
+            apiId: 'fmp-stock-peers'
           }
         ]
       }

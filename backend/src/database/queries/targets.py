@@ -127,6 +127,60 @@ async def upsert_company_targets(
     logger.info("[upsert_company_targets] Called - Redirecting to truncate_and_insert_company_targets")
     return await truncate_and_insert_company_targets(pool, companies)
 
+async def update_target_peers(
+    pool: asyncpg.Pool,
+    peer_updates: Dict[str, List[str]]
+) -> Dict[str, int]:
+    """
+    Update peer column for tickers in config_lv3_targets.
+
+    Args:
+        pool: Database connection pool
+        peer_updates: Dict mapping ticker -> list of peer tickers
+
+    Returns:
+        Dict with update count
+    """
+    logger.info("[update_target_peers] Updating peer data in config_lv3_targets")
+
+    if not peer_updates:
+        logger.warning("[update_target_peers] No peer updates provided")
+        return {"update": 0}
+
+    tickers = []
+    peers_json = []
+    for ticker, peers in peer_updates.items():
+        tickers.append(ticker.upper())
+        peers_json.append(json.dumps(peers))
+
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            WITH batch_data AS (
+                SELECT
+                    UNNEST($1::text[]) AS ticker,
+                    UNNEST($2::jsonb[]) AS peer
+            )
+            UPDATE config_lv3_targets t
+            SET peer = b.peer
+            FROM batch_data b
+            WHERE t.ticker = b.ticker
+            """,
+            tickers,
+            peers_json
+        )
+
+    update_count = 0
+    if result:
+        try:
+            update_count = int(result.split()[-1])
+        except (ValueError, IndexError):
+            logger.warning(f"[update_target_peers] Unexpected execute result: {result}")
+
+    logger.info(f"[update_target_peers] Updated {update_count} rows")
+    return {"update": update_count}
+
+
 
 async def get_all_tickers(pool: asyncpg.Pool) -> List[str]:
     """

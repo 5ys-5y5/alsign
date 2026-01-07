@@ -26,6 +26,7 @@ class FMPAPIClient:
         self.rate_limiter = RateLimiter(settings.FMP_RATE_LIMIT)
         self.client: Optional[httpx.AsyncClient] = None
         self._api_key_cache: Optional[str] = None
+        self._usage_per_min_cache: Optional[int] = None
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -33,12 +34,34 @@ class FMPAPIClient:
             timeout=httpx.Timeout(60.0, connect=30.0),
             limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
         )
+        await self._load_service_config()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         if self.client:
             await self.client.aclose()
+
+    async def _load_service_config(self) -> None:
+        """
+        Load API service config and update rate limiter.
+        """
+        if self._api_key_cache and self._usage_per_min_cache:
+            return
+
+        pool = await db_pool.get_pool()
+        service_config = await api_config.get_api_service_config(pool, 'financialmodelingprep')
+
+        if not service_config or not service_config.get('apiKey'):
+            raise ValueError("FMP API key not found in config_lv1_api_service")
+
+        self._api_key_cache = service_config['apiKey']
+        usage_per_min = service_config.get('usagePerMin')
+        if isinstance(usage_per_min, int) and usage_per_min > 0:
+            self._usage_per_min_cache = usage_per_min
+            self.rate_limiter.calls_per_minute = usage_per_min
+        else:
+            self._usage_per_min_cache = self.rate_limiter.calls_per_minute
 
     async def _get_api_key(self) -> str:
         """
@@ -50,16 +73,9 @@ class FMPAPIClient:
         Raises:
             ValueError: If API key not found
         """
-        if self._api_key_cache:
-            return self._api_key_cache
+        if not self._api_key_cache:
+            await self._load_service_config()
 
-        pool = await db_pool.get_pool()
-        service_config = await api_config.get_api_service_config(pool, 'financialmodelingprep')
-
-        if not service_config or not service_config.get('apiKey'):
-            raise ValueError("FMP API key not found in config_lv1_api_service")
-
-        self._api_key_cache = service_config['apiKey']
         return self._api_key_cache
 
     def _apply_schema_mapping(self, data: Any, schema: Dict[str, str]) -> Any:
@@ -203,7 +219,7 @@ class FMPAPIClient:
         if not config:
             raise ValueError(f"API configuration not found: {api_id}")
 
-        # Get API key
+        # Get API key and ensure rate limit is configured
         api_key = await self._get_api_key()
 
         # Prepare variables for substitution
