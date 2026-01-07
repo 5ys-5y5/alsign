@@ -10,14 +10,14 @@ from datetime import datetime, date, timedelta
 from ..database.connection import db_pool
 from ..database.queries import holidays, targets, consensus, earning
 from .external_api import FMPAPIClient
-from .utils.batch_utils import calculate_eta, format_progress, chunk_list
+from .utils.batch_utils import calculate_eta, format_progress, chunk_list, format_eta_ms
 from .utils.datetime_utils import parse_to_utc, parse_date_only_to_utc
 from ..models.response_models import Counters, PhaseCounters
 
 logger = logging.getLogger("alsign")
 
 # Concurrency settings for API calls (considering FMP rate limits)
-API_CONCURRENCY = 5   # Max concurrent API calls (conservative for stability)
+# API_CONCURRENCY is now calculated dynamically from usagePerMin
 PEER_MAX_CONCURRENCY = 50
 API_BATCH_SIZE = 20   # Batch size for progress logging
 API_RETRY_COUNT = 2   # Number of retries for failed API calls
@@ -87,6 +87,11 @@ async def collect_target_peers(
     failed_count = 0
     total = len(tickers)
     index = 0
+    completed = 0
+    start_time = time.time()
+
+    logger.info(f"[collect_target_peers] Starting peer collection for {total} tickers")
+
     while index < total:
         remaining = total - index
         batch_size, mode = fmp_client.rate_limiter.calculate_dynamic_batch_size(remaining)
@@ -109,6 +114,32 @@ async def collect_target_peers(
                 failed_count += 1
 
         index += batch_size
+        completed = index
+
+        # Log progress every 20 tickers or at completion
+        if completed % 20 == 0 or completed == total:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            eta_ms = calculate_eta(total, completed, elapsed_ms)
+            eta = format_eta_ms(eta_ms)
+
+            logger.info(
+                f"Peer collection: {completed}/{total} tickers",
+                extra={
+                    'endpoint': 'GET /sourceData',
+                    'phase': 'target-peer-collection',
+                    'elapsed_ms': elapsed_ms,
+                    'progress': format_progress(completed, total),
+                    'eta': eta,
+                    'counters': {
+                        'success': len(peer_updates),
+                        'fail': failed_count
+                    },
+                    'batch': {
+                        'size': batch_size,
+                        'mode': mode
+                    }
+                }
+            )
 
     return peer_updates, failed_count
 
@@ -214,17 +245,19 @@ async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
     logger.info(f"[get_targets] Warnings: {warn_codes}")
     logger.info("=" * 80)
 
+    counters_obj = Counters(
+        success=result.get("insert", 0) + result.get("update", 0),
+        fail=0,
+        skip=0,
+        update=result.get("update", 0),
+        insert=result.get("insert", 0),
+        conflict=0
+    )
+
     return {
         "executed": True,
         "elapsedMs": elapsed_ms,
-        "counters": Counters(
-            success=result.get("insert", 0) + result.get("update", 0),
-            fail=0,
-            skip=0,
-            update=result.get("update", 0),
-            insert=result.get("insert", 0),
-            conflict=0
-        ),
+        "counters": counters_obj.model_dump(),
         "warn": warn_codes,
         "dbWrites": [
             {
@@ -256,6 +289,15 @@ async def get_holidays(overwrite: bool = False) -> Dict[str, Any]:
     start_time = time.time()
     warn_codes = []
 
+    logger.info(
+        "Starting holiday data collection",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'holiday-start',
+            'elapsed_ms': 0
+        }
+    )
+
     async with FMPAPIClient() as fmp_client:
         # Fetch holidays for NASDAQ
         holidays_data = await fmp_client.get_market_holidays("NASDAQ")
@@ -269,17 +311,33 @@ async def get_holidays(overwrite: bool = False) -> Dict[str, Any]:
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 
+    counters_obj = Counters(
+        success=result.get("insert", 0) + result.get("update", 0),
+        fail=0,
+        skip=0,
+        update=result.get("update", 0),
+        insert=result.get("insert", 0),
+        conflict=0
+    )
+
+    logger.info(
+        f"Holiday data collection completed: {counters_obj.success} records",
+        extra={
+            'endpoint': 'GET /sourceData',
+            'phase': 'holiday-complete',
+            'elapsed_ms': elapsed_ms,
+            'counters': {
+                'success': counters_obj.success,
+                'insert': counters_obj.insert,
+                'update': counters_obj.update
+            }
+        }
+    )
+
     return {
         "executed": True,
         "elapsedMs": elapsed_ms,
-        "counters": Counters(
-            success=result.get("insert", 0) + result.get("update", 0),
-            fail=0,
-            skip=0,
-            update=result.get("update", 0),
-            insert=result.get("insert", 0),
-            conflict=0
-        ),
+        "counters": counters_obj.model_dump(),
         "warn": warn_codes,
         "dbWrites": [
             {
@@ -359,9 +417,9 @@ async def get_consensus(
             return {
                 "executed": True,
                 "elapsedMs": 0,
-                "counters": Counters(),
-                "phase1": PhaseCounters(elapsedMs=0, counters=Counters()),
-                "phase2": {"partitionsProcessed": 0, "partitionsFailed": 0, "counters": Counters()},
+                "counters": Counters().model_dump(),
+                "phase1": PhaseCounters(elapsedMs=0, counters=Counters()).model_dump(),
+                "phase2": {"partitionsProcessed": 0, "partitionsFailed": 0, "counters": Counters().model_dump()},
                 "warn": warn_codes
             }
 
@@ -384,8 +442,13 @@ async def get_consensus(
         all_consensus = []
         completed_tickers = 0
         failed_tickers = 0
-        semaphore = asyncio.Semaphore(API_CONCURRENCY)
+
+        # Dynamic concurrency based on usagePerMin
+        max_concurrent = fmp_client.get_rate_limit()
+        semaphore = asyncio.Semaphore(max_concurrent)
         results_lock = asyncio.Lock()
+
+        logger.info(f"[fill_consensus] Using dynamic concurrency: {max_concurrent}")
 
         async def fetch_ticker_consensus(fmp_client: FMPAPIClient, ticker: str):
             nonlocal completed_tickers, failed_tickers
@@ -738,27 +801,32 @@ async def get_consensus(
 
     total_elapsed = int((time.time() - start_time) * 1000)
 
+    total_counters = Counters(
+        success=phase1_counters.success + phase2_update_count + phase3_success,
+        fail=partitions_failed + phase3_fail,
+        skip=phase3_skip,
+        update=phase1_counters.update + phase2_update_count + phase3_success,
+        insert=phase1_counters.insert,
+        conflict=0
+    )
+    phase1_obj = PhaseCounters(elapsedMs=phase1_elapsed, counters=phase1_counters)
+    phase2_counters = Counters(update=phase2_update_count, success=phase2_update_count, fail=partitions_failed)
+    phase3_counters = Counters(success=phase3_success, fail=phase3_fail, skip=phase3_skip, update=phase3_success)
+
     return {
         "executed": True,
         "elapsedMs": total_elapsed,
-        "counters": Counters(
-            success=phase1_counters.success + phase2_update_count + phase3_success,
-            fail=partitions_failed + phase3_fail,
-            skip=phase3_skip,
-            update=phase1_counters.update + phase2_update_count + phase3_success,
-            insert=phase1_counters.insert,
-            conflict=0
-        ),
-        "phase1": PhaseCounters(elapsedMs=phase1_elapsed, counters=phase1_counters),
+        "counters": total_counters.model_dump(),
+        "phase1": phase1_obj.model_dump(),
         "phase2": {
             "partitionsProcessed": partitions_processed,
             "partitionsFailed": partitions_failed,
-            "counters": Counters(update=phase2_update_count, success=phase2_update_count, fail=partitions_failed)
+            "counters": phase2_counters.model_dump()
         },
         "phase3": {
             "eventsProcessed": total_events_phase3,
             "elapsedMs": phase3_elapsed,
-            "counters": Counters(success=phase3_success, fail=phase3_fail, skip=phase3_skip, update=phase3_success)
+            "counters": phase3_counters.model_dump()
         },
         "warn": warn_codes,
         "dbWrites": [
@@ -902,7 +970,7 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
         return {
             "executed": True,
             "elapsedMs": int((time.time() - start_time) * 1000),
-            "counters": Counters(),
+            "counters": Counters().model_dump(),
             "warn": warn_codes,
             "dbWrites": []
         }
@@ -929,8 +997,13 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
     completed_ranges = 0
     failed_ranges = 0
     fetch_start = time.time()
-    semaphore = asyncio.Semaphore(API_CONCURRENCY)
+
+    # Dynamic concurrency based on usagePerMin
+    max_concurrent = fmp_client.get_rate_limit()
+    semaphore = asyncio.Semaphore(max_concurrent)
     results_lock = asyncio.Lock()
+
+    logger.info(f"[fill_earnings] Using dynamic concurrency: {max_concurrent}")
 
     async def fetch_range_earnings(fmp_client: FMPAPIClient, from_dt: date, to_dt: date):
         nonlocal completed_ranges, failed_ranges
@@ -1007,17 +1080,19 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 
+    counters_obj = Counters(
+        success=result.get("insert", 0),
+        fail=0,
+        skip=skipped_count,
+        update=0,
+        insert=result.get("insert", 0),
+        conflict=result.get("conflict", 0)
+    )
+
     return {
         "executed": True,
         "elapsedMs": elapsed_ms,
-        "counters": Counters(
-            success=result.get("insert", 0),
-            fail=0,
-            skip=skipped_count,
-            update=0,
-            insert=result.get("insert", 0),
-            conflict=result.get("conflict", 0)
-        ),
+        "counters": counters_obj.model_dump(),
         "warn": warn_codes,
         "dbWrites": [
             {

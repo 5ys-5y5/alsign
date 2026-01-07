@@ -19,6 +19,7 @@ from .metric_engine import MetricCalculationEngine
 from ..utils.logging_utils import (
     log_error, log_warning, log_event_update, log_batch_start, log_batch_complete, log_db_update
 )
+from .utils.batch_utils import calculate_eta, format_eta_ms
 
 logger = logging.getLogger("alsign")
 
@@ -917,7 +918,8 @@ async def calculate_valuations(
     )
     
     # Phase 4: Process tickers in parallel with concurrency control
-    TICKER_CONCURRENCY = 10  # Process 10 tickers concurrently
+    # This is DB/calculation work (not API calls), so use higher concurrency
+    TICKER_CONCURRENCY = 50  # Process 50 tickers concurrently (increased from 10)
     semaphore = asyncio.Semaphore(TICKER_CONCURRENCY)
     
     # Progress tracking
@@ -2047,11 +2049,130 @@ async def generate_price_trends(
     )
 
     # ========================================
-    # I-43: Process unique pairs and build txn_price_trend inserts
+    # Helper function for individual price trend upserts
+    # ========================================
+    async def _upsert_single_price_trend(ticker: str, event_date: date, jsonb_columns: dict, wts_long: int, wts_short: int):
+        """
+        Upsert a single price trend record to txn_price_trend table.
+
+        Args:
+            ticker: Stock ticker symbol
+            event_date: Event date
+            jsonb_columns: Dict with d_neg14 through d_pos14 JSONB data
+            wts_long: Long position winning time shift
+            wts_short: Short position winning time shift
+        """
+        import json
+
+        # Helper to convert dict to JSON string for JSONB columns
+        def jsonb_or_null(val):
+            if val is None:
+                return None
+            if isinstance(val, dict):
+                return json.dumps(val)
+            return val
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO txn_price_trend (
+                    ticker, event_date,
+                    d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
+                    d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
+                    d_neg4, d_neg3, d_neg2, d_neg1,
+                    d_0,
+                    d_pos1, d_pos2, d_pos3, d_pos4, d_pos5,
+                    d_pos6, d_pos7, d_pos8, d_pos9, d_pos10,
+                    d_pos11, d_pos12, d_pos13, d_pos14,
+                    wts_long, wts_short
+                ) VALUES (
+                    $1, $2,
+                    $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb,
+                    $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
+                    $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb,
+                    $17::jsonb,
+                    $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb,
+                    $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27::jsonb,
+                    $28::jsonb, $29::jsonb, $30::jsonb, $31::jsonb,
+                    $32, $33
+                )
+                ON CONFLICT (ticker, event_date) DO UPDATE
+                SET
+                    d_neg14 = EXCLUDED.d_neg14,
+                    d_neg13 = EXCLUDED.d_neg13,
+                    d_neg12 = EXCLUDED.d_neg12,
+                    d_neg11 = EXCLUDED.d_neg11,
+                    d_neg10 = EXCLUDED.d_neg10,
+                    d_neg9 = EXCLUDED.d_neg9,
+                    d_neg8 = EXCLUDED.d_neg8,
+                    d_neg7 = EXCLUDED.d_neg7,
+                    d_neg6 = EXCLUDED.d_neg6,
+                    d_neg5 = EXCLUDED.d_neg5,
+                    d_neg4 = EXCLUDED.d_neg4,
+                    d_neg3 = EXCLUDED.d_neg3,
+                    d_neg2 = EXCLUDED.d_neg2,
+                    d_neg1 = EXCLUDED.d_neg1,
+                    d_0 = EXCLUDED.d_0,
+                    d_pos1 = EXCLUDED.d_pos1,
+                    d_pos2 = EXCLUDED.d_pos2,
+                    d_pos3 = EXCLUDED.d_pos3,
+                    d_pos4 = EXCLUDED.d_pos4,
+                    d_pos5 = EXCLUDED.d_pos5,
+                    d_pos6 = EXCLUDED.d_pos6,
+                    d_pos7 = EXCLUDED.d_pos7,
+                    d_pos8 = EXCLUDED.d_pos8,
+                    d_pos9 = EXCLUDED.d_pos9,
+                    d_pos10 = EXCLUDED.d_pos10,
+                    d_pos11 = EXCLUDED.d_pos11,
+                    d_pos12 = EXCLUDED.d_pos12,
+                    d_pos13 = EXCLUDED.d_pos13,
+                    d_pos14 = EXCLUDED.d_pos14,
+                    wts_long = EXCLUDED.wts_long,
+                    wts_short = EXCLUDED.wts_short,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                ticker,
+                event_date,
+                # 29 day offset JSONB columns
+                jsonb_or_null(jsonb_columns.get('d_neg14')),
+                jsonb_or_null(jsonb_columns.get('d_neg13')),
+                jsonb_or_null(jsonb_columns.get('d_neg12')),
+                jsonb_or_null(jsonb_columns.get('d_neg11')),
+                jsonb_or_null(jsonb_columns.get('d_neg10')),
+                jsonb_or_null(jsonb_columns.get('d_neg9')),
+                jsonb_or_null(jsonb_columns.get('d_neg8')),
+                jsonb_or_null(jsonb_columns.get('d_neg7')),
+                jsonb_or_null(jsonb_columns.get('d_neg6')),
+                jsonb_or_null(jsonb_columns.get('d_neg5')),
+                jsonb_or_null(jsonb_columns.get('d_neg4')),
+                jsonb_or_null(jsonb_columns.get('d_neg3')),
+                jsonb_or_null(jsonb_columns.get('d_neg2')),
+                jsonb_or_null(jsonb_columns.get('d_neg1')),
+                jsonb_or_null(jsonb_columns.get('d_0')),
+                jsonb_or_null(jsonb_columns.get('d_pos1')),
+                jsonb_or_null(jsonb_columns.get('d_pos2')),
+                jsonb_or_null(jsonb_columns.get('d_pos3')),
+                jsonb_or_null(jsonb_columns.get('d_pos4')),
+                jsonb_or_null(jsonb_columns.get('d_pos5')),
+                jsonb_or_null(jsonb_columns.get('d_pos6')),
+                jsonb_or_null(jsonb_columns.get('d_pos7')),
+                jsonb_or_null(jsonb_columns.get('d_pos8')),
+                jsonb_or_null(jsonb_columns.get('d_pos9')),
+                jsonb_or_null(jsonb_columns.get('d_pos10')),
+                jsonb_or_null(jsonb_columns.get('d_pos11')),
+                jsonb_or_null(jsonb_columns.get('d_pos12')),
+                jsonb_or_null(jsonb_columns.get('d_pos13')),
+                jsonb_or_null(jsonb_columns.get('d_pos14')),
+                # wts_long and wts_short (integers)
+                wts_long,
+                wts_short
+            )
+
+    # ========================================
+    # I-43: Process unique pairs and save incrementally
     # ========================================
     success_count = 0
     fail_count = 0
-    batch_inserts = []  # Collect all inserts for batch processing
 
     for idx, ((ticker, event_date), event) in enumerate(unique_ticker_dates.items()):
         try:
@@ -2206,15 +2327,25 @@ async def generate_price_trends(
                         wts_short = offset
 
 
-            # Collect for batch insert
-            batch_inserts.append({
-                'ticker': ticker,
-                'event_date': event_date,
-                'jsonb_columns': jsonb_columns,
-                'wts_long': wts_long,
-                'wts_short': wts_short
-            })
-            success_count += 1
+            # Immediately save to database (incremental save)
+            try:
+                await _upsert_single_price_trend(ticker, event_date, jsonb_columns, wts_long, wts_short)
+                success_count += 1
+                logger.debug(
+                    f"Saved price trend: {ticker} @ {event_date}",
+                    extra={
+                        'endpoint': 'POST /generatePriceTrends',
+                        'phase': 'save_price_trend',
+                        'counters': {'success': 1}
+                    }
+                )
+            except Exception as db_error:
+                fail_count += 1
+                logger.error(
+                    f"Failed to save price trend: {ticker} @ {event_date}: {db_error}",
+                    exc_info=True
+                )
+                # Continue processing other records
 
         except Exception as e:
             logger.error(f"Failed to generate price trend for {ticker} {event_date}: {e}")
@@ -2223,12 +2354,16 @@ async def generate_price_trends(
 
         # Log progress every 50 pairs
         if (idx + 1) % 50 == 0 or (idx + 1) == len(unique_ticker_dates):
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            eta_ms = calculate_eta(len(unique_ticker_dates), idx + 1, elapsed_ms)
+            eta = format_eta_ms(eta_ms)
+
             logger.info(
                 f"Processed {idx + 1}/{len(unique_ticker_dates)} unique pairs",
                 extra={
                     'endpoint': 'POST /generatePriceTrends',
                     'phase': 'process_price_trends',
-                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'elapsed_ms': elapsed_ms,
                     'counters': {
                         'processed': idx + 1,
                         'total': len(unique_ticker_dates),
@@ -2240,229 +2375,14 @@ async def generate_price_trends(
                         'total': len(unique_ticker_dates),
                         'pct': round((idx + 1) / len(unique_ticker_dates) * 100, 1)
                     },
+                    'eta': eta,
                     'rate': {},
                     'batch': {},
                     'warn': []
                 }
             )
 
-    # ========================================
-    # I-43: Batch UPSERT into txn_price_trend
-    # ========================================
-    logger.info(f"[PriceTrends] I-43: Prepared {len(batch_inserts)} rows for txn_price_trend table")
-
-    if not batch_inserts:
-        logger.warning("[PriceTrends] I-43: No data to insert into txn_price_trend (all events skipped due to missing D0 data)")
-        total_elapsed_ms = int((time.time() - start_time) * 1000)
-        return {
-            'success': 0,
-            'fail': fail_count
-        }
-
-    if batch_inserts:
-        logger.info(f"[PriceTrends] I-43: Executing batch UPSERT for {len(batch_inserts)} unique pairs")
-        batch_start = time.time()
-
-        conn = None
-        try:
-            async with pool.acquire() as conn:
-                # I-43: Start transaction explicitly
-                await conn.execute("BEGIN")
-
-                # Prepare arrays for UNNEST
-                tickers = []
-                event_dates = []
-                d_neg14_list = []
-                d_neg13_list = []
-                d_neg12_list = []
-                d_neg11_list = []
-                d_neg10_list = []
-                d_neg9_list = []
-                d_neg8_list = []
-                d_neg7_list = []
-                d_neg6_list = []
-                d_neg5_list = []
-                d_neg4_list = []
-                d_neg3_list = []
-                d_neg2_list = []
-                d_neg1_list = []
-                d_0_list = []
-                d_pos1_list = []
-                d_pos2_list = []
-                d_pos3_list = []
-                d_pos4_list = []
-                d_pos5_list = []
-                d_pos6_list = []
-                d_pos7_list = []
-                d_pos8_list = []
-                d_pos9_list = []
-                d_pos10_list = []
-                d_pos11_list = []
-                d_pos12_list = []
-                d_pos13_list = []
-                d_pos14_list = []
-                wts_long_list = []
-                wts_short_list = []
-
-                for insert in batch_inserts:
-                    tickers.append(insert['ticker'])
-                    event_dates.append(insert['event_date'])
-
-                    jsonb_cols = insert['jsonb_columns']
-                    d_neg14_list.append(jsonb_cols.get('d_neg14'))
-                    d_neg13_list.append(jsonb_cols.get('d_neg13'))
-                    d_neg12_list.append(jsonb_cols.get('d_neg12'))
-                    d_neg11_list.append(jsonb_cols.get('d_neg11'))
-                    d_neg10_list.append(jsonb_cols.get('d_neg10'))
-                    d_neg9_list.append(jsonb_cols.get('d_neg9'))
-                    d_neg8_list.append(jsonb_cols.get('d_neg8'))
-                    d_neg7_list.append(jsonb_cols.get('d_neg7'))
-                    d_neg6_list.append(jsonb_cols.get('d_neg6'))
-                    d_neg5_list.append(jsonb_cols.get('d_neg5'))
-                    d_neg4_list.append(jsonb_cols.get('d_neg4'))
-                    d_neg3_list.append(jsonb_cols.get('d_neg3'))
-                    d_neg2_list.append(jsonb_cols.get('d_neg2'))
-                    d_neg1_list.append(jsonb_cols.get('d_neg1'))
-                    d_0_list.append(jsonb_cols.get('d_0'))
-                    d_pos1_list.append(jsonb_cols.get('d_pos1'))
-                    d_pos2_list.append(jsonb_cols.get('d_pos2'))
-                    d_pos3_list.append(jsonb_cols.get('d_pos3'))
-                    d_pos4_list.append(jsonb_cols.get('d_pos4'))
-                    d_pos5_list.append(jsonb_cols.get('d_pos5'))
-                    d_pos6_list.append(jsonb_cols.get('d_pos6'))
-                    d_pos7_list.append(jsonb_cols.get('d_pos7'))
-                    d_pos8_list.append(jsonb_cols.get('d_pos8'))
-                    d_pos9_list.append(jsonb_cols.get('d_pos9'))
-                    d_pos10_list.append(jsonb_cols.get('d_pos10'))
-                    d_pos11_list.append(jsonb_cols.get('d_pos11'))
-                    d_pos12_list.append(jsonb_cols.get('d_pos12'))
-                    d_pos13_list.append(jsonb_cols.get('d_pos13'))
-                    d_pos14_list.append(jsonb_cols.get('d_pos14'))
-
-                    wts_long_list.append(insert['wts_long'])
-                    wts_short_list.append(insert['wts_short'])
-
-                # Use text[] for JSONB columns, then cast to jsonb in SELECT
-                result = await conn.execute(
-                    """
-                    INSERT INTO txn_price_trend (
-                        ticker, event_date,
-                        d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
-                        d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
-                        d_neg4, d_neg3, d_neg2, d_neg1,
-                        d_0,
-                        d_pos1, d_pos2, d_pos3, d_pos4, d_pos5,
-                        d_pos6, d_pos7, d_pos8, d_pos9, d_pos10,
-                        d_pos11, d_pos12, d_pos13, d_pos14,
-                        wts_long, wts_short
-                    )
-                    SELECT
-                        ticker, event_date,
-                        NULLIF(d_neg14, '')::jsonb, NULLIF(d_neg13, '')::jsonb, NULLIF(d_neg12, '')::jsonb, NULLIF(d_neg11, '')::jsonb, NULLIF(d_neg10, '')::jsonb,
-                        NULLIF(d_neg9, '')::jsonb, NULLIF(d_neg8, '')::jsonb, NULLIF(d_neg7, '')::jsonb, NULLIF(d_neg6, '')::jsonb, NULLIF(d_neg5, '')::jsonb,
-                        NULLIF(d_neg4, '')::jsonb, NULLIF(d_neg3, '')::jsonb, NULLIF(d_neg2, '')::jsonb, NULLIF(d_neg1, '')::jsonb,
-                        NULLIF(d_0, '')::jsonb,
-                        NULLIF(d_pos1, '')::jsonb, NULLIF(d_pos2, '')::jsonb, NULLIF(d_pos3, '')::jsonb, NULLIF(d_pos4, '')::jsonb, NULLIF(d_pos5, '')::jsonb,
-                        NULLIF(d_pos6, '')::jsonb, NULLIF(d_pos7, '')::jsonb, NULLIF(d_pos8, '')::jsonb, NULLIF(d_pos9, '')::jsonb, NULLIF(d_pos10, '')::jsonb,
-                        NULLIF(d_pos11, '')::jsonb, NULLIF(d_pos12, '')::jsonb, NULLIF(d_pos13, '')::jsonb, NULLIF(d_pos14, '')::jsonb,
-                        wts_long, wts_short
-                    FROM UNNEST(
-                        $1::text[], $2::date[],
-                        $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
-                        $8::text[], $9::text[], $10::text[], $11::text[], $12::text[],
-                        $13::text[], $14::text[], $15::text[], $16::text[],
-                        $17::text[],
-                        $18::text[], $19::text[], $20::text[], $21::text[], $22::text[],
-                        $23::text[], $24::text[], $25::text[], $26::text[], $27::text[],
-                        $28::text[], $29::text[], $30::text[], $31::text[],
-                        $32::int[], $33::int[]
-                    ) AS t(
-                        ticker, event_date,
-                        d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
-                        d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
-                        d_neg4, d_neg3, d_neg2, d_neg1,
-                        d_0,
-                        d_pos1, d_pos2, d_pos3, d_pos4, d_pos5,
-                        d_pos6, d_pos7, d_pos8, d_pos9, d_pos10,
-                        d_pos11, d_pos12, d_pos13, d_pos14,
-                        wts_long, wts_short
-                    )
-                    ON CONFLICT (ticker, event_date) DO UPDATE
-                    SET
-                        d_neg14 = EXCLUDED.d_neg14,
-                        d_neg13 = EXCLUDED.d_neg13,
-                        d_neg12 = EXCLUDED.d_neg12,
-                        d_neg11 = EXCLUDED.d_neg11,
-                        d_neg10 = EXCLUDED.d_neg10,
-                        d_neg9 = EXCLUDED.d_neg9,
-                        d_neg8 = EXCLUDED.d_neg8,
-                        d_neg7 = EXCLUDED.d_neg7,
-                        d_neg6 = EXCLUDED.d_neg6,
-                        d_neg5 = EXCLUDED.d_neg5,
-                        d_neg4 = EXCLUDED.d_neg4,
-                        d_neg3 = EXCLUDED.d_neg3,
-                        d_neg2 = EXCLUDED.d_neg2,
-                        d_neg1 = EXCLUDED.d_neg1,
-                        d_0 = EXCLUDED.d_0,
-                        d_pos1 = EXCLUDED.d_pos1,
-                        d_pos2 = EXCLUDED.d_pos2,
-                        d_pos3 = EXCLUDED.d_pos3,
-                        d_pos4 = EXCLUDED.d_pos4,
-                        d_pos5 = EXCLUDED.d_pos5,
-                        d_pos6 = EXCLUDED.d_pos6,
-                        d_pos7 = EXCLUDED.d_pos7,
-                        d_pos8 = EXCLUDED.d_pos8,
-                        d_pos9 = EXCLUDED.d_pos9,
-                        d_pos10 = EXCLUDED.d_pos10,
-                        d_pos11 = EXCLUDED.d_pos11,
-                        d_pos12 = EXCLUDED.d_pos12,
-                        d_pos13 = EXCLUDED.d_pos13,
-                        d_pos14 = EXCLUDED.d_pos14,
-                        wts_long = EXCLUDED.wts_long,
-                        wts_short = EXCLUDED.wts_short,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    tickers, event_dates,
-                    d_neg14_list, d_neg13_list, d_neg12_list, d_neg11_list, d_neg10_list,
-                    d_neg9_list, d_neg8_list, d_neg7_list, d_neg6_list, d_neg5_list,
-                    d_neg4_list, d_neg3_list, d_neg2_list, d_neg1_list,
-                    d_0_list,
-                    d_pos1_list, d_pos2_list, d_pos3_list, d_pos4_list, d_pos5_list,
-                    d_pos6_list, d_pos7_list, d_pos8_list, d_pos9_list, d_pos10_list,
-                    d_pos11_list, d_pos12_list, d_pos13_list, d_pos14_list,
-                    wts_long_list, wts_short_list
-                )
-
-                # Parse insert count from result
-                if "INSERT" in result:
-                    # Result format: "INSERT 0 N" where N is the number of inserted rows
-                    inserted_count = int(result.split()[-1])
-                    logger.info(f"[PriceTrends] I-43: Batch UPSERT completed: {inserted_count} rows in {int((time.time() - batch_start) * 1000)}ms")
-
-                    # Adjust counts based on actual inserts
-                    if inserted_count < len(batch_inserts):
-                        fail_count += (len(batch_inserts) - inserted_count)
-                        success_count = inserted_count
-                else:
-                    logger.warning(f"[PriceTrends] I-43: Unexpected result format: {result}")
-
-                # I-43: Commit transaction
-                await conn.execute("COMMIT")
-                logger.info(f"[PriceTrends] I-43: Transaction committed successfully")
-
-        except Exception as e:
-            # I-43: Rollback on error
-            if conn is not None:
-                try:
-                    await conn.execute("ROLLBACK")
-                    logger.error(f"[PriceTrends] I-43: Transaction rolled back due to error")
-                except:
-                    pass
-            logger.error(f"[PriceTrends] I-43: Batch UPSERT failed: {e}", exc_info=True)
-            logger.error(f"[PriceTrends] I-43: Sample data (first row): {batch_inserts[0] if batch_inserts else 'N/A'}")
-            fail_count += len(batch_inserts)
-            success_count = 0
-
+    # All records saved incrementally - no batch operation needed
     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
     logger.info(
@@ -2551,7 +2471,8 @@ async def collect_all_peer_tickers(
     ticker_to_peers = {}
 
     # OPTIMIZATION: Parallel fetching with semaphore for rate limiting
-    MAX_CONCURRENT_PEER_REQUESTS = 20  # Limit concurrent API calls
+    # Set to high value (700 = usagePerMin), RateLimiter will dynamically control actual rate
+    MAX_CONCURRENT_PEER_REQUESTS = 700  # Increased from 20, RateLimiter controls actual rate
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_PEER_REQUESTS)
 
     async def fetch_ticker_peers_with_semaphore(ticker: str, idx: int):

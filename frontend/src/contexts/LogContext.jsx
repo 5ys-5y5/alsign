@@ -17,11 +17,11 @@ export function LogProvider({ children }) {
   const [logs, setLogs] = useState([]);
   const [panelOpen, setPanelOpen] = useState(false);
   const [panelPosition, setPanelPosition] = useState('right'); // 'bottom' | 'right'
-  const [panelSize, setPanelSize] = useState(400);
+  const [panelSize, setPanelSize] = useState(800);
 
   const handlePositionChange = useCallback((newPosition) => {
     setPanelPosition(newPosition);
-    setPanelSize(newPosition === 'right' ? 480 : 400);
+    setPanelSize(newPosition === 'right' ? 800 : 800);
   }, []);
 
   const handleRequestStart = useCallback((request) => {

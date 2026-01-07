@@ -10,8 +10,8 @@ import KPICard from '../components/dashboard/KPICard';
 import EventsTable from '../components/dashboard/EventsTable';
 import TradesTable from '../components/dashboard/TradesTable';
 
-// API base URL from environment or default to localhost
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+// API base URL
+const API_BASE_URL = '/api';
 
 /**
  * Format date string for display.

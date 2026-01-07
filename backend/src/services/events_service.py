@@ -7,6 +7,7 @@ from typing import Dict, Any, List
 from ..database.connection import db_pool
 from ..database.queries import events
 from ..models.response_models import TableProcessingResult
+from .utils.batch_utils import calculate_eta, format_progress, format_eta_ms
 
 logger = logging.getLogger("alsign")
 
@@ -81,6 +82,11 @@ async def consolidate_events(
     total_inserted = 0
     total_conflicts = 0
 
+    # Progress tracking
+    total_tables = len(discovered_tables)
+    completed_tables = 0
+    tables_start_time = time.time()
+
     for table_name in discovered_tables:
         table_start = time.time()
 
@@ -143,8 +149,15 @@ async def consolidate_events(
                 warn=warnings
             ))
 
+        completed_tables += 1
+
+        # Calculate progress and ETA
+        elapsed_ms = int((time.time() - tables_start_time) * 1000)
+        eta_ms = calculate_eta(total_tables, completed_tables, elapsed_ms)
+        eta = format_eta_ms(eta_ms)
+
         logger.info(
-            f"Completed table {table_name}",
+            f"Completed table {table_name} ({completed_tables}/{total_tables})",
             extra={
                 'endpoint': 'POST /setEventsTable',
                 'phase': f'process_{table_name}',
@@ -152,9 +165,11 @@ async def consolidate_events(
                 'counters': {
                     'scanned': rows_scanned,
                     'inserted': insert_result.get('insert', 0) if not dry_run else rows_scanned,
-                    'conflicts': insert_result.get('conflict', 0) if not dry_run else 0
+                    'conflicts': insert_result.get('conflict', 0) if not dry_run else 0,
+                    'total_events_so_far': total_rows_scanned
                 },
-                'progress': {},
+                'progress': format_progress(completed_tables, total_tables),
+                'eta': eta,
                 'rate': {},
                 'batch': {},
                 'warn': warnings

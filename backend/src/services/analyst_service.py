@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional
 from ..database.connection import db_pool
 from ..database.queries import analyst, policies, metrics
 from ..models.response_models import AnalystGroupResult
+from .utils.batch_utils import calculate_eta, format_eta_ms
 
 logger = logging.getLogger("alsign")
 
@@ -424,12 +425,16 @@ async def aggregate_analyst_performance(overwrite: bool = False) -> Dict[str, An
 
         # Log progress every 10 groups
         if (idx + 1) % 10 == 0:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            eta_ms = calculate_eta(len(groups_dict), idx + 1, elapsed_ms)
+            eta = format_eta_ms(eta_ms)
+
             logger.info(
                 f"Processed {idx + 1}/{len(groups_dict)} analyst groups",
                 extra={
                     'endpoint': 'POST /fillAnalyst',
                     'phase': 'process_groups',
-                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'elapsed_ms': elapsed_ms,
                     'counters': {
                         'processed': idx + 1,
                         'total': len(groups_dict),
@@ -441,6 +446,7 @@ async def aggregate_analyst_performance(overwrite: bool = False) -> Dict[str, An
                         'total': len(groups_dict),
                         'pct': round((idx + 1) / len(groups_dict) * 100, 1)
                     },
+                    'eta': eta,
                     'rate': {},
                     'batch': {},
                     'warn': []

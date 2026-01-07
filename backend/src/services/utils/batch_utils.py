@@ -204,3 +204,39 @@ def format_progress(done: int, total: int) -> dict:
         'total': total,
         'pct': pct
     }
+
+
+def format_eta_ms(eta_ms: int) -> str:
+    """
+    Format ETA milliseconds to human-readable time format.
+
+    Args:
+        eta_ms: ETA in milliseconds
+
+    Returns:
+        Formatted string like "1h 2m 3s", "5m 30s", or "45s"
+        Returns "0s" if eta_ms is 0 or negative
+
+    Examples:
+        format_eta_ms(3661000) -> "1h 1m 1s"
+        format_eta_ms(125000) -> "2m 5s"
+        format_eta_ms(5000) -> "5s"
+        format_eta_ms(0) -> "0s"
+    """
+    if eta_ms <= 0:
+        return "0s"
+
+    total_seconds = eta_ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if seconds > 0 or len(parts) == 0:
+        parts.append(f"{seconds}s")
+
+    return " ".join(parts)

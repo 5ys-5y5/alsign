@@ -9,7 +9,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL = '/api';
 
 /**
  * Endpoint Flow Definitions
@@ -205,6 +205,165 @@ const ENDPOINT_FLOWS = {
       }
     }
   },
+
+  getQuantatatives: {
+    id: 'getQuantatatives',
+    title: 'POST /getQuantatatives',
+    description: 'config_lv3_targets의 ticker + peer를 모아 재무/가격 API를 호출하고 config_lv3_quantatatives에 JSONB로 저장',
+    parameters: [
+      {
+        name: 'overwrite',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '기존 데이터 덮어쓰기 여부. false(기본값)이면 이미 데이터가 있는 API는 건너뜀. true면 모든 선택된 API를 다시 가져옴.'
+      },
+      {
+        name: 'apis',
+        type: 'string',
+        required: false,
+        default: '(all APIs)',
+        description: '수집할 API를 쉼표로 구분하여 지정. 가능한 값: ratios, key-metrics, cash-flow, balance-sheet, market-cap, price, income, quote. 예: "ratios,key-metrics". 비어있으면 모든 API 수집.',
+        examples: [
+          { value: 'ratios,key-metrics', description: 'Ratios와 Key Metrics만 수집' },
+          { value: 'price,market-cap', description: 'Price와 Market Cap만 수집' },
+          { value: 'balance-sheet,quote', description: 'Balance Sheet와 Quote만 수집' },
+          { value: '', description: '모든 API 수집 (기본값)' }
+        ]
+      },
+      {
+        name: 'tickers',
+        type: 'string',
+        required: false,
+        default: '(all targets and peers)',
+        description: '처리할 ticker를 쉼표로 구분하여 지정. config_lv3_targets의 ticker 또는 peer 컬럼에 존재하는 ticker만 처리됨. 예: "AAPL,MSFT,NVDA". 비어있으면 모든 targets + peers 처리.',
+        examples: [
+          { value: 'AAPL,MSFT,NVDA', description: '특정 3개 ticker만 처리' },
+          { value: 'TSLA', description: '단일 ticker만 처리' },
+          { value: '', description: '모든 targets + peers 처리 (기본값)' }
+        ]
+      }
+    ],
+    usageExamples: [
+      {
+        title: '기본 실행 (모든 API)',
+        url: 'POST /getQuantatatives',
+        description: 'targets + peers 전체 티커 대상으로 모든 quantatatives API 수집'
+      },
+      {
+        title: '선택적 API만 수집',
+        url: 'POST /getQuantatatives?apis=ratios,key-metrics',
+        description: 'Financial Ratios와 Key Metrics만 수집 (기존 데이터 유지)'
+      },
+      {
+        title: '특정 ticker만 처리',
+        url: 'POST /getQuantatatives?tickers=AAPL,MSFT,NVDA',
+        description: 'AAPL, MSFT, NVDA 3개 ticker만 처리 (config_lv3_targets에 존재하는지 자동 확인)'
+      },
+      {
+        title: '기존 데이터 덮어쓰기',
+        url: 'POST /getQuantatatives?overwrite=true',
+        description: '모든 API를 다시 수집하여 기존 데이터 덮어쓰기'
+      },
+      {
+        title: '특정 ticker + API 조합',
+        url: 'POST /getQuantatatives?tickers=TSLA&apis=price,market-cap&overwrite=true',
+        description: 'TSLA의 Price와 Market Cap만 다시 수집하여 덮어쓰기'
+      },
+      {
+        title: '특정 API만 덮어쓰기',
+        url: 'POST /getQuantatatives?overwrite=true&apis=price,market-cap',
+        description: 'Price와 Market Cap만 다시 수집하여 덮어쓰기'
+      }
+    ],
+    phases: [
+      {
+        id: 'load_targets',
+        title: '1. 대상 티커 로드',
+        description: 'config_lv3_targets에서 ticker/peer 조회',
+        apiId: null,
+        note: 'DB 쿼리 (API 아님)'
+      },
+      {
+        id: 'expand_peers',
+        title: '2. Peer 확장',
+        description: 'peer JSON/문자열 파싱 후 unique ticker 생성',
+        apiId: null
+      },
+      {
+        id: 'fetch_apis',
+        title: '3. Ticker별 API 호출',
+        description: 'FMP 재무/가격 API 호출 후 raw JSON 수집',
+        subPhases: [
+          {
+            id: 'income_statement',
+            title: 'Income Statement',
+            apiId: 'fmp-income-statement',
+            requiredKeys: ['date', 'revenue', 'netIncome'],
+            configKey: 'quantatatives.income_statement'
+          },
+          {
+            id: 'cash_flow',
+            title: 'Cash Flow Statement',
+            apiId: 'fmp-cash-flow-statement',
+            requiredKeys: ['date', 'operatingCashFlow', 'freeCashFlow'],
+            configKey: 'quantatatives.cash_flow_statement'
+          },
+          {
+            id: 'key_metrics',
+            title: 'Key Metrics',
+            apiId: 'fmp-key-metrics',
+            requiredKeys: ['date', 'marketCap', 'peRatio'],
+            configKey: 'quantatatives.key_metrics'
+          },
+          {
+            id: 'financial_ratios',
+            title: 'Financial Ratios',
+            apiId: 'fmp-ratios',
+            requiredKeys: ['date', 'currentRatio', 'priceEarningsRatio'],
+            configKey: 'quantatatives.financial_ratios'
+          },
+          {
+            id: 'historical_market_cap',
+            title: 'Historical Market Cap',
+            apiId: 'fmp-historical-market-capitalization',
+            requiredKeys: ['date', 'marketCap'],
+            configKey: 'quantatatives.historical_market_cap'
+          },
+          {
+            id: 'historical_price',
+            title: 'Historical Price',
+            apiId: 'fmp-historical-price-eod-full',
+            requiredKeys: ['date', 'open', 'high', 'low', 'close'],
+            configKey: 'quantatatives.historical_price'
+          }
+        ]
+      },
+      {
+        id: 'status_update',
+        title: '4. Status 갱신',
+        description: 'API별 최소/최대 기준일을 status JSONB에 기록',
+        apiId: null,
+        note: '기존 maxDate보다 새로운 maxDate가 크면 업데이트'
+      },
+      {
+        id: 'upsert',
+        title: '5. UPSERT',
+        description: 'config_lv3_quantatatives에 ticker 단위로 UPSERT',
+        apiId: null
+      }
+    ],
+    outputs: [
+      'status (API별 minDate/maxDate)',
+      'income_statement (JSONB)',
+      'cash_flow_statement (JSONB)',
+      'key_metrics (JSONB)',
+      'financial_ratios (JSONB)',
+      'historical_price (JSONB)',
+      'historical_market_cap (JSONB)'
+    ]
+  },
+
   backfillEventsTable: {
     id: 'backfillEventsTable',
     title: 'POST /backfillEventsTable',

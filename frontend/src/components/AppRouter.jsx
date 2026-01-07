@@ -41,7 +41,7 @@ function ContentWrapper({ children }) {
   const getMainContentStyle = () => {
     return {
       padding: 'var(--space-4)',
-      width: '80%',
+      width: '98%',
       maxWidth: '1400px',
       margin: '0 auto',
     };

@@ -66,9 +66,10 @@ async def truncate_and_insert_company_targets(
             await conn.execute("TRUNCATE TABLE config_lv3_targets")
             logger.info("[truncate_and_insert_company_targets] Step 4: TRUNCATE completed successfully")
 
-            # Insert new data
-            logger.info(f"[truncate_and_insert_company_targets] Step 5: Starting to insert {len(companies)} companies")
+            # Insert new data - Prepare data for bulk insert
+            logger.info(f"[truncate_and_insert_company_targets] Step 5: Starting to prepare {len(companies)} companies for bulk insert")
 
+            insert_data = []
             for idx, company in enumerate(companies):
                 # Log every 500 companies
                 if idx % 500 == 0:
@@ -86,23 +87,32 @@ async def truncate_and_insert_company_targets(
                     logger.warning(f"[truncate_and_insert_company_targets] Skipping company with no ticker: {str(company)[:100]}")
                     continue
 
-                # Insert company
+                # Add to bulk insert data
+                insert_data.append((
+                    ticker.upper(),
+                    company.get('sector'),
+                    company.get('industry'),
+                    json.dumps(company)
+                ))
+
+            # Bulk insert all data at once
+            logger.info(f"[truncate_and_insert_company_targets] Step 6: Bulk inserting {len(insert_data)} companies")
+            if insert_data:
                 try:
-                    await conn.execute(
+                    await conn.executemany(
                         """
                         INSERT INTO config_lv3_targets (ticker, sector, industry, response_key)
                         VALUES ($1, $2, $3, $4)
                         """,
-                        ticker.upper(),
-                        company.get('sector'),
-                        company.get('industry'),
-                        json.dumps(company)
+                        insert_data
                     )
-                    insert_count += 1
+                    insert_count = len(insert_data)
+                    logger.info(f"[truncate_and_insert_company_targets] Bulk insert completed successfully: {insert_count} companies inserted")
                 except Exception as e:
-                    logger.error(f"[truncate_and_insert_company_targets] Failed to insert {ticker}: {type(e).__name__}: {str(e)}")
+                    logger.error(f"[truncate_and_insert_company_targets] Bulk insert failed: {type(e).__name__}: {str(e)}")
+                    raise
 
-            logger.info(f"[truncate_and_insert_company_targets] Step 6: Insertion loop completed")
+            logger.info(f"[truncate_and_insert_company_targets] Step 7: Insertion completed")
             logger.info(f"[truncate_and_insert_company_targets] Total inserted: {insert_count}")
             logger.info(f"[truncate_and_insert_company_targets] Step 7: Committing transaction")
 

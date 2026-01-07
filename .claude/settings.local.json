@@ -113,7 +113,12 @@
       "Bash(cmd //c \"for /f \"\"tokens=5\"\" %a in \\(''netstat -ano ^| findstr \"\":8000\"\" ^| findstr \"\"LISTENING\"\"''\\) do @taskkill /F /PID %a 2>nul\")",
       "Bash(cmd //c \"taskkill /F /PID 7504 && taskkill /F /PID 52468\")",
       "Bash(cmd //c \"for %p in \\(8000\\) do for /f \"\"tokens=5\"\" %a in \\(''netstat -ano ^| findstr \"\":%p\"\" ^| findstr \"\"LISTENING\"\"''\\) do taskkill /F /PID %a 2>nul\")",
-      "Bash(cmd //c \"taskkill /F /PID 52468\")"
+      "Bash(cmd //c \"taskkill /F /PID 52468\")",
+      "Bash(then grep \"^DB\" backend/.env)",
+      "Bash(cmd //c \"taskkill /F /PID 22736 2>&1\")",
+      "Bash(cmd //c \"tasklist | findstr 22736\")",
+      "Bash(cmd //c \"taskkill /F /PID 24316 2>&1\")",
+      "Bash(cmd //c \"for %p in \\(2264 29156 28536\\) do taskkill /F /PID %p 2>nul\")"
     ]
   }
 }

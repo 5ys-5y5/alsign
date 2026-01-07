@@ -1,14 +1,7 @@
-/**
- * RequestsPage Component
- *
- * Request forms for backend API endpoints with Status/LOG monitoring panel.
- * Based on alsign/prompt/2_designSystem.ini request_contract.
- */
-
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useLog } from '../contexts/LogContext';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+const API_BASE_URL = '/api';
 
 /**
  * Parse log line in key=value format.
@@ -122,7 +115,8 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
     const isStreaming =
       (path === '/sourceData' && method === 'GET') ||
       (path === '/setEventsTable' && method === 'POST') ||
-      (path === '/backfillEventsTable' && method === 'POST');
+      (path === '/backfillEventsTable' && method === 'POST') ||
+      (path === '/getQuantatatives' && method === 'POST');
 
     if (isStreaming) {
       // Use SSE for real-time streaming
@@ -133,10 +127,31 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
         streamUrl = `${API_BASE_URL}/setEventsTable/stream${queryString ? '?' + queryString : ''}`;
       } else if (path === '/backfillEventsTable' && method === 'POST') {
         streamUrl = `${API_BASE_URL}/backfillEventsTable/stream${queryString ? '?' + queryString : ''}`;
+      } else if (path === '/getQuantatatives' && method === 'POST') {
+        streamUrl = `${API_BASE_URL}/getQuantatatives/stream${queryString ? '?' + queryString : ''}`;
       }
       const eventSource = new EventSource(streamUrl);
       let requestId = null;
       const detailedLogs = [];
+
+      // Safety timeout: close connection if no response in 30 minutes (for large batch operations)
+      const safetyTimeout = setTimeout(() => {
+        if (eventSource.readyState !== EventSource.CLOSED) {
+          console.error('EventSource timeout - closing connection');
+          eventSource.close();
+          setError('Request timeout - no response from server');
+          setLoading(false);
+          onLog?.('error', `${method} ${path} - Timeout (30min)`, requestId || 'unknown');
+          onRequestComplete?.({
+            id: requestId || Date.now().toString(),
+            status: 'error',
+            statusCode: 408,
+            duration: 1800000,
+            error: 'Request timeout',
+            detailedLogs: [...detailedLogs],
+          });
+        }
+      }, 1800000);
 
       eventSource.addEventListener('init', (e) => {
         const data = JSON.parse(e.data);
@@ -172,6 +187,7 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
       });
 
       eventSource.addEventListener('result', (e) => {
+        clearTimeout(safetyTimeout);
         const result = JSON.parse(e.data);
         const duration = Date.now() - startTime;
 
@@ -524,6 +540,7 @@ export default function RequestsPage() {
   // Endpoint list for navigation
   const endpoints = [
     { id: 'sourceData', title: 'GET /sourceData' },
+    { id: 'getQuantatatives', title: 'POST /getQuantatatives' },
     { id: 'setEventsTable', title: 'POST /setEventsTable' },
     { id: 'backfillEventsTable', title: 'POST /backfillEventsTable' },
     { id: 'generatePriceTrends', title: 'POST /generatePriceTrends' },
@@ -717,6 +734,42 @@ export default function RequestsPage() {
               description: 'JSON 배열 형식의 파티션 목록',
             },
           ]}
+          onRequestStart={handleRequestStart}
+          onRequestComplete={handleRequestComplete}
+          onLog={handleLog}
+        />}
+
+        {/* POST /getQuantatatives */}
+        {selectedEndpoint === 'getQuantatatives' && <RequestForm
+          title="POST /getQuantatatives"
+          method="POST"
+          path="/getQuantatatives"
+          queryFields={[
+            {
+              key: 'overwrite',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: 'If checked, refetch all selected APIs even if data already exists. If unchecked, skip APIs with existing data.',
+            },
+            {
+              key: 'apis',
+              type: 'string',
+              control: 'input',
+              placeholder: 'ratios,key-metrics,cash-flow,balance-sheet,market-cap,price,income,quote',
+              required: false,
+              description: 'Comma-separated list of APIs to fetch. Available: ratios, key-metrics, cash-flow, balance-sheet, market-cap, price, income, quote. Leave empty to fetch all APIs.',
+            },
+            {
+              key: 'tickers',
+              type: 'string',
+              control: 'input',
+              placeholder: 'AAPL,MSFT,NVDA',
+              required: false,
+              description: 'Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. Leave empty to process all targets and their peers.',
+            },
+          ]}
+          bodyFields={[]}
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
