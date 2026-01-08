@@ -133,11 +133,15 @@
       "Bash(cmd //c \"taskkill /F /PID 24660 2>&1\")",
       "Bash(cmd //c \"taskkill /F /PID 9344 2>&1\")",
       "Bash(cmd //c \"taskkill /F /PID 29880 2>&1\")",
-      "Bash(cmd //c \"taskkill /F /PID 21788 2>&1\")"
+      "Bash(cmd //c \"taskkill /F /PID 21788 2>&1\")",
+      "Bash(python3:*)",
+      "Bash(awk:*)",
+      "Bash(git checkout:*)",
+      "Bash(rm:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "supabase"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

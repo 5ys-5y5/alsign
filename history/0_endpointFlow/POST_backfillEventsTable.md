@@ -398,6 +398,7 @@ engine.calculate_all(api_data, target_domains)
 | I-41 | priceQuantitative 메트릭 구현 (원본 설계 준수) | ✅ 완료 |
 | I-37 | targetMedian → 실제 Median 계산 (PERCENTILE_CONT) | ✅ 완료 |
 | I-44 | Database timeout + peer collection 병렬 처리 성능 최적화 | ✅ 완료 |
+| I-42 | Dedicated quantitative columns (price_quantitative, peer_quantitative) | ✅ 완료 |
 
 ### I-25 해결 완료 (2025-12-27)
 - **문제**: `fmp-quote` API가 현재 시점 marketCap만 반환
@@ -815,8 +816,281 @@ CREATE TABLE txn_price_trend (
 - `backend/src/routers/events.py`
 - `backend/src/routers/events_stream.py`
 
+### I-42 해결됨 (2026-01-08) ✅
+
+**배경**:
+- I-41에서 `priceQuantitative` 메트릭을 `value_quantitative.valuation` JSONB 내부에 구현
+- 실제 프로덕션 환경에서 `priceQuantitative` 기반의 position/disparity 계산이 빈번히 사용됨
+- JSONB 내부 필드 접근은 인덱싱이 어렵고 쿼리 성능이 떨어짐
+
+**문제**:
+1. **성능 문제**: `value_quantitative->'valuation'->>'priceQuantitative'` JSONB 경로 쿼리가 느림
+2. **구조적 문제**: peer 데이터(sector averages)가 `value_quantitative`에 포함되지 않아 정보 손실
+3. **position/disparity 누락**: `priceQuantitative`가 NULL이면 position_quantitative, disparity_quantitative도 NULL
+
+**해결**: txn_events 테이블에 전용 컬럼 추가
+```sql
+ALTER TABLE txn_events ADD COLUMN price_quantitative NUMERIC;
+ALTER TABLE txn_events ADD COLUMN peer_quantitative JSONB;
+```
+
+**설계**:
+
+#### 1. **price_quantitative 컬럼**
+- **타입**: `NUMERIC` (인덱스 가능)
+- **의미**: 업종 평균 PER/PBR 기반 적정가 (Fair Value)
+- **계산 방식**:
+  ```
+  적정가 = (업종 평균 PER) × (현재 EPS)
+  EPS = 현재 주가 / 현재 PER
+
+  또는 (PER 음수/없을 시):
+  적정가 = (업종 평균 PBR) × (현재 BPS)
+  BPS = 현재 주가 / 현재 PBR
+  ```
+- **데이터 소스**:
+  - 현재 주가: `fmp-historical-price-eod-full` (event_date 기준)
+  - 현재 PER/PBR: `value_quantitative.valuation` (계산된 메트릭)
+  - 업종 평균 PER/PBR: peer 데이터에서 sector average 계산
+
+#### 2. **peer_quantitative 컬럼**
+- **타입**: `JSONB`
+- **의미**: 업종 평균 계산에 사용된 peer 데이터 메타정보
+- **구조**:
+  ```json
+  {
+    "peerCount": 9,
+    "sectorAverages": {
+      "PER": 25.5,
+      "PBR": 7.2,
+      "PSR": 3.1
+    }
+  }
+  ```
+- **목적**:
+  - `priceQuantitative` 계산 근거 제공
+  - 업종 평균 PER/PBR 값 직접 조회 가능
+  - Peer 수로 신뢰도 판단 가능
+
+#### 3. **position_quantitative & disparity_quantitative 계산 흐름**
+
+**Phase 1: Sector Averages 계산 (Ticker 단위)**
+```
+process_ticker_batch()
+  │
+  ├─► DB 모드: Global Peer Cache 사용
+  │     ├─► ticker_to_peers에서 peer 목록 조회
+  │     ├─► global_peer_cache에서 peer 재무 데이터 조회
+  │     └─► calculate_sector_average_from_cache() 호출
+  │           ├─► peer_data['fmp-ratios'][0] (최신 재무비율)
+  │           ├─► priceEarningsRatio, priceToBookRatio 등 추출
+  │           └─► 평균 계산 → {'PER': 25.5, 'PBR': 7.2, ...}
+  │
+  └─► API 모드 (fallback): DB에서 개별 조회
+        └─► calculate_sector_average_metrics_from_db()
+```
+
+**Phase 2: priceQuantitative 계산 (Event 단위)**
+```
+For each event:
+  │
+  ├─► [1] Quantitative 메트릭 계산 (temp_quant_result)
+  │     └─► engine.calculate_all() → PER, PBR, PSR 등
+  │
+  ├─► [2] 현재 주가 조회 (current_price)
+  │     ├─► consensus event: qualitative.currentPrice
+  │     └─► earning event: ticker_api_cache['fmp-historical-price-eod-full'][event_date]
+  │
+  ├─► [3] priceQuantitative 계산
+  │     └─► calculate_fair_value_from_sector(
+  │           temp_quant_result.value,  # {'valuation': {'PER': 28.5, 'PBR': 7.2}}
+  │           sector_averages,          # {'PER': 25.5, 'PBR': 7.2}
+  │           current_price             # 180.0
+  │         )
+  │         ├─► current_per = temp_value['valuation']['PER']  # 28.5
+  │         ├─► sector_avg_per = sector_averages['PER']       # 25.5
+  │         ├─► eps = current_price / current_per             # 180 / 28.5 = 6.32
+  │         └─► fair_value = sector_avg_per * eps             # 25.5 × 6.32 = 161.16
+  │
+  └─► [4] custom_values에 저장
+        └─► custom_values['priceQuantitative'] = fair_value
+```
+
+**Phase 3: position & disparity 계산 (Event 단위)**
+```
+For each event:
+  │
+  ├─► value_quant = calculate_quantitative_metrics_fast(
+  │       ..., custom_values={'priceQuantitative': 161.16}
+  │     )
+  │     └─► value_quant['valuation']['priceQuantitative'] = 161.16
+  │
+  ├─► price_quant_value = value_quant['valuation']['priceQuantitative']  # 161.16
+  │
+  ├─► [1] position_quantitative 계산
+  │     ├─► if price_quant_value > current_price: 'long'
+  │     ├─► elif price_quant_value < current_price: 'short'
+  │     └─► else: 'neutral'
+  │
+  ├─► [2] disparity_quantitative 계산
+  │     └─► (price_quant_value / current_price) - 1  # (161.16 / 180.0) - 1 = -0.1046
+  │
+  └─► [3] 전용 컬럼 추출
+        ├─► price_quantitative = value_quant['valuation']['priceQuantitative']
+        └─► peer_quantitative = {'peerCount': 9, 'sectorAverages': {...}}
+```
+
+**Phase 4: DB 업데이트**
+```
+batch_update_event_valuations()
+  │
+  └─► UPDATE txn_events SET
+        value_quantitative = $1,
+        position_quantitative = $2,
+        disparity_quantitative = $3,
+        price_quantitative = $4,  -- NEW: 전용 컬럼
+        peer_quantitative = $5    -- NEW: 전용 컬럼
+      WHERE ...
+```
+
+**데이터 흐름 다이어그램**:
+```
+[Global Peer Cache] (DB 또는 API에서 로드)
+    ↓
+[Sector Averages] = calculate_sector_average_from_cache(peer_tickers, cache)
+    ↓                   ├─> PER: 25.5
+    │                   ├─> PBR: 7.2
+    │                   └─> PSR: 3.1
+    │
+    ├──────────────────────────────────────────┐
+    │                                          │
+    ▼                                          ▼
+[priceQuantitative 계산]                   [peer_quantitative 구성]
+fair_value = calculate_fair_value_from_sector()   {
+    ├─> current_price: 180.0                       "peerCount": 9,
+    ├─> current_PER: 28.5                          "sectorAverages": {
+    ├─> sector_avg_PER: 25.5                         "PER": 25.5,
+    └─> fair_value = 161.16                          "PBR": 7.2,
+                                                      "PSR": 3.1
+    ↓                                                }
+    └─> custom_values['priceQuantitative'] = 161.16  }
+              │                                      │
+              ▼                                      │
+    [value_quantitative JSONB]                      │
+    {                                               │
+      "valuation": {                                │
+        "priceQuantitative": 161.16, ◄──────────────┘
+        "PER": 28.5,
+        "PBR": 7.2,
+        ...
+      }
+    }
+              │
+              ▼
+    [position/disparity 계산]
+    ├─> position_quantitative = 'long'
+    └─> disparity_quantitative = -0.1046
+              │
+              ▼
+    [DB 저장: txn_events 테이블]
+    ├─> value_quantitative (JSONB)
+    ├─> position_quantitative (enum)
+    ├─> disparity_quantitative (float)
+    ├─> price_quantitative (NUMERIC) ◄── NEW
+    └─> peer_quantitative (JSONB) ◄── NEW
+```
+
+**핵심 함수**:
+1. **calculate_sector_average_from_cache()** (`utils/quantitative_cache.py:219-308`)
+   - DB 모드용: peer cache에서 fmp-ratios 직접 추출
+   - 구조: `{ticker: {api_id: data}}`
+
+2. **calculate_sector_average_from_cache_api()** (`valuation_service.py:2691-2752`)
+   - API 모드용: calculated_metrics 구조 처리
+   - 구조: `{ticker: {calculated_metrics: {valuation: {...}}}}`
+
+3. **calculate_fair_value_from_sector()** (`utils/quantitative_cache.py:311-351`)
+   - 적정가 계산 (PER 우선, 실패 시 PBR)
+   - Returns: fair_value (float) or None
+
+**NULL 처리**:
+- `sector_averages` 비어있을 때: priceQuantitative = NULL
+- priceQuantitative = NULL일 때: position_quantitative = NULL, disparity_quantitative = NULL
+- peer_quantitative = NULL (sector_averages 없을 때)
+
+**로깅 (디버깅용)**:
+```python
+# Sector averages 계산 시작
+logger.info(f"[DEBUG-SECTOR-AVG-CALC] Starting calculation for {len(peer_tickers)} peers")
+logger.info(f"[DEBUG-SECTOR-AVG-CALC] Peers with valid ratios: {peers_with_data_count}/{len(peer_tickers)}")
+
+# priceQuantitative 계산
+logger.info(f"[DEBUG-PRICE-QUANT] current_price={current_price}, sector_avg_PER={sector_averages.get('PER')}")
+
+# position/disparity 계산
+logger.info(f"[DEBUG-POS-CALC] price_quant={price_quant_value}, current_price={current_price}")
+```
+
+**쿼리 예시**:
+```sql
+-- 적정가가 현재가보다 낮은 이벤트 (매수 신호)
+SELECT ticker, event_date,
+       price_quantitative,
+       (peer_quantitative->>'sectorAverages')::jsonb->'PER' as sector_avg_per
+FROM txn_events
+WHERE position_quantitative = 'long'
+  AND price_quantitative IS NOT NULL
+ORDER BY disparity_quantitative DESC;
+
+-- Peer 수가 5개 이상인 신뢰도 높은 이벤트
+SELECT ticker, event_date, price_quantitative,
+       (peer_quantitative->>'peerCount')::int as peer_count
+FROM txn_events
+WHERE (peer_quantitative->>'peerCount')::int >= 5
+  AND price_quantitative IS NOT NULL;
+```
+
+**성능 영향**:
+- ✅ priceQuantitative 쿼리: JSONB 경로 → NUMERIC 컬럼 (인덱스 가능)
+- ✅ Sector averages: peer_quantitative에서 직접 조회 (재계산 불필요)
+- ✅ 저장 오버헤드: 무시할 수준 (NUMERIC 8바이트, JSONB ~100바이트)
+
+**수정된 파일**:
+- `backend/src/services/valuation_service.py`
+  - Line 161-193: Sector averages 계산 로깅 추가
+  - Line 329-426: priceQuantitative 및 position/disparity 계산 로깅 추가
+  - Line 438-461: price_quantitative, peer_quantitative 컬럼 구성
+  - Line 2691-2752: API 모드 함수 이름 변경 (calculate_sector_average_from_cache_api)
+- `backend/src/services/utils/quantitative_cache.py`
+  - Line 219-308: DB 모드 sector average 계산 로깅 강화
+
+**검증 방법**:
+```bash
+# 1. 엔드포인트 실행
+POST /backfillEventsTable?overwrite=true&tickers=RGTI
+
+# 2. 로그 확인
+[DEBUG-SECTOR-AVG-CALC] Starting calculation for 9 peers
+[DEBUG-SECTOR-AVG-CALC] Peers with valid ratios: 9/9
+[DEBUG-SECTOR-AVG-CALC] PER: 25.50 (from 9 values)
+[DEBUG-PRICE-QUANT] SUCCESS: priceQuantitative=161.16
+[DEBUG-POS-CALC] SUCCESS: position=long, disparity=-0.1046
+
+# 3. DB 확인
+SELECT ticker, event_date, price_quantitative, peer_quantitative
+FROM txn_events
+WHERE ticker = 'RGTI' AND price_quantitative IS NOT NULL
+LIMIT 5;
+```
+
+**참조**:
+- **이슈**: `history/3_DETAIL.md#I-42`
+- **관련 이슈**: I-41 (priceQuantitative 메트릭 구현)
+- **DB 스키마**: `backend/migrations/add_quantitative_columns.sql`
+
 ---
 
-*최종 업데이트: 2026-01-06 KST (I-44 추가 - Database timeout + peer collection 병렬 처리 성능 최적화)*
+*최종 업데이트: 2026-01-08 KST (I-42 추가 - Dedicated quantitative columns for performance)*
+*이전 업데이트: 2026-01-06 KST (I-44 추가 - Database timeout + peer collection 병렬 처리 성능 최적화)*
 *이전 업데이트: 2026-01-05 KST (I-43 설계 추가 - txn_price_trend 테이블 분리)*
 

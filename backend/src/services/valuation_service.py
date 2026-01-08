@@ -20,6 +20,14 @@ from ..utils.logging_utils import (
     log_error, log_warning, log_event_update, log_batch_start, log_batch_complete, log_db_update
 )
 from .utils.batch_utils import calculate_eta, format_eta_ms
+from .utils.quantitative_cache import (
+    get_peer_tickers_from_db,
+    get_quantitative_data_from_db,
+    get_batch_quantitative_data_from_db,
+    calculate_sector_average_from_cache,
+    calculate_sector_average_metrics_from_db,
+    calculate_fair_value_from_sector
+)
 
 logger = logging.getLogger("alsign")
 
@@ -94,49 +102,36 @@ async def process_ticker_batch(
         # Use special event_id format for ticker-level API calls
         ticker_context_id = f"ticker-cache:{ticker}"
 
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL API CACHING START ==========")
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | Fetching {len(required_apis)} APIs for {ticker} (ONCE for all {len(ticker_events)} events)")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL DB CACHING START (API-FREE!) ==========")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | Loading {len(required_apis)} APIs for {ticker} from DB (ONCE for all {len(ticker_events)} events)")
 
-        # Fetch all API data once
-        ticker_api_cache = {}
+        # ========================================
+        # NEW: DB에서 quantitative 데이터 조회 (API 호출 제거!)
+        # ========================================
+        ticker_api_cache = await get_quantitative_data_from_db(pool, ticker, required_apis)
+
+        if not ticker_api_cache:
+            log_warning(
+                logger,
+                f"No quantitative data for {ticker}. Run POST /getQuantitatives first.",
+                ticker=ticker
+            )
+            # 빈 결과 반환 - 이 ticker는 실패로 처리됨
+            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL DB CACHING FAILED ==========")
+            return {
+                'updates': [],
+                'results': [],
+                'success_counts': {'quant': 0, 'qual': 0},
+                'fail_counts': {'quant': len(ticker_events), 'qual': len(ticker_events)}
+            }
+
+        # Consensus summary는 qualitative 계산에서 사용되지 않음
+        # calculate_qualitative_metrics_fast에서 evt_consensus 테이블을 직접 조회하므로
+        # 여기서는 None으로 설정
         consensus_summary_cache = None
 
-        async with FMPAPIClient() as fmp_client:
-            # Fetch quantitative APIs
-            for api_id in required_apis:
-                try:
-                    params = {'ticker': ticker}
-
-                    if 'historical-price' in api_id or 'eod' in api_id or 'historical-market-cap' in api_id:
-                        # Wide date range to cover all events
-                        # I-25: fmp-historical-market-capitalization도 from/to 파라미터 필요
-                        params['fromDate'] = '2000-01-01'
-                        params['toDate'] = datetime.now().strftime('%Y-%m-%d')
-                    else:
-                        params['period'] = 'quarter'
-                        params['limit'] = 100
-
-                    result = await fmp_client.call_api(api_id, params, event_id=ticker_context_id)
-                    ticker_api_cache[api_id] = result
-                    logger.debug(f"[Ticker Batch] {ticker}: Cached {api_id} ({len(result) if isinstance(result, list) else 'single'} records)")
-                except Exception as e:
-                    log_warning(logger, f"Failed to fetch API {api_id}", ticker=ticker)
-                    ticker_api_cache[api_id] = []
-
-            # Fetch qualitative API (consensus) ONCE for ticker
-            try:
-                consensus_data = await fmp_client.call_api('fmp-price-target-consensus', {'ticker': ticker}, event_id=ticker_context_id)
-                if consensus_data:
-                    if isinstance(consensus_data, list) and len(consensus_data) > 0:
-                        consensus_summary_cache = consensus_data[0]
-                    elif isinstance(consensus_data, dict):
-                        consensus_summary_cache = consensus_data
-                logger.debug(f"[Ticker Batch] {ticker}: Consensus summary cached")
-            except Exception as e:
-                logger.warning(f"[Ticker Batch] {ticker}: Consensus fetch skipped: {e}")
-
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | API cache ready: {len(ticker_api_cache) + 1} APIs cached")
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL API CACHING END ==========")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | DB cache ready: {len(ticker_api_cache)} APIs loaded from config_lv3_quantitatives")
+        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL DB CACHING END (No API calls!) ==========")
         
         # OPTIMIZATION: Load transforms and engine ONCE per ticker (not per event!)
         transforms = await metrics.select_metric_transforms(pool)
@@ -166,7 +161,20 @@ async def process_ticker_batch(
                 if peer_tickers:
                     logger.info(f"[PERF-OPT] {ticker}: Using global peer cache ({peer_count} peers)")
 
+                    # DEBUG: Log cache structure for first peer
+                    if peer_tickers and global_peer_cache:
+                        first_peer = peer_tickers[0]
+                        first_peer_data = global_peer_cache.get(first_peer, {})
+                        cache_keys = list(first_peer_data.keys()) if first_peer_data else []
+                        logger.info(f"[DEBUG-SECTOR-AVG] {ticker}: First peer={first_peer}, cache keys={cache_keys}")
+                        if 'fmp-ratios' in first_peer_data:
+                            ratios_data = first_peer_data.get('fmp-ratios', [])
+                            logger.info(f"[DEBUG-SECTOR-AVG] {ticker}: fmp-ratios type={type(ratios_data)}, length={len(ratios_data) if isinstance(ratios_data, list) else 'N/A'}")
+                        else:
+                            logger.warning(f"[DEBUG-SECTOR-AVG] {ticker}: 'fmp-ratios' key NOT FOUND in {first_peer} cache")
+
                     # Calculate sector averages from GLOBAL CACHE (no API calls!)
+                    # Uses quantitative_cache.calculate_sector_average_from_cache (DB mode)
                     sector_averages = await calculate_sector_average_from_cache(
                         peer_tickers, global_peer_cache
                     )
@@ -174,28 +182,38 @@ async def process_ticker_batch(
                     logger.info(
                         f"[PERF-OPT] {ticker}: Sector averages calculated from cache: {list(sector_averages.keys())}"
                     )
+
+                    # DEBUG: Log detailed result if empty
+                    if not sector_averages:
+                        logger.warning(
+                            f"[DEBUG-SECTOR-AVG] {ticker}: EMPTY sector_averages! "
+                            f"peer_tickers={peer_tickers[:3]}, "
+                            f"cache_size={len(global_peer_cache)}, "
+                            f"cache_tickers={list(global_peer_cache.keys())[:5]}"
+                        )
                 else:
                     logger.warning(f"[PERF-OPT] {ticker}: No peers in global cache")
 
             else:
-                # FALLBACK: Use per-ticker peer fetching (old method)
-                logger.info(f"[FALLBACK] {ticker}: Global cache not available, fetching peers individually")
+                # FALLBACK: DB에서 peer 데이터 조회 (API 호출 대신!)
+                logger.info(f"[DB-Mode] {ticker}: Global cache not available, loading peers from DB")
 
-                # Get peer tickers ONCE for this ticker
-                peer_tickers = await get_peer_tickers(ticker, event_id=ticker_context_id)
+                # Get peer tickers from config_lv3_targets (DB 조회, API 호출 없음!)
+                peer_tickers = await get_peer_tickers_from_db(pool, ticker)
                 peer_count = len(peer_tickers)
 
                 if peer_tickers and ticker_events:
-                    logger.info(f"[FALLBACK] {ticker}: Found {peer_count} peer tickers: {peer_tickers}")
+                    logger.info(f"[DB-Mode] {ticker}: Found {peer_count} peer tickers from DB: {peer_tickers[:5]}...")
 
                     # Use first event's date as reference for sector averages
                     reference_date = ticker_events[0]['event_date']
-                    sector_averages = await calculate_sector_average_metrics(
-                        pool, peer_tickers, reference_date, metrics_by_domain, event_id=ticker_context_id
+                    # DB 기반 sector average 계산 (API 호출 없음!)
+                    sector_averages = await calculate_sector_average_metrics_from_db(
+                        pool, peer_tickers, reference_date, metrics_by_domain
                     )
-                    logger.info(f"[FALLBACK] {ticker}: Sector averages calculated: {list(sector_averages.keys())}")
+                    logger.info(f"[DB-Mode] {ticker}: Sector averages calculated from DB: {list(sector_averages.keys())}")
                 else:
-                    logger.warning(f"[FALLBACK] {ticker}: No peer tickers found")
+                    logger.warning(f"[DB-Mode] {ticker}: No peer tickers found in config_lv3_targets")
 
             logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER DATA PROCESSING END ==========")
 
@@ -308,14 +326,34 @@ async def process_ticker_batch(
                 # CRITICAL: Save current_price for position/disparity calculation later
                 current_price_for_position = current_price
 
-                # DEBUG: Log price retrieval
-                if idx <= 2:
-                    logger.info(f"{row_context} | DEBUG | current_price={current_price}, has_temp_value={temp_quant_result.get('value') is not None}, sector_avg_keys={list(sector_averages.keys())}")
+                # DEBUG: Log price retrieval (first 5 events for detail)
+                if idx <= 4:
+                    logger.info(
+                        f"{row_context} | DEBUG-PRICE-QUANT | "
+                        f"current_price={current_price}, "
+                        f"has_temp_value={temp_quant_result.get('value') is not None}, "
+                        f"has_sector_avg={bool(sector_averages)}, "
+                        f"sector_avg_keys={list(sector_averages.keys())}"
+                    )
 
                 if current_price and temp_quant_result.get('value'):
                     # PERFORMANCE FIX: Use CACHED sector_averages (NO API CALLS!)
                     # Instead of calling calculate_price_quantitative_metric which fetches peer data every time,
                     # we use the sector_averages that were cached once at ticker level
+
+                    if idx <= 4:
+                        temp_value = temp_quant_result.get('value', {})
+                        valuation = temp_value.get('valuation', {}) if isinstance(temp_value, dict) else {}
+                        logger.info(
+                            f"{row_context} | DEBUG-PRICE-QUANT | "
+                            f"Calling calculate_fair_value_from_sector with: "
+                            f"current_price={current_price}, "
+                            f"PER={valuation.get('PER')}, "
+                            f"PBR={valuation.get('PBR')}, "
+                            f"sector_avg_PER={sector_averages.get('PER')}, "
+                            f"sector_avg_PBR={sector_averages.get('PBR')}"
+                        )
+
                     fair_value = calculate_fair_value_from_sector(
                         temp_quant_result.get('value'),
                         sector_averages,  # CACHED at ticker level - NO API calls!
@@ -324,14 +362,18 @@ async def process_ticker_batch(
 
                     if fair_value is not None:
                         custom_values['priceQuantitative'] = fair_value
-                        if idx <= 2:
-                            logger.info(f"{row_context} | DEBUG | priceQuantitative={fair_value:.2f} (CACHED sector_avg)")
+                        if idx <= 4:
+                            logger.info(f"{row_context} | DEBUG-PRICE-QUANT | SUCCESS: priceQuantitative={fair_value:.2f}")
                     else:
-                        if idx <= 2:
-                            logger.warning(f"{row_context} | DEBUG | priceQuantitative=NULL (calculation failed)")
+                        if idx <= 4:
+                            logger.warning(f"{row_context} | DEBUG-PRICE-QUANT | FAILED: calculate_fair_value_from_sector returned None")
                 else:
-                    if idx <= 2:
-                        logger.warning(f"{row_context} | DEBUG | Skipped priceQuantitative: current_price={current_price}, has_value={temp_quant_result.get('value') is not None}")
+                    if idx <= 4:
+                        logger.warning(
+                            f"{row_context} | DEBUG-PRICE-QUANT | SKIPPED: "
+                            f"current_price={'NULL' if not current_price else current_price}, "
+                            f"temp_value={'NULL' if not temp_quant_result.get('value') else 'EXISTS'}"
+                        )
 
             # Calculate quantitative metrics using CACHED API data + custom values
             quant_result = await calculate_quantitative_metrics_fast(
@@ -359,9 +401,16 @@ async def process_ticker_batch(
             if value_quant and 'valuation' in value_quant:
                 price_quant_value = value_quant['valuation'].get('priceQuantitative')
 
-            # DEBUG: Log position/disparity calculation
-            if idx <= 2:
-                logger.info(f"{row_context} | DEBUG | Position calc: price_quant={price_quant_value}, current_price={current_price} (from_qual={qual_result.get('currentPrice') is not None}, from_hist={current_price_for_position is not None})")
+            # DEBUG: Log position/disparity calculation (first 5 events for detail)
+            if idx <= 4:
+                logger.info(
+                    f"{row_context} | DEBUG-POS-CALC | "
+                    f"price_quant={price_quant_value}, "
+                    f"current_price={current_price}, "
+                    f"has_sector_avg={bool(sector_averages)}, "
+                    f"from_qual={qual_result.get('currentPrice') is not None}, "
+                    f"from_hist={current_price_for_position is not None}"
+                )
 
             if price_quant_value is not None and current_price:
                 # I-41: Calculate position/disparity using priceQuantitative
@@ -374,16 +423,31 @@ async def process_ticker_batch(
 
                 disparity_quant = round((price_quant_value / current_price) - 1, 4) if current_price != 0 else None
 
-                if idx <= 2:
-                    logger.info(f"{row_context} | DEBUG | Calculated position={position_quant}, disparity={disparity_quant}")
+                if idx <= 4:
+                    logger.info(
+                        f"{row_context} | DEBUG-POS-CALC | SUCCESS: "
+                        f"position={position_quant}, disparity={disparity_quant:.4f}"
+                    )
             else:
                 # Fallback: No priceQuantitative available
+                if idx <= 4:
+                    logger.warning(
+                        f"{row_context} | DEBUG-POS-CALC | FALLBACK TRIGGERED: "
+                        f"price_quant_value={'NULL' if price_quant_value is None else price_quant_value}, "
+                        f"current_price={'NULL' if current_price is None else current_price}, "
+                        f"Trying calculate_position_disparity with quant_result.value and qual_result.currentPrice"
+                    )
+
                 position_quant, disparity_quant = calculate_position_disparity(
                     quant_result.get('value'),
                     qual_result.get('currentPrice')
                 )
-                if idx <= 2:
-                    logger.warning(f"{row_context} | DEBUG | Fallback position={position_quant}, disparity={disparity_quant}")
+
+                if idx <= 4:
+                    logger.warning(
+                        f"{row_context} | DEBUG-POS-CALC | FALLBACK RESULT: "
+                        f"position={position_quant}, disparity={disparity_quant}"
+                    )
             
             position_qual, disparity_qual = calculate_position_disparity(
                 qual_result.get('value'),
@@ -854,7 +918,7 @@ async def calculate_valuations(
     logger.info(f"[backfillEventsTable] ✓ Phase 3 completed in {phase3_elapsed:.2f}s - grouped into {len(ticker_groups)} tickers")
     logger.info("=" * 80)
 
-    # Phase 3.5: Global Peer Collection & Parallel Fetching (PERFORMANCE OPTIMIZATION)
+    # Phase 3.5: Global Peer Collection & Parallel Fetching (DB-BASED - NO API CALLS!)
     logger.info("=" * 80)
     logger.info(f"[backfillEventsTable] Phase 3.5: GLOBAL PEER COLLECTION & PARALLEL FETCHING")
     logger.info("=" * 80)
@@ -863,43 +927,66 @@ async def calculate_valuations(
     ticker_to_peers = {}
 
     try:
-        # Step 1: Collect all peer tickers
+        # ========================================
+        # NEW: DB에서 글로벌 peer 캐시 구축 (API 호출 제거!)
+        # ========================================
+        # Step 1: 모든 ticker의 peer 목록 수집 (DB에서)
         peer_collect_start = time.time()
-        logger.info(f"[PERF-OPT] Step 1/2: Starting peer ticker collection for {len(ticker_groups)} tickers...")
-        ticker_to_peers, unique_peers = await collect_all_peer_tickers(ticker_groups)
+        logger.info(f"[DB-Mode] Step 1/2: Loading peer mappings for {len(ticker_groups)} tickers from DB...")
+        logger.info(f"[DB-Mode] Using function: get_peer_tickers_from_db() from quantitative_cache module")
+
+        ticker_to_peers = {}
+        unique_peers = set()
+
+        for ticker in ticker_groups.keys():
+            peer_list = await get_peer_tickers_from_db(pool, ticker)
+            if peer_list:
+                ticker_to_peers[ticker] = peer_list[:10]  # 최대 10개
+                unique_peers.update(peer_list[:10])
+
         peer_collect_elapsed = time.time() - peer_collect_start
+        logger.info(f"[DB-Mode] ✓ Step 1/2: Peer mapping loaded in {peer_collect_elapsed:.2f}s from config_lv3_targets")
+        logger.info(f"[DB-Mode] Found {len(ticker_to_peers)} tickers with peers, {len(unique_peers)} unique peers total")
 
-        logger.info(f"[PERF-OPT] ✓ Step 1/2: Peer collection completed in {peer_collect_elapsed:.2f}s")
-        logger.info(f"[PERF-OPT] Found {len(ticker_to_peers)} tickers with peers, {len(unique_peers)} unique peers total")
-
-        # Step 2: Fetch peer financials in parallel
+        # Step 2: 모든 unique peer의 재무 데이터 일괄 조회 (DB에서, 배치 쿼리!)
         if unique_peers:
-            # Use first event date as reference for all peers (reasonable approximation)
-            reference_date = events[0]['event_date']
-
             peer_fetch_start = time.time()
-            logger.info(f"[PERF-OPT] Step 2/2: Starting parallel fetch of {len(unique_peers)} peer financials (max_concurrent=20)...")
-            global_peer_cache = await fetch_peer_financials_parallel(
-                unique_peers,
+            logger.info(f"[DB-Mode] Step 2/2: Loading {len(unique_peers)} peer financials from DB (batch query)...")
+
+            # MetricEngine에서 필요한 API 목록 확인
+            transforms = await metrics.select_metric_transforms(pool)
+            engine = MetricCalculationEngine(metrics_by_domain, transforms)
+            required_apis = engine.get_required_apis()
+
+            # CRITICAL: Sector averages 계산을 위해 fmp-ratios 추가 (peer 데이터용)
+            # calculate_sector_average_from_cache()에서 peer_data['fmp-ratios'] 접근
+            required_apis_with_ratios = set(required_apis)
+            required_apis_with_ratios.add('fmp-ratios')
+
+            logger.info(f"[DB-Mode] Required APIs for peers (with fmp-ratios): {sorted(required_apis_with_ratios)}")
+
+            # 배치 쿼리로 모든 peer 데이터 한 번에 조회 (단일 DB 쿼리!)
+            global_peer_cache = await get_batch_quantitative_data_from_db(
                 pool,
-                metrics_by_domain,
-                reference_date,
-                max_concurrent=20  # Parallel fetching limit
+                list(unique_peers),
+                list(required_apis_with_ratios)
             )
+
             peer_fetch_elapsed = time.time() - peer_fetch_start
 
             logger.info("=" * 80)
-            logger.info(f"[PERF-OPT] ✓ Step 2/2: Global peer cache ready: {len(global_peer_cache)} peers cached")
-            logger.info(f"[PERF-OPT] ✓ Total peer fetching time: {peer_fetch_elapsed:.2f}s (parallelized)")
-            logger.info(f"[PERF-OPT] ✓ Estimated time saved vs sequential: {peer_fetch_elapsed * 10:.2f}s → {peer_fetch_elapsed:.2f}s (~{(1 - peer_fetch_elapsed/(peer_fetch_elapsed*10))*100:.0f}% faster)")
+            logger.info(f"[DB-Mode] ✓ Step 2/2: Global peer cache ready: {len(global_peer_cache)} peers loaded from config_lv3_quantitatives")
+            logger.info(f"[DB-Mode] ✓ Total DB query time: {peer_fetch_elapsed:.2f}s (single batch query)")
+            logger.info(f"[DB-Mode] ✓ Estimated speedup vs API: ~1000x faster (DB vs API calls)")
             logger.info("=" * 80)
         else:
-            logger.warning("[PERF-OPT] No peer tickers found for any ticker - skipping Step 2/2")
+            logger.warning("[DB-Mode] No peer tickers found for any ticker - skipping Step 2/2")
+            global_peer_cache = {}
 
     except Exception as e:
         logger.error("=" * 80)
-        logger.error(f"[PERF-OPT] ✗ Failed to build global peer cache: {e}", exc_info=True)
-        logger.warning("[PERF-OPT] Falling back to per-ticker peer fetching")
+        logger.error(f"[DB-Mode] ✗ Failed to build global peer cache from DB: {e}", exc_info=True)
+        logger.warning("[DB-Mode] Falling back to per-ticker peer fetching from DB")
         logger.error("=" * 80)
         global_peer_cache = {}
         ticker_to_peers = {}
@@ -1011,7 +1098,7 @@ async def calculate_valuations(
             
             return result
     
-    logger.info(f"[backfillEventsTable] Phase 4: Processing tickers with concurrency={TICKER_CONCURRENCY}")
+    logger.info(f"[backfillEventsTable] Phase 4: Processing tickers with concurrency={max_workers}")
     
     start_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -2676,17 +2763,20 @@ async def fetch_peer_financials_parallel(
     return global_peer_cache
 
 
-async def calculate_sector_average_from_cache(
+async def calculate_sector_average_from_cache_api(
     peer_tickers: List[str],
     global_peer_cache: Dict[str, Dict[str, Any]],
     target_metrics: List[str] = ['PER', 'PBR']
 ) -> Dict[str, float]:
     """
-    캐시된 peer data로 sector average를 계산합니다.
+    캐시된 peer data로 sector average를 계산합니다 (API 모드용 - calculated_metrics 구조).
+
+    이 함수는 API에서 fetch한 peer data (calculated_metrics 포함) 구조를 처리합니다.
+    DB 모드에서는 quantitative_cache.calculate_sector_average_from_cache를 사용하세요.
 
     Args:
         peer_tickers: Peer ticker list for this ticker
-        global_peer_cache: Global peer financial data cache
+        global_peer_cache: Global peer financial data cache (with calculated_metrics)
         target_metrics: Metrics to calculate average for
 
     Returns:
