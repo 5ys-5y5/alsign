@@ -118,7 +118,26 @@
       "Bash(cmd //c \"taskkill /F /PID 22736 2>&1\")",
       "Bash(cmd //c \"tasklist | findstr 22736\")",
       "Bash(cmd //c \"taskkill /F /PID 24316 2>&1\")",
-      "Bash(cmd //c \"for %p in \\(2264 29156 28536\\) do taskkill /F /PID %p 2>nul\")"
+      "Bash(cmd //c \"for %p in \\(2264 29156 28536\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"netstat -ano | findstr \":8000\" | findstr \"LISTENING\"\")",
+      "Bash(cmd //c \"for %p in \\(27324 9664\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"netstat -ano | findstr \":8000\"\")",
+      "Bash(cmd //c \"taskkill /F /PID 27324 2>&1 && taskkill /F /PID 9664 2>&1\")",
+      "Bash(cmd //c \"for %p in \\(19088 27344\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(19292 24580\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(cmd //c \"for %p in \\(4916 28080\\) do taskkill /F /PID %p 2>nul\")",
+      "Bash(grep:*)",
+      "Bash(cmd //c \"for /f \"tokens=5\" %a in \\(''netstat -ano ^| findstr \":8000\" ^| findstr \"LISTENING\"''\\) do taskkill /F /PID %a 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 29372 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 23048 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 24660 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 9344 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 29880 2>&1\")",
+      "Bash(cmd //c \"taskkill /F /PID 21788 2>&1\")"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "supabase"
+  ],
+  "enableAllProjectMcpServers": true
 }

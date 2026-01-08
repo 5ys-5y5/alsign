@@ -10,8 +10,8 @@ class Settings(BaseSettings):
 
     # Database Configuration
     DATABASE_URL: str | None = None
-    DB_POOL_MIN_SIZE: int = 10
-    DB_POOL_MAX_SIZE: int = 20
+    DB_POOL_MIN_SIZE: int = 5
+    DB_POOL_MAX_SIZE: int = 30  # 20 ticker workers × ~1.5 avg connections (conservative for DB CPU)
 
     # External API Configuration
     FMP_API_KEY: str

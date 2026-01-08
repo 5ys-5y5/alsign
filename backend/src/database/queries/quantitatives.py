@@ -19,7 +19,7 @@ async def fetch_target_tickers_with_peers(pool: asyncpg.Pool) -> List[Dict[str, 
         return [dict(row) for row in rows]
 
 
-async def get_quantatatives_by_ticker(
+async def get_quantitatives_by_ticker(
     pool: asyncpg.Pool,
     ticker: str
 ) -> Optional[Dict[str, Any]]:
@@ -55,7 +55,7 @@ async def get_quantatatives_by_ticker(
         return dict(row) if row else None
 
 
-async def upsert_quantatatives(
+async def upsert_quantitatives(
     pool: asyncpg.Pool,
     record: Dict[str, Any]
 ) -> None:

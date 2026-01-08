@@ -4,6 +4,33 @@ import { useLog } from '../contexts/LogContext';
 const API_BASE_URL = '/api';
 
 /**
+ * Default timeout settings per endpoint (in milliseconds)
+ * Set to 0 to disable timeout for an endpoint
+ * Can be overridden via 'timeout' query parameter
+ */
+const ENDPOINT_TIMEOUTS = {
+  '/sourceData': 3600000,              // 60 minutes
+  '/setEventsTable': 3600000,          // 60 minutes
+  '/backfillEventsTable': 0,           // No timeout (can run for hours)
+  '/getQuantitatives': 0,              // No timeout (can run for hours)
+};
+
+/**
+ * Common timeout field definition for all endpoints
+ * Can be added to any endpoint's queryFields array
+ */
+const TIMEOUT_FIELD = {
+  key: 'timeout',
+  label: 'Timeout (ms)',
+  type: 'number',
+  control: 'input',
+  placeholder: '0 = no timeout, 3600000 = 60min',
+  min: 0,
+  required: false,
+  description: 'Request timeout in milliseconds. Set to 0 to disable timeout (run indefinitely). Default: endpoint-specific (see ENDPOINT_TIMEOUTS).',
+};
+
+/**
  * Parse log line in key=value format.
  * Format: [endpoint | phase] key1=value1 | key2=value2 | ... | msg
  */
@@ -116,7 +143,7 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
       (path === '/sourceData' && method === 'GET') ||
       (path === '/setEventsTable' && method === 'POST') ||
       (path === '/backfillEventsTable' && method === 'POST') ||
-      (path === '/getQuantatatives' && method === 'POST');
+      (path === '/getQuantitatives' && method === 'POST');
 
     if (isStreaming) {
       // Use SSE for real-time streaming
@@ -127,31 +154,51 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
         streamUrl = `${API_BASE_URL}/setEventsTable/stream${queryString ? '?' + queryString : ''}`;
       } else if (path === '/backfillEventsTable' && method === 'POST') {
         streamUrl = `${API_BASE_URL}/backfillEventsTable/stream${queryString ? '?' + queryString : ''}`;
-      } else if (path === '/getQuantatatives' && method === 'POST') {
-        streamUrl = `${API_BASE_URL}/getQuantatatives/stream${queryString ? '?' + queryString : ''}`;
+      } else if (path === '/getQuantitatives' && method === 'POST') {
+        streamUrl = `${API_BASE_URL}/getQuantitatives/stream${queryString ? '?' + queryString : ''}`;
       }
       const eventSource = new EventSource(streamUrl);
       let requestId = null;
       const detailedLogs = [];
 
-      // Safety timeout: close connection if no response in 30 minutes (for large batch operations)
-      const safetyTimeout = setTimeout(() => {
-        if (eventSource.readyState !== EventSource.CLOSED) {
-          console.error('EventSource timeout - closing connection');
-          eventSource.close();
-          setError('Request timeout - no response from server');
-          setLoading(false);
-          onLog?.('error', `${method} ${path} - Timeout (30min)`, requestId || 'unknown');
-          onRequestComplete?.({
-            id: requestId || Date.now().toString(),
-            status: 'error',
-            statusCode: 408,
-            duration: 1800000,
-            error: 'Request timeout',
-            detailedLogs: [...detailedLogs],
-          });
+      // Determine timeout for this endpoint
+      // Priority: 1) timeout query param, 2) endpoint default, 3) no timeout
+      let timeoutMs = ENDPOINT_TIMEOUTS[path] !== undefined ? ENDPOINT_TIMEOUTS[path] : 0;
+
+      // Check if user specified timeout in query params
+      if (queryParams.timeout !== undefined && queryParams.timeout !== '') {
+        timeoutMs = parseInt(queryParams.timeout, 10);
+        if (isNaN(timeoutMs)) {
+          timeoutMs = 0; // Invalid value = no timeout
         }
-      }, 1800000);
+      }
+
+      // Setup safety timeout if configured (0 = no timeout)
+      let safetyTimeout = null;
+      if (timeoutMs > 0) {
+        const timeoutMinutes = Math.round(timeoutMs / 60000);
+        console.log(`Setting ${timeoutMinutes}min timeout for ${path}`);
+
+        safetyTimeout = setTimeout(() => {
+          if (eventSource.readyState !== EventSource.CLOSED) {
+            console.error(`EventSource timeout after ${timeoutMinutes}min - closing connection`);
+            eventSource.close();
+            setError(`Request timeout - no response after ${timeoutMinutes} minutes`);
+            setLoading(false);
+            onLog?.('error', `${method} ${path} - Timeout (${timeoutMinutes}min)`, requestId || 'unknown');
+            onRequestComplete?.({
+              id: requestId || Date.now().toString(),
+              status: 'error',
+              statusCode: 408,
+              duration: timeoutMs,
+              error: `Request timeout (${timeoutMinutes}min)`,
+              detailedLogs: [...detailedLogs],
+            });
+          }
+        }, timeoutMs);
+      } else {
+        console.log(`No timeout set for ${path} (will run indefinitely)`);
+      }
 
       eventSource.addEventListener('init', (e) => {
         const data = JSON.parse(e.data);
@@ -187,7 +234,7 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
       });
 
       eventSource.addEventListener('result', (e) => {
-        clearTimeout(safetyTimeout);
+        if (safetyTimeout) clearTimeout(safetyTimeout);
         const result = JSON.parse(e.data);
         const duration = Date.now() - startTime;
 
@@ -207,6 +254,7 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
       });
 
       eventSource.addEventListener('error', (e) => {
+        if (safetyTimeout) clearTimeout(safetyTimeout);
         const duration = Date.now() - startTime;
         let errorMsg = 'Stream error';
 
@@ -235,7 +283,8 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
         if (eventSource.readyState === EventSource.CLOSED) {
           return;
         }
-        
+
+        if (safetyTimeout) clearTimeout(safetyTimeout);
         const duration = Date.now() - startTime;
         const errorMsg = 'Connection error';
 
@@ -423,6 +472,19 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
                         borderColor: required && !queryParams[field.key] ? 'var(--accent-warning)' : undefined,
                       }}
                     />
+                  ) : field.type === 'number' ? (
+                    <input
+                      type="number"
+                      value={queryParams[field.key] || ''}
+                      onChange={(e) => handleQueryChange(field.key, e.target.value)}
+                      placeholder={field.placeholder}
+                      min={field.min}
+                      max={field.max}
+                      style={{
+                        borderColor: required && !queryParams[field.key] ? 'var(--accent-warning)' : undefined,
+                        width: '150px',
+                      }}
+                    />
                   ) : (
                     <input
                       type="text"
@@ -540,7 +602,7 @@ export default function RequestsPage() {
   // Endpoint list for navigation
   const endpoints = [
     { id: 'sourceData', title: 'GET /sourceData' },
-    { id: 'getQuantatatives', title: 'POST /getQuantatatives' },
+    { id: 'getQuantitatives', title: 'POST /getQuantitatives' },
     { id: 'setEventsTable', title: 'POST /setEventsTable' },
     { id: 'backfillEventsTable', title: 'POST /backfillEventsTable' },
     { id: 'generatePriceTrends', title: 'POST /generatePriceTrends' },
@@ -733,17 +795,28 @@ export default function RequestsPage() {
               requiredWhen: { field: 'calc_scope', values: ['partition_keys'] },
               description: 'JSON 배열 형식의 파티션 목록',
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           onRequestStart={handleRequestStart}
           onRequestComplete={handleRequestComplete}
           onLog={handleLog}
         />}
 
-        {/* POST /getQuantatatives */}
-        {selectedEndpoint === 'getQuantatatives' && <RequestForm
-          title="POST /getQuantatatives"
+        {/* POST /getQuantitatives */}
+        {selectedEndpoint === 'getQuantitatives' && <RequestForm
+          title="POST /getQuantitatives"
           method="POST"
-          path="/getQuantatatives"
+          path="/getQuantitatives"
           queryFields={[
             {
               key: 'overwrite',
@@ -768,6 +841,17 @@ export default function RequestsPage() {
               required: false,
               description: 'Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. Leave empty to process all targets and their peers.',
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 ticker worker 수 (1-100). DB CPU에 따라 조정. 기본값: 20',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[]}
           onRequestStart={handleRequestStart}
@@ -807,6 +891,17 @@ export default function RequestsPage() {
               placeholder: 'evt_consensus,evt_earning',
               required: false,
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[{ key: '__body__', type: 'json', default: '{}' }]}
           onRequestStart={handleRequestStart}
@@ -867,8 +962,21 @@ export default function RequestsPage() {
               control: 'input',
               required: false,
               placeholder: '5000',
+              min: 100,
+              max: 50000,
               description: 'Number of events to process per batch. Use smaller values (1,000-5,000) for faster feedback (I-44)',
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[
             {
@@ -920,6 +1028,17 @@ export default function RequestsPage() {
               required: false,
               placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[
             {
@@ -939,7 +1058,7 @@ export default function RequestsPage() {
           title="POST /trades"
           method="POST"
           path="/trades"
-          queryFields={[]}
+          queryFields={[{ ...TIMEOUT_FIELD }]}
           bodyFields={[
             {
               key: '__body__',
@@ -979,6 +1098,17 @@ export default function RequestsPage() {
               control: 'checkbox',
               required: false,
             },
+            {
+              key: 'max_workers',
+              type: 'number',
+              control: 'input',
+              placeholder: '20',
+              min: 1,
+              max: 100,
+              required: false,
+              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[
             {

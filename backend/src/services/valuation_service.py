@@ -665,7 +665,8 @@ async def calculate_valuations(
     tickers: Optional[List[str]] = None,
     cancel_event: Optional[asyncio.Event] = None,
     metrics_list: Optional[List[str]] = None,
-    batch_size: Optional[int] = None
+    batch_size: Optional[int] = None,
+    max_workers: int = 20
 ) -> Dict[str, Any]:
     """
     Calculate quantitative and qualitative valuations for all events in txn_events.
@@ -687,6 +688,8 @@ async def calculate_valuations(
         cancel_event: Optional asyncio.Event for cancellation.
         metrics_list: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
         batch_size: Optional batch size for processing events. If None, processes all events in one batch.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with summary and per-event results
@@ -776,6 +779,7 @@ async def calculate_valuations(
         logger.info(f"[backfillEventsTable] Calling metrics.select_events_for_valuation...")
         events = await metrics.select_events_for_valuation(
             pool,
+            limit=batch_size,  # ✅ batch_size를 SELECT LIMIT로 적용
             from_date=from_date,
             to_date=to_date,
             tickers=tickers
@@ -918,9 +922,9 @@ async def calculate_valuations(
     )
     
     # Phase 4: Process tickers in parallel with concurrency control
-    # This is DB/calculation work (not API calls), so use higher concurrency
-    TICKER_CONCURRENCY = 50  # Process 50 tickers concurrently (increased from 10)
-    semaphore = asyncio.Semaphore(TICKER_CONCURRENCY)
+    # CRITICAL: DB CPU is the bottleneck, use user-configured max_workers
+    # This is DB/calculation work (not API calls), but JSONB operations are CPU-intensive
+    semaphore = asyncio.Semaphore(max_workers)
     
     # Progress tracking
     completed_tickers = 0
@@ -1850,7 +1854,8 @@ def calculate_position_disparity(
 async def generate_price_trends(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
-    tickers: Optional[List[str]] = None
+    tickers: Optional[List[str]] = None,
+    max_workers: int = 20
 ) -> Dict[str, Any]:
     """
     Generate price_trend arrays for events in txn_events and trades in txn_trades.
@@ -1864,6 +1869,8 @@ async def generate_price_trends(
         from_date: Optional start date for filtering by event_date/trade_date
         to_date: Optional end date for filtering by event_date/trade_date
         tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with summary and statistics including events and trades counts

@@ -16,7 +16,8 @@ async def consolidate_events(
     overwrite: bool = False,
     dry_run: bool = False,
     schema: str = "public",
-    table_filter: List[str] = None
+    table_filter: List[str] = None,
+    max_workers: int = 20
 ) -> Dict[str, Any]:
     """
     Consolidate events from evt_* tables into txn_events.
@@ -31,6 +32,8 @@ async def consolidate_events(
         dry_run: If True, return projected changes without modifying database
         schema: Target schema to search for evt_* tables
         table_filter: Optional list of specific table names to process
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with summary and per-table results

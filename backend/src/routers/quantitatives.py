@@ -12,7 +12,7 @@ import json
 import logging
 import time
 
-from ..services.quantitatives_service import get_quantatatives
+from ..services.quantitatives_service import get_quantitatives
 
 logger = logging.getLogger("alsign")
 
@@ -22,8 +22,8 @@ router = APIRouter(tags=["Quantitatives"])
 active_streams: Dict[str, asyncio.Event] = {}
 
 
-@router.post("/getQuantatatives")
-async def get_quantatatives_endpoint(
+@router.post("/getQuantitatives")
+async def get_quantitatives_endpoint(
     request: Request,
     response: Response,
     overwrite: bool = Query(
@@ -37,6 +37,12 @@ async def get_quantatatives_endpoint(
     tickers: Optional[str] = Query(
         default=None,
         description="Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. If not specified, processes all targets and their peers."
+    ),
+    max_workers: Optional[int] = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent ticker workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30 depending on DB capacity."
     ),
 ):
     """
@@ -78,11 +84,16 @@ async def get_quantatatives_endpoint(
         ticker_list = [ticker.strip().upper() for ticker in tickers.split(',') if ticker.strip()]
 
     try:
-        result = await get_quantatatives(overwrite=overwrite, apis=api_list, tickers=ticker_list)
+        result = await get_quantitatives(
+            overwrite=overwrite,
+            apis=api_list,
+            tickers=ticker_list,
+            max_workers=max_workers
+        )
 
         return {
             "reqId": req_id,
-            "endpoint": "POST /getQuantatatives",
+            "endpoint": "POST /getQuantitatives",
             "summary": result.get('summary', {}),
             "results": result.get('results', [])
         }
@@ -92,8 +103,8 @@ async def get_quantatatives_endpoint(
         raise HTTPException(status_code=500, detail=f"Quantatatives collection failed: {str(e)}")
 
 
-@router.api_route("/getQuantatatives/stream", methods=["GET", "POST"])
-async def stream_get_quantatatives(
+@router.api_route("/getQuantitatives/stream", methods=["GET", "POST"])
+async def stream_get_quantitatives(
     request: Request,
     overwrite: bool = Query(
         default=False,
@@ -106,6 +117,12 @@ async def stream_get_quantatatives(
     tickers: Optional[str] = Query(
         default=None,
         description="Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. If not specified, processes all targets and their peers."
+    ),
+    max_workers: Optional[int] = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent ticker workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30 depending on DB capacity."
     ),
 ):
     """
@@ -152,9 +169,9 @@ async def stream_get_quantatatives(
 
                     # Log request start
                     logger.info(
-                        f"Request started: POST /getQuantatatives",
+                        f"Request started: POST /getQuantitatives",
                         extra={
-                            'endpoint': 'POST /getQuantatatives',
+                            'endpoint': 'POST /getQuantitatives',
                             'phase': 'request_start',
                             'elapsed_ms': 0,
                             'counters': {},
@@ -180,7 +197,7 @@ async def stream_get_quantatatives(
                         logger.warning(
                             f"Request cancelled by user",
                             extra={
-                                'endpoint': 'POST /getQuantatatives',
+                                'endpoint': 'POST /getQuantitatives',
                                 'phase': 'cancelled',
                                 'elapsed_ms': int((time.time() - start_time) * 1000),
                                 'counters': {},
@@ -197,18 +214,19 @@ async def stream_get_quantatatives(
                         return
 
                     # Execute quantitatives collection
-                    result = await get_quantatatives(
+                    result = await get_quantitatives(
                         overwrite=overwrite,
                         apis=api_list,
-                        tickers=ticker_list
+                        tickers=ticker_list,
+                        max_workers=max_workers
                     )
 
                     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
                     logger.info(
-                        f"POST /getQuantatatives completed",
+                        f"POST /getQuantitatives completed",
                         extra={
-                            'endpoint': 'POST /getQuantatatives',
+                            'endpoint': 'POST /getQuantitatives',
                             'phase': 'complete',
                             'elapsed_ms': total_elapsed_ms,
                             'counters': result['summary'],
@@ -224,7 +242,7 @@ async def stream_get_quantatatives(
                         'type': 'result',
                         'data': {
                             'reqId': req_id,
-                            'endpoint': 'POST /getQuantatatives',
+                            'endpoint': 'POST /getQuantitatives',
                             'summary': result['summary'],
                             'results': result.get('results', []),
                             'invalidTickers': result.get('invalidTickers', [])
@@ -233,9 +251,9 @@ async def stream_get_quantatatives(
 
                 except Exception as e:
                     logger.error(
-                        f"POST /getQuantatatives failed: {str(e)}",
+                        f"POST /getQuantitatives failed: {str(e)}",
                         extra={
-                            'endpoint': 'POST /getQuantatatives',
+                            'endpoint': 'POST /getQuantitatives',
                             'phase': 'error',
                             'elapsed_ms': int((time.time() - start_time) * 1000),
                             'counters': {},
@@ -308,10 +326,10 @@ async def stream_get_quantatatives(
     )
 
 
-@router.post("/getQuantatatives/cancel/{req_id}")
-async def cancel_get_quantatatives_stream(req_id: str):
+@router.post("/getQuantitatives/cancel/{req_id}")
+async def cancel_get_quantitatives_stream(req_id: str):
     """
-    Cancel an active getQuantatatives streaming request.
+    Cancel an active getQuantitatives streaming request.
 
     Args:
         req_id: Request ID to cancel

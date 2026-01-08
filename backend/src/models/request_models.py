@@ -63,6 +63,13 @@ class SourceDataQueryParams(BaseModel):
         description="Required when calc_scope=partition_keys. JSON array of {ticker, analyst_name, analyst_company} objects."
     )
 
+    max_workers: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
+    )
+
     @validator('mode')
     def validate_mode(cls, v):
         """Validate mode parameter contains only allowed values."""
@@ -207,6 +214,13 @@ class SetEventsTableQueryParams(BaseModel):
         description="Comma-separated list of specific evt_* tables to process."
     )
 
+    max_workers: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
+    )
+
     @validator('table')
     def validate_table(cls, v):
         """Validate table parameter matches evt_* pattern."""
@@ -253,6 +267,13 @@ class BackfillEventsTableQueryParams(BaseModel):
         ge=100,
         le=50000,
         description="Number of events to process per batch. If not specified, processes all events in one batch. Range: 100-50000. Use smaller batches (e.g., 1000-5000) for faster feedback and progress tracking. (PERFORMANCE)"
+    )
+
+    max_workers: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
 
     def get_ticker_list(self) -> Optional[List[str]]:
@@ -307,6 +328,13 @@ class FillAnalystQueryParams(BaseModel):
     overwrite: bool = Field(
         default=False,
         description="If false, update only NULL values in analyst performance data. If true, recalculate all metrics."
+    )
+
+    max_workers: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
 
 

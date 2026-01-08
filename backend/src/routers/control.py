@@ -49,7 +49,7 @@ class APIListItem(BaseModel):
     api_service: str
     api: str
     schema: Optional[Union[Dict[str, Any], str]]
-    endpoint: str
+    endpoint: Optional[str]  # ✅ endpoint가 NULL일 수 있음
     function2: Optional[str]
     created_at: Optional[str]
 

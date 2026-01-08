@@ -122,7 +122,10 @@ async def stream_source_data(
                                         'warn': []
                                     }
                                 )
-                                result = await source_data_service.get_holidays(overwrite=params.overwrite)
+                                result = await source_data_service.get_holidays(
+                                    overwrite=params.overwrite,
+                                    max_workers=params.max_workers
+                                )
                                 results['holiday'] = result
                                 total_success += result['counters'].success
                                 total_fail += result['counters'].fail
@@ -141,7 +144,10 @@ async def stream_source_data(
                                         'warn': []
                                     }
                                 )
-                                result = await source_data_service.get_targets(overwrite=params.overwrite)
+                                result = await source_data_service.get_targets(
+                                    overwrite=params.overwrite,
+                                    max_workers=params.max_workers
+                                )
                                 results['target'] = result
                                 total_success += result['counters'].success
                                 total_fail += result['counters'].fail
@@ -167,7 +173,8 @@ async def stream_source_data(
                                     tickers_param=params.tickers,
                                     from_date=params.from_date,
                                     to_date=params.to_date,
-                                    partitions_param=params.partitions
+                                    partitions_param=params.partitions,
+                                    max_workers=params.max_workers
                                 )
                                 results['consensus'] = result
                                 total_success += result['counters'].success
@@ -187,7 +194,11 @@ async def stream_source_data(
                                         'warn': []
                                     }
                                 )
-                                result = await source_data_service.get_earning(overwrite=params.overwrite, past=params.past)
+                                result = await source_data_service.get_earning(
+                                    overwrite=params.overwrite,
+                                    past=params.past,
+                                    max_workers=params.max_workers
+                                )
                                 results['earning'] = result
                                 total_success += result['counters'].success
                                 total_fail += result['counters'].fail

@@ -39,7 +39,10 @@ async def fill_analyst(
     req_id = request.state.reqId if hasattr(request.state, 'reqId') else str(uuid.uuid4())
 
     try:
-        result = await analyst_service.aggregate_analyst_performance(overwrite=params.overwrite)
+        result = await analyst_service.aggregate_analyst_performance(
+            overwrite=params.overwrite,
+            max_workers=params.max_workers
+        )
 
         # Check if there was a global error
         if 'error' in result and 'errorCode' in result:

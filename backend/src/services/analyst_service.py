@@ -115,7 +115,7 @@ def calculate_statistics_from_db_metrics(
     return stats
 
 
-async def aggregate_analyst_performance(overwrite: bool = False) -> Dict[str, Any]:
+async def aggregate_analyst_performance(overwrite: bool = False, max_workers: int = 20) -> Dict[str, Any]:
     """
     Aggregate analyst performance metrics from consensus events.
 
@@ -124,6 +124,8 @@ async def aggregate_analyst_performance(overwrite: bool = False) -> Dict[str, An
 
     Args:
         overwrite: If False, update only NULL values. If True, recalculate all metrics.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with summary and per-group results

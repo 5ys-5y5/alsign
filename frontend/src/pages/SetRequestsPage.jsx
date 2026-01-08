@@ -206,10 +206,10 @@ const ENDPOINT_FLOWS = {
     }
   },
 
-  getQuantatatives: {
-    id: 'getQuantatatives',
-    title: 'POST /getQuantatatives',
-    description: 'config_lv3_targets의 ticker + peer를 모아 재무/가격 API를 호출하고 config_lv3_quantatatives에 JSONB로 저장',
+  getQuantitatives: {
+    id: 'getQuantitatives',
+    title: 'POST /getQuantitatives',
+    description: 'config_lv3_targets의 ticker + peer를 모아 재무/가격 API를 호출하고 config_lv3_quantitatives에 JSONB로 저장',
     parameters: [
       {
         name: 'overwrite',
@@ -242,38 +242,62 @@ const ENDPOINT_FLOWS = {
           { value: 'TSLA', description: '단일 ticker만 처리' },
           { value: '', description: '모든 targets + peers 처리 (기본값)' }
         ]
+      },
+      {
+        name: 'max_workers',
+        type: 'number',
+        required: false,
+        default: '20',
+        min: 1,
+        max: 100,
+        description: '동시 실행 ticker worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정.',
+        examples: [
+          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
+          { value: '20', description: '기본값 (균형)' },
+          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
+        ]
       }
     ],
     usageExamples: [
       {
         title: '기본 실행 (모든 API)',
-        url: 'POST /getQuantatatives',
-        description: 'targets + peers 전체 티커 대상으로 모든 quantatatives API 수집'
+        url: 'POST /getQuantitatives',
+        description: 'targets + peers 전체 티커 대상으로 모든 quantitatives API 수집'
       },
       {
         title: '선택적 API만 수집',
-        url: 'POST /getQuantatatives?apis=ratios,key-metrics',
+        url: 'POST /getQuantitatives?apis=ratios,key-metrics',
         description: 'Financial Ratios와 Key Metrics만 수집 (기존 데이터 유지)'
       },
       {
         title: '특정 ticker만 처리',
-        url: 'POST /getQuantatatives?tickers=AAPL,MSFT,NVDA',
+        url: 'POST /getQuantitatives?tickers=AAPL,MSFT,NVDA',
         description: 'AAPL, MSFT, NVDA 3개 ticker만 처리 (config_lv3_targets에 존재하는지 자동 확인)'
       },
       {
         title: '기존 데이터 덮어쓰기',
-        url: 'POST /getQuantatatives?overwrite=true',
+        url: 'POST /getQuantitatives?overwrite=true',
         description: '모든 API를 다시 수집하여 기존 데이터 덮어쓰기'
       },
       {
         title: '특정 ticker + API 조합',
-        url: 'POST /getQuantatatives?tickers=TSLA&apis=price,market-cap&overwrite=true',
+        url: 'POST /getQuantitatives?tickers=TSLA&apis=price,market-cap&overwrite=true',
         description: 'TSLA의 Price와 Market Cap만 다시 수집하여 덮어쓰기'
       },
       {
         title: '특정 API만 덮어쓰기',
-        url: 'POST /getQuantatatives?overwrite=true&apis=price,market-cap',
+        url: 'POST /getQuantitatives?overwrite=true&apis=price,market-cap',
         description: 'Price와 Market Cap만 다시 수집하여 덮어쓰기'
+      },
+      {
+        title: 'DB CPU 부하 감소 (낮은 worker)',
+        url: 'POST /getQuantitatives?max_workers=10',
+        description: 'Worker 10개로 제한하여 DB CPU 부하 감소 (느리지만 안정적)'
+      },
+      {
+        title: 'DB 여유 시 고속 처리',
+        url: 'POST /getQuantitatives?max_workers=30',
+        description: 'Worker 30개로 증가하여 처리 속도 향상 (DB CPU 여유 필요)'
       }
     ],
     phases: [
@@ -300,42 +324,42 @@ const ENDPOINT_FLOWS = {
             title: 'Income Statement',
             apiId: 'fmp-income-statement',
             requiredKeys: ['date', 'revenue', 'netIncome'],
-            configKey: 'quantatatives.income_statement'
+            configKey: 'quantitatives.income_statement'
           },
           {
             id: 'cash_flow',
             title: 'Cash Flow Statement',
             apiId: 'fmp-cash-flow-statement',
             requiredKeys: ['date', 'operatingCashFlow', 'freeCashFlow'],
-            configKey: 'quantatatives.cash_flow_statement'
+            configKey: 'quantitatives.cash_flow_statement'
           },
           {
             id: 'key_metrics',
             title: 'Key Metrics',
             apiId: 'fmp-key-metrics',
             requiredKeys: ['date', 'marketCap', 'peRatio'],
-            configKey: 'quantatatives.key_metrics'
+            configKey: 'quantitatives.key_metrics'
           },
           {
             id: 'financial_ratios',
             title: 'Financial Ratios',
             apiId: 'fmp-ratios',
             requiredKeys: ['date', 'currentRatio', 'priceEarningsRatio'],
-            configKey: 'quantatatives.financial_ratios'
+            configKey: 'quantitatives.financial_ratios'
           },
           {
             id: 'historical_market_cap',
             title: 'Historical Market Cap',
             apiId: 'fmp-historical-market-capitalization',
             requiredKeys: ['date', 'marketCap'],
-            configKey: 'quantatatives.historical_market_cap'
+            configKey: 'quantitatives.historical_market_cap'
           },
           {
             id: 'historical_price',
             title: 'Historical Price',
             apiId: 'fmp-historical-price-eod-full',
             requiredKeys: ['date', 'open', 'high', 'low', 'close'],
-            configKey: 'quantatatives.historical_price'
+            configKey: 'quantitatives.historical_price'
           }
         ]
       },
@@ -349,7 +373,7 @@ const ENDPOINT_FLOWS = {
       {
         id: 'upsert',
         title: '5. UPSERT',
-        description: 'config_lv3_quantatatives에 ticker 단위로 UPSERT',
+        description: 'config_lv3_quantitatives에 ticker 단위로 UPSERT',
         apiId: null
       }
     ],

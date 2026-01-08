@@ -12,6 +12,7 @@ class RateLimiter:
     Sliding window rate limiter with dynamic batch sizing.
 
     Tracks API calls within a time window and enforces rate limits.
+    Thread-safe for concurrent async operations.
     """
 
     def __init__(self, calls_per_minute: int):
@@ -24,33 +25,49 @@ class RateLimiter:
         self.calls_per_minute = calls_per_minute
         self.window_size = 60.0  # seconds
         self.call_timestamps: deque = deque()
+        self._lock = None  # Will be initialized in acquire()
 
     async def acquire(self):
         """
         Wait if necessary to stay within rate limit.
 
-        Blocks until it's safe to make another API call.
+        Uses fine-grained locking: Lock only protects critical section (check + append).
+        Sleep happens outside lock to minimize contention.
         """
         import asyncio
 
-        now = time.time()
+        # Lazy initialization of lock (must be done in async context)
+        if self._lock is None:
+            self._lock = asyncio.Lock()
 
-        # Remove timestamps outside window
-        while self.call_timestamps and self.call_timestamps[0] < now - self.window_size:
-            self.call_timestamps.popleft()
+        while True:
+            # Quick check without lock first (optimization)
+            now = time.time()
 
-        # If at capacity, wait until oldest call ages out
-        if len(self.call_timestamps) >= self.calls_per_minute:
-            sleep_time = self.call_timestamps[0] + self.window_size - now + 0.1  # +0.1 buffer
+            # Clean old timestamps and check capacity with minimal lock time
+            async with self._lock:
+                # Remove expired timestamps
+                while self.call_timestamps and self.call_timestamps[0] < now - self.window_size:
+                    self.call_timestamps.popleft()
+
+                # Check if we can proceed
+                if len(self.call_timestamps) < self.calls_per_minute:
+                    # Record and return immediately
+                    self.call_timestamps.append(time.time())
+                    return
+
+                # Calculate wait time (still inside lock to ensure accuracy)
+                if self.call_timestamps:
+                    oldest = self.call_timestamps[0]
+                    sleep_time = oldest + self.window_size - time.time() + 0.1
+                else:
+                    # Should not happen, but safe fallback
+                    sleep_time = 0.1
+
+            # Sleep OUTSIDE lock
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
-            # Clean up again after sleeping
-            now = time.time()
-            while self.call_timestamps and self.call_timestamps[0] < now - self.window_size:
-                self.call_timestamps.popleft()
-
-        # Record this call
-        self.call_timestamps.append(time.time())
+            # Retry
 
     def get_current_rate(self) -> int:
         """

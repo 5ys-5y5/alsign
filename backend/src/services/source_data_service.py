@@ -99,11 +99,11 @@ async def collect_target_peers(
         batch = tickers[index:index + batch_size]
 
         rate_limit = fmp_client.get_rate_limit()
-        max_concurrent = min(rate_limit, PEER_MAX_CONCURRENCY, batch_size)
+        max_concurrent = min(rate_limit, PEER_MAX_CONCURRENCY, batch_size, max_workers)
         semaphore = asyncio.Semaphore(max_concurrent)
         logger.info(
             f"[get_targets] Peer batch: size={batch_size}, mode={mode}, "
-            f"rate_limit={rate_limit}, max_concurrent={max_concurrent}"
+            f"rate_limit={rate_limit}, max_concurrent={max_concurrent}, max_workers={max_workers}"
         )
         tasks = [_fetch_peer_tickers(fmp_client, ticker, semaphore) for ticker in batch]
         results = await asyncio.gather(*tasks)
@@ -143,12 +143,14 @@ async def collect_target_peers(
 
     return peer_updates, failed_count
 
-async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
+async def get_targets(overwrite: bool = False, max_workers: int = 20) -> Dict[str, Any]:
     """
     Fetch and upsert company targets from FMP screener.
 
     Args:
         overwrite: If False, update only NULL values. If True, truncate and insert all data.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with elapsedMs, counters, warn, dbWrites
@@ -276,12 +278,15 @@ async def get_targets(overwrite: bool = False) -> Dict[str, Any]:
     }
 
 
-async def get_holidays(overwrite: bool = False) -> Dict[str, Any]:
+async def get_holidays(overwrite: bool = False, max_workers: int = 20) -> Dict[str, Any]:
     """
     Fetch and upsert market holidays from FMP API.
 
     Args:
         overwrite: If False, update only NULL values. If True, overwrite existing data.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
+                     (Note: Currently not used as this endpoint makes single API call)
 
     Returns:
         Dict with elapsedMs, counters, warn, dbWrites
@@ -357,7 +362,8 @@ async def get_consensus(
     tickers_param: str = None,
     from_date: date = None,
     to_date: date = None,
-    partitions_param: str = None
+    partitions_param: str = None,
+    max_workers: int = 20
 ) -> Dict[str, Any]:
     """
     Fetch and process consensus data with two-phase processing.
@@ -366,7 +372,7 @@ async def get_consensus(
     Phase 2: Calculate prev values and direction for target partitions
 
     Args:
-        calc_mode: 
+        calc_mode:
             - None (default): Phase 1 + Phase 2 for affected partitions only
             - 'maintenance': Phase 1 + Phase 2 with custom scope
             - 'calculation': Phase 2 only (skip API calls, use existing data)
@@ -375,6 +381,8 @@ async def get_consensus(
         from_date: Start date (required if calc_scope=event_date_range)
         to_date: End date (required if calc_scope=event_date_range)
         partitions_param: JSON array of partitions (required if calc_scope=partition_keys)
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with elapsedMs, counters, phase1, phase2, warn
@@ -443,12 +451,18 @@ async def get_consensus(
         completed_tickers = 0
         failed_tickers = 0
 
-        # Dynamic concurrency based on usagePerMin
-        max_concurrent = fmp_client.get_rate_limit()
+        # Dynamic concurrency: balance API rate limit and DB capacity
+        # CRITICAL: DB CPU is the bottleneck, not API rate limit
+        # Use min() to respect both API limit and user-configured max_workers
+        api_rate_limit = fmp_client.get_rate_limit()
+        max_concurrent = min(api_rate_limit, max_workers)
         semaphore = asyncio.Semaphore(max_concurrent)
         results_lock = asyncio.Lock()
 
-        logger.info(f"[fill_consensus] Using dynamic concurrency: {max_concurrent}")
+        logger.info(
+            f"[fill_consensus] Concurrency: max_workers={max_workers}, "
+            f"api_rate_limit={api_rate_limit}, max_concurrent={max_concurrent}"
+        )
 
         async def fetch_ticker_consensus(fmp_client: FMPAPIClient, ticker: str):
             nonlocal completed_tickers, failed_tickers
@@ -906,7 +920,7 @@ async def determine_phase2_partitions(
     return []
 
 
-async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, Any]:
+async def get_earning(overwrite: bool = False, past: bool = False, max_workers: int = 20) -> Dict[str, Any]:
     """
     Fetch and insert earning calendar data.
 
@@ -924,6 +938,8 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
     Args:
         overwrite: If False, update only NULL values. If True, overwrite existing data.
         past: If True, also fetch past 5 years (backfill mode). Default: future only.
+        max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
+                     Default: 20. Recommended: 10-30 depending on DB capacity.
 
     Returns:
         Dict with elapsedMs, counters, warn, dbWrites
@@ -998,12 +1014,18 @@ async def get_earning(overwrite: bool = False, past: bool = False) -> Dict[str, 
     failed_ranges = 0
     fetch_start = time.time()
 
-    # Dynamic concurrency based on usagePerMin
-    max_concurrent = fmp_client.get_rate_limit()
+    # Dynamic concurrency: balance API rate limit and DB capacity
+    # CRITICAL: DB CPU is the bottleneck, not API rate limit
+    # Use min() to respect both API limit and user-configured max_workers
+    api_rate_limit = fmp_client.get_rate_limit()
+    max_concurrent = min(api_rate_limit, max_workers)
     semaphore = asyncio.Semaphore(max_concurrent)
     results_lock = asyncio.Lock()
 
-    logger.info(f"[fill_earnings] Using dynamic concurrency: {max_concurrent}")
+    logger.info(
+        f"[fill_earnings] Concurrency: max_workers={max_workers}, "
+        f"api_rate_limit={api_rate_limit}, max_concurrent={max_concurrent}"
+    )
 
     async def fetch_range_earnings(fmp_client: FMPAPIClient, from_dt: date, to_dt: date):
         nonlocal completed_ranges, failed_ranges

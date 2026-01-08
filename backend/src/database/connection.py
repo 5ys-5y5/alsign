@@ -23,8 +23,11 @@ class DatabasePool:
                 dsn=settings.DATABASE_URL,
                 min_size=settings.DB_POOL_MIN_SIZE,
                 max_size=settings.DB_POOL_MAX_SIZE,
-                command_timeout=300,  # Increased from 60s to 300s for large queries
+                command_timeout=60,  # 1 minute per query
+                timeout=60,  # Wait up to 60s for available connection (DB may be slow under load)
                 statement_cache_size=0,
+                max_queries=10000,  # Recycle connections more frequently to reduce DB load
+                max_inactive_connection_lifetime=180,  # 3 minutes idle timeout (release unused connections faster)
                 server_settings={
                     'application_name': 'alsign_api'
                 }

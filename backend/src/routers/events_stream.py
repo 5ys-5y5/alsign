@@ -114,7 +114,8 @@ async def stream_set_events_table(
                         overwrite=params.overwrite,
                         dry_run=params.dryRun,
                         schema=params.schema,
-                        table_filter=table_filter
+                        table_filter=table_filter,
+                        max_workers=params.max_workers
                     )
 
                     total_elapsed_ms = int((time.time() - start_time) * 1000)
@@ -331,7 +332,8 @@ async def stream_backfill_events_table(
                         tickers=ticker_list,
                         cancel_event=cancel_event,
                         metrics_list=metrics_list,
-                        batch_size=params.batch_size
+                        batch_size=params.batch_size,
+                        max_workers=params.max_workers
                     )
 
                     logger.info(f"[STREAM] valuation_service.calculate_valuations completed")
