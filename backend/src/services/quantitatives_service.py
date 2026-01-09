@@ -174,27 +174,11 @@ async def _process_ticker(
 
         if not should_fetch:
             # Skip API call - data is fresh
-            logger.info(
-                f"[{ticker}] Skipping {api_id}: {reason}",
-                extra={
-                    'endpoint': 'POST /getQuantitatives',
-                    'phase': 'freshness-check',
-                    'counters': {'skipped': 1}
-                }
-            )
             column_values[column] = existing_row.get(column) if existing_row else None
             skipped_columns.append(column)
             continue
 
         # Fetch data from API
-        logger.info(
-            f"[{ticker}] Fetching {api_id}: {reason}",
-            extra={
-                'endpoint': 'POST /getQuantitatives',
-                'phase': 'fetch-api',
-                'counters': {'fetch': 1}
-            }
-        )
         api_data = await fmp_client.call_api(api_id, {"ticker": ticker})
         min_date, max_date = _extract_min_max_dates(api_data)
 
@@ -227,6 +211,12 @@ async def _process_ticker(
 
     # Determine status: if all APIs were skipped (no updates), mark as skipped
     result_status = "skipped" if not updated_columns and skipped_columns else "success"
+
+    # Log success/failure concisely
+    if result_status == "success":
+        logger.info(f"Success: config_lv3_quantitatives.ticker={ticker}")
+    elif result_status == "skipped":
+        logger.info(f"Skipped: config_lv3_quantitatives.ticker={ticker} (all APIs fresh)")
 
     return {
         "ticker": ticker,
@@ -261,24 +251,6 @@ async def _analyze_all_tickers_freshness_batch(
 
     step_start = time.time()
 
-    # ===== Step 1: Fetch metadata only (status + NULL checks) =====
-    logger.info(
-        f"[Batch Freshness] Step 1: Fetching metadata for {len(tickers)} tickers from DB...",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-fetch-start',
-            'counters': {'tickers': len(tickers)}
-        }
-    )
-
-    logger.info(
-        f"[Batch Freshness] Step 1a: Acquiring connection and preparing query...",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-fetch-connection'
-        }
-    )
-
     async with pool.acquire() as conn:
         # Only fetch status and check if JSONB columns are NULL (not the actual data!)
         # This is MUCH faster than fetching all JSONB data
@@ -297,48 +269,10 @@ async def _analyze_all_tickers_freshness_batch(
             WHERE ticker = ANY($1::text[])
         """
 
-        logger.info(
-            f"[Batch Freshness] Step 1b: Executing query for {len(tickers)} tickers...",
-            extra={
-                'endpoint': 'POST /getQuantitatives',
-                'phase': 'batch-fetch-executing'
-            }
-        )
-
         rows = await conn.fetch(query, tickers)
-
-        logger.info(
-            f"[Batch Freshness] Step 1c: Query returned {len(rows)} rows, building lookup dict...",
-            extra={
-                'endpoint': 'POST /getQuantitatives',
-                'phase': 'batch-fetch-returned',
-                'counters': {'rows': len(rows)}
-            }
-        )
-
-    step1_elapsed = int((time.time() - step_start) * 1000)
-    logger.info(
-        f"[Batch Freshness] Step 1 complete: Fetched {len(rows)} existing rows ({step1_elapsed}ms)",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-fetch-complete',
-            'elapsed_ms': step1_elapsed,
-            'counters': {'existing_rows': len(rows)}
-        }
-    )
 
     # Build lookup dict: O(1) access per ticker
     existing_data = {row['ticker']: dict(row) for row in rows}
-
-    # ===== Step 2: Pre-calculate dates ONCE (not N times) =====
-    step2_start = time.time()
-    logger.info(
-        "[Batch Freshness] Step 2: Pre-calculating date boundaries...",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-date-calc-start'
-        }
-    )
 
     today = date.today()
 
@@ -359,14 +293,6 @@ async def _analyze_all_tickers_freshness_batch(
 
     # Last 2 trading days (for daily API freshness check)
     # Pre-fetch holidays to determine trading days
-    logger.info(
-        "[Batch Freshness] Step 2a: Fetching NASDAQ holidays for trading day calculation...",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-holidays-fetch-start'
-        }
-    )
-
     async with pool.acquire() as conn:
         holidays_query = """
             SELECT DISTINCT date::date as holiday_date
@@ -384,15 +310,6 @@ async def _analyze_all_tickers_freshness_batch(
 
     holidays = {row['holiday_date'] for row in holiday_rows}
 
-    logger.info(
-        f"[Batch Freshness] Step 2a complete: Loaded {len(holidays)} NASDAQ holidays",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-holidays-fetch-complete',
-            'counters': {'holidays': len(holidays)}
-        }
-    )
-
     # Find last 2 trading days
     last_2_trading_days = []
     check_date = today
@@ -406,30 +323,6 @@ async def _analyze_all_tickers_freshness_batch(
         days_back += 1
 
     second_last_trading_day = last_2_trading_days[1] if len(last_2_trading_days) >= 2 else today - timedelta(days=3)
-
-    step2_elapsed = int((time.time() - step2_start) * 1000)
-    logger.info(
-        f"[Batch Freshness] Step 2 complete: Date boundaries calculated ({step2_elapsed}ms): "
-        f"currentQuarterEnd={current_quarter_end}, "
-        f"twoQuartersAgoEnd={two_quarters_ago_end}, "
-        f"secondLastTradingDay={second_last_trading_day}",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-date-calc-complete',
-            'elapsed_ms': step2_elapsed
-        }
-    )
-
-    # ===== Step 3: Process all tickers in memory (NO DB queries) =====
-    step3_start = time.time()
-    logger.info(
-        f"[Batch Freshness] Step 3: Processing {len(tickers)} tickers in memory (no DB calls)...",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-process-start',
-            'counters': {'total_tickers': len(tickers)}
-        }
-    )
 
     results = []
     progress_interval = 1000  # Log every 1000 tickers
@@ -569,43 +462,6 @@ async def _analyze_all_tickers_freshness_batch(
             'existing_row': existing_row,
             'reason': reason
         })
-
-        # Debug log for first 10 tickers to verify freshness logic
-        if idx <= 10:
-            logger.info(
-                f"[Batch Freshness DEBUG] Ticker {idx}/{len(tickers)} - {ticker}: "
-                f"status={status}, fetch={len(apis_to_fetch)}, skip={len(apis_to_skip)}, reason={reason}"
-            )
-
-        # Log progress every 1000 tickers
-        if idx % progress_interval == 0 or idx == len(tickers):
-            elapsed = int((time.time() - step3_start) * 1000)
-            tickers_per_sec = idx / (elapsed / 1000) if elapsed > 0 else 0
-            eta_ms = int((len(tickers) - idx) / tickers_per_sec * 1000) if tickers_per_sec > 0 else 0
-
-            logger.info(
-                f"[Batch Freshness] Step 3 progress: {idx}/{len(tickers)} tickers "
-                f"({idx*100//len(tickers)}%) - {tickers_per_sec:.1f} tickers/sec - ETA: {eta_ms}ms",
-                extra={
-                    'endpoint': 'POST /getQuantitatives',
-                    'phase': 'batch-process-progress',
-                    'elapsed_ms': elapsed,
-                    'progress': {'current': idx, 'total': len(tickers), 'percent': idx*100//len(tickers)},
-                    'rate': {'tickers_per_sec': tickers_per_sec},
-                    'eta': eta_ms
-                }
-            )
-
-    step3_elapsed = int((time.time() - step3_start) * 1000)
-    logger.info(
-        f"[Batch Freshness] Step 3 complete: Processed {len(tickers)} tickers in {step3_elapsed}ms",
-        extra={
-            'endpoint': 'POST /getQuantitatives',
-            'phase': 'batch-process-complete',
-            'elapsed_ms': step3_elapsed,
-            'counters': {'processed': len(tickers)}
-        }
-    )
 
     return results
 
@@ -785,16 +641,13 @@ async def get_quantitatives(
         }
     )
 
-    # Log skipped tickers
-    for skip_info in skip_tickers:
-        logger.info(
-            f"[{skip_info['ticker']}] Skipping: {skip_info['reason']}",
-            extra={
-                'endpoint': 'POST /getQuantitatives',
-                'phase': 'skip-fresh-ticker',
-                'counters': {'skipped': 1}
-            }
-        )
+    # Log skipped tickers concisely
+    if skip_tickers:
+        skip_ticker_names = [s['ticker'] for s in skip_tickers[:10]]
+        if len(skip_tickers) > 10:
+            logger.info(f"Skipped {len(skip_tickers)} tickers (fresh data): {', '.join(skip_ticker_names)}... and {len(skip_tickers) - 10} more")
+        else:
+            logger.info(f"Skipped {len(skip_tickers)} tickers (fresh data): {', '.join(skip_ticker_names)}")
 
     # ===== Phase 4: Process work targets (new + update) =====
     work_targets = new_tickers + update_tickers
@@ -885,7 +738,7 @@ async def get_quantitatives(
                     else:
                         fail_count += 1
                 except Exception as exc:
-                    logger.error(f"[get_quantitatives] Failed for {ticker}: {exc}", exc_info=True)
+                    logger.error(f"Failed: config_lv3_quantitatives.ticker={ticker}, reason={str(exc)}")
                     results.append(
                         {
                             "ticker": ticker,

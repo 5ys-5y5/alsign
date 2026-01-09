@@ -137,7 +137,9 @@
       "Bash(python3:*)",
       "Bash(awk:*)",
       "Bash(git checkout:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "mcp__supabase__execute_sql",
+      "mcp__supabase__list_tables"
     ]
   },
   "enableAllProjectMcpServers": true,

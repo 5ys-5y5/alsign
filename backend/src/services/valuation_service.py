@@ -31,6 +31,372 @@ from .utils.quantitative_cache import (
 
 logger = logging.getLogger("alsign")
 
+# Configuration: Maximum concurrent OpenAI API calls
+MAX_CONCURRENT_QUALITATIVE = 10  # Adjust based on OpenAI rate limits
+
+# Configuration: Maximum concurrent event processing (quantitative + position/disparity)
+MAX_CONCURRENT_EVENTS = 20  # Adjust based on system resources
+
+
+def remove_meta_from_value_quantitative(value_quantitative: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Remove _meta data from value_quantitative JSONB field.
+
+    _meta was used for validation purposes during development, but is no longer needed
+    in production outputs.
+
+    Args:
+        value_quantitative: Value quantitative data (e.g., {"valuation": {...}, "profitability": {...}})
+
+    Returns:
+        Value quantitative data without _meta fields
+    """
+    if not value_quantitative or not isinstance(value_quantitative, dict):
+        return value_quantitative
+
+    cleaned = {}
+    for domain_key, domain_value in value_quantitative.items():
+        if isinstance(domain_value, dict):
+            # Remove _meta from this domain
+            cleaned[domain_key] = {k: v for k, v in domain_value.items() if k != '_meta'}
+        else:
+            cleaned[domain_key] = domain_value
+
+    return cleaned
+
+
+async def process_single_event_parallel(
+    event: Dict[str, Any],
+    idx: int,
+    total_events: int,
+    ticker: str,
+    ticker_api_cache: Dict[str, Any],
+    engine: Any,
+    target_domains: List[str],
+    qual_result: Dict[str, Any],
+    sector_averages: Dict[str, float],
+    peer_count: int,
+    overwrite: bool,
+    metrics_list: Optional[List[str]]
+) -> Dict[str, Any]:
+    """
+    Process a single event: calculate quantitative, position, disparity.
+
+    This function is designed to be called in parallel for multiple events.
+    All async operations (quantitative calculation) are awaited here.
+
+    Args:
+        event: Event dictionary
+        idx: Event index (1-based)
+        total_events: Total event count
+        ticker: Ticker symbol
+        ticker_api_cache: Cached API data
+        engine: MetricCalculationEngine
+        target_domains: Domains to calculate
+        qual_result: Pre-calculated qualitative result
+        sector_averages: Sector average metrics
+        peer_count: Number of peers
+        overwrite: Update mode
+        metrics_list: Metrics to update
+
+    Returns:
+        Dictionary ready for DB update
+    """
+    event_id = event.get('id')
+    event_date = event['event_date']
+    source = event['source']
+    source_id = event['source_id']
+
+    event_id_str = str(event_id) if event_id else "unknown"
+    row_context = f"[table: txn_events | id: {event_id_str}]"
+
+    try:
+        # I-41: Prepare custom_values for priceQuantitative metric
+        custom_values = {}
+        current_price_for_position = None
+
+        if sector_averages:
+            # First, calculate basic quantitative metrics (PER, PBR, etc.)
+            temp_quant_result = await calculate_quantitative_metrics_fast(
+                ticker, event_date, ticker_api_cache, engine, target_domains
+            )
+
+            # Get current price for priceQuantitative calculation
+            current_price = None
+            if source == 'consensus':
+                # Use PRE-CALCULATED qualitative result
+                current_price = qual_result.get('currentPrice')
+            else:
+                # For earning events: get historical price from cache
+                if 'fmp-historical-price-eod-full' in ticker_api_cache:
+                    historical_prices = ticker_api_cache['fmp-historical-price-eod-full']
+                    if isinstance(historical_prices, list):
+                        if isinstance(event_date, str):
+                            target_date = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
+                        elif hasattr(event_date, 'date'):
+                            target_date = event_date.date()
+                        else:
+                            target_date = event_date
+
+                        for price_record in historical_prices:
+                            record_date_str = price_record.get('date')
+                            if record_date_str:
+                                try:
+                                    record_date = datetime.fromisoformat(record_date_str.replace('Z', '+00:00')).date()
+                                    if record_date == target_date:
+                                        current_price = price_record.get('close')
+                                        break
+                                except:
+                                    continue
+
+            current_price_for_position = current_price
+
+            if current_price and temp_quant_result.get('value'):
+                # calculate_fair_value_from_sector is imported at top of file
+                fair_value = calculate_fair_value_from_sector(
+                    temp_quant_result.get('value'),
+                    sector_averages,
+                    current_price
+                )
+                if fair_value is not None:
+                    custom_values['priceQuantitative'] = fair_value
+
+        # Calculate quantitative metrics with custom values
+        quant_result = await calculate_quantitative_metrics_fast(
+            ticker, event_date, ticker_api_cache, engine, target_domains,
+            custom_values=custom_values
+        )
+
+        # Calculate positions and disparities
+        value_quant = quant_result.get('value', {})
+        current_price = qual_result.get('currentPrice')
+        if not current_price and current_price_for_position:
+            current_price = current_price_for_position
+
+        # Extract priceQuantitative
+        price_quant_value = None
+        if value_quant and 'valuation' in value_quant:
+            price_quant_value = value_quant['valuation'].get('priceQuantitative')
+
+        if price_quant_value is not None and current_price:
+            if price_quant_value > current_price:
+                position_quant = 'long'
+            elif price_quant_value < current_price:
+                position_quant = 'short'
+            else:
+                position_quant = 'neutral'
+            disparity_quant = round((price_quant_value / current_price) - 1, 4) if current_price != 0 else None
+        else:
+            # Fallback: calculate_position_disparity is defined later in this file
+            # Python will find it at runtime
+            position_quant, disparity_quant = calculate_position_disparity(
+                quant_result.get('value'),
+                qual_result.get('currentPrice')
+            )
+
+        # Calculate qualitative position/disparity
+        position_qual, disparity_qual = calculate_position_disparity(
+            qual_result.get('value'),
+            qual_result.get('currentPrice')
+        )
+
+        # Store raw values
+        value_qual = qual_result.get('value')
+
+        # Extract priceQuantitative for dedicated column
+        price_quant_col = None
+        if value_quant and 'valuation' in value_quant:
+            price_quant_col = value_quant['valuation'].get('priceQuantitative')
+
+        # Build peer_quantitative JSONB
+        peer_quant_col = None
+        if price_quant_col is not None and sector_averages:
+            peer_quant_col = {
+                'peerCount': peer_count,
+                'sectorAverages': sector_averages
+            }
+
+        # Log success concisely
+        if quant_result['status'] == 'success':
+            logger.info(f"Success: txn_events.id={event_id_str}")
+        else:
+            logger.error(f"Failed: txn_events.id={event_id_str}, reason={quant_result.get('message', 'Unknown')}")
+
+        # Remove _meta from value_quantitative before storing
+        value_quant_cleaned = remove_meta_from_value_quantitative(value_quant)
+
+        # Return update dictionary
+        return {
+            'ticker': ticker,
+            'event_date': event_date,
+            'source': source,
+            'source_id': source_id,
+            'value_quantitative': value_quant_cleaned,
+            'value_qualitative': value_qual,
+            'position_quantitative': position_quant,
+            'position_qualitative': position_qual,
+            'disparity_quantitative': disparity_quant,
+            'disparity_qualitative': disparity_qual,
+            'price_quantitative': price_quant_col,
+            'peer_quantitative': peer_quant_col,
+            'quant_status': quant_result['status'],
+            'qual_status': qual_result['status'],
+            'event_id': event_id
+        }
+
+    except Exception as e:
+        logger.error(f"Failed: txn_events.id={event_id_str}, reason={str(e)}")
+        return {
+            'ticker': ticker,
+            'event_date': event_date,
+            'source': source,
+            'source_id': source_id,
+            'quant_status': 'failed',
+            'qual_status': qual_result.get('status', 'failed'),
+            'error': str(e),
+            'event_id': event_id
+        }
+
+
+async def batch_process_events_parallel(
+    ticker: str,
+    events: List[Dict[str, Any]],
+    ticker_api_cache: Dict[str, Any],
+    engine: Any,
+    target_domains: List[str],
+    qual_cache: Dict[str, Dict],
+    sector_averages: Dict[str, float],
+    peer_count: int,
+    overwrite: bool,
+    metrics_list: Optional[List[str]],
+    max_concurrent: int = MAX_CONCURRENT_EVENTS
+) -> List[Dict[str, Any]]:
+    """
+    Process all events in parallel with concurrency control.
+
+    This function uses asyncio.Semaphore to limit concurrent event processing,
+    preventing resource exhaustion while maximizing throughput.
+
+    Args:
+        ticker: Ticker symbol
+        events: List of events to process
+        ticker_api_cache: Cached API data
+        engine: MetricCalculationEngine
+        target_domains: Domains to calculate
+        qual_cache: Pre-calculated qualitative results
+        sector_averages: Sector average metrics
+        peer_count: Number of peers
+        overwrite: Update mode
+        metrics_list: Metrics to update
+        max_concurrent: Maximum concurrent processing (default: 20)
+
+    Returns:
+        List of update dictionaries ready for DB
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+    total_events = len(events)
+
+    async def process_with_limit(event, idx):
+        """Helper function to process event with semaphore control."""
+        async with semaphore:
+            event_key = f"{event['event_date']}_{event['source']}_{event['source_id']}"
+            qual_result = qual_cache.get(event_key, {
+                'status': 'failed',
+                'message': 'Not found in qualitative cache',
+                'currentPrice': None,
+                'value': None
+            })
+
+            return await process_single_event_parallel(
+                event, idx, total_events, ticker, ticker_api_cache, engine,
+                target_domains, qual_result, sector_averages, peer_count,
+                overwrite, metrics_list
+            )
+
+    # Create tasks for all events
+    tasks = [process_with_limit(event, idx) for idx, event in enumerate(events, 1)]
+
+    # Execute all tasks in parallel (with semaphore limiting concurrency)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Filter out exceptions and return valid results
+    valid_results = []
+    for result in results:
+        if isinstance(result, dict):
+            valid_results.append(result)
+        else:
+            logger.error(f"Failed: Unexpected exception during parallel event processing: {result}")
+
+    return valid_results
+
+
+async def batch_calculate_qualitative_parallel(
+    pool,
+    ticker: str,
+    events: List[Dict[str, Any]],
+    consensus_summary_cache: Optional[Dict],
+    max_concurrent: int = MAX_CONCURRENT_QUALITATIVE
+) -> Dict[str, Dict]:
+    """
+    Calculate qualitative metrics for all events in parallel with concurrency control.
+
+    This function uses asyncio.Semaphore to limit concurrent OpenAI API calls,
+    respecting rate limits while maximizing throughput.
+
+    Args:
+        pool: Database connection pool
+        ticker: Ticker symbol
+        events: List of events to process
+        consensus_summary_cache: Consensus data cache (optional)
+        max_concurrent: Maximum concurrent API calls (default: 10)
+
+    Returns:
+        Dict[event_key, qual_result]
+        Example: {"2024-01-15_earning_123": {...}, ...}
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def calculate_with_limit(event):
+        """Helper function to calculate qualitative with semaphore control."""
+        async with semaphore:
+            event_date = event['event_date']
+            source = event['source']
+            source_id = event['source_id']
+
+            # Create unique key for this event
+            event_key = f"{event_date}_{source}_{source_id}"
+
+            try:
+                qual_result = await calculate_qualitative_metrics_fast(
+                    pool, ticker, event_date, source, source_id, consensus_summary_cache
+                )
+                return event_key, qual_result
+            except Exception as e:
+                logger.error(f"Failed: txn_events qualitative calculation for {ticker}, reason={str(e)}")
+                return event_key, {
+                    'status': 'failed',
+                    'message': f'Qualitative calculation failed: {str(e)}',
+                    'currentPrice': None
+                }
+
+    # Create tasks for all events
+    tasks = [calculate_with_limit(event) for event in events]
+
+    # Execute all tasks in parallel (with semaphore limiting concurrency)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Convert results to dict
+    qual_cache = {}
+    for result in results:
+        if isinstance(result, tuple):
+            event_key, qual_result = result
+            qual_cache[event_key] = qual_result
+        else:
+            # Handle unexpected exceptions
+            logger.error(f"Failed: Unexpected exception during qualitative calculation: {result}")
+
+    return qual_cache
+
 
 def group_events_by_ticker(events: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """
@@ -102,9 +468,7 @@ async def process_ticker_batch(
         # Use special event_id format for ticker-level API calls
         ticker_context_id = f"ticker-cache:{ticker}"
 
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL DB CACHING START (API-FREE!) ==========")
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | Loading {len(required_apis)} APIs for {ticker} from DB (ONCE for all {len(ticker_events)} events)")
-
+    
         # ========================================
         # NEW: DB에서 quantitative 데이터 조회 (API 호출 제거!)
         # ========================================
@@ -130,15 +494,12 @@ async def process_ticker_batch(
         # 여기서는 None으로 설정
         consensus_summary_cache = None
 
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | DB cache ready: {len(ticker_api_cache)} APIs loaded from config_lv3_quantitatives")
-        logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== TICKER-LEVEL DB CACHING END (No API calls!) ==========")
         
         # OPTIMIZATION: Load transforms and engine ONCE per ticker (not per event!)
         transforms = await metrics.select_metric_transforms(pool)
         engine = MetricCalculationEngine(metrics_by_domain, transforms)
         target_domains = ['valuation', 'profitability', 'momentum', 'risk', 'dilution']
         
-        logger.info(f"[Ticker Batch] {ticker}: MetricEngine initialized (60 metrics)")
 
         # ========================================
         # CRITICAL: Use GLOBAL PEER CACHE (PERFORMANCE OPTIMIZATION)
@@ -150,8 +511,6 @@ async def process_ticker_batch(
         peer_count = 0
 
         try:
-            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER DATA PROCESSING START ==========")
-
             # USE GLOBAL PEER CACHE if available (PERFORMANCE OPTIMIZATION)
             if global_peer_cache and ticker_to_peers:
                 # Get pre-collected peer list for this ticker
@@ -159,19 +518,6 @@ async def process_ticker_batch(
                 peer_count = len(peer_tickers)
 
                 if peer_tickers:
-                    logger.info(f"[PERF-OPT] {ticker}: Using global peer cache ({peer_count} peers)")
-
-                    # DEBUG: Log cache structure for first peer
-                    if peer_tickers and global_peer_cache:
-                        first_peer = peer_tickers[0]
-                        first_peer_data = global_peer_cache.get(first_peer, {})
-                        cache_keys = list(first_peer_data.keys()) if first_peer_data else []
-                        logger.info(f"[DEBUG-SECTOR-AVG] {ticker}: First peer={first_peer}, cache keys={cache_keys}")
-                        if 'fmp-ratios' in first_peer_data:
-                            ratios_data = first_peer_data.get('fmp-ratios', [])
-                            logger.info(f"[DEBUG-SECTOR-AVG] {ticker}: fmp-ratios type={type(ratios_data)}, length={len(ratios_data) if isinstance(ratios_data, list) else 'N/A'}")
-                        else:
-                            logger.warning(f"[DEBUG-SECTOR-AVG] {ticker}: 'fmp-ratios' key NOT FOUND in {first_peer} cache")
 
                     # Calculate sector averages from GLOBAL CACHE (no API calls!)
                     # Uses quantitative_cache.calculate_sector_average_from_cache (DB mode)
@@ -179,49 +525,21 @@ async def process_ticker_batch(
                         peer_tickers, global_peer_cache
                     )
 
-                    logger.info(
-                        f"[PERF-OPT] {ticker}: Sector averages calculated from cache: {list(sector_averages.keys())}"
-                    )
-
-                    # DEBUG: Log detailed result if empty
-                    if not sector_averages:
-                        logger.warning(
-                            f"[DEBUG-SECTOR-AVG] {ticker}: EMPTY sector_averages! "
-                            f"peer_tickers={peer_tickers[:3]}, "
-                            f"cache_size={len(global_peer_cache)}, "
-                            f"cache_tickers={list(global_peer_cache.keys())[:5]}"
-                        )
-                else:
-                    logger.warning(f"[PERF-OPT] {ticker}: No peers in global cache")
-
             else:
                 # FALLBACK: DB에서 peer 데이터 조회 (API 호출 대신!)
-                logger.info(f"[DB-Mode] {ticker}: Global cache not available, loading peers from DB")
-
-                # Get peer tickers from config_lv3_targets (DB 조회, API 호출 없음!)
                 peer_tickers = await get_peer_tickers_from_db(pool, ticker)
                 peer_count = len(peer_tickers)
 
                 if peer_tickers and ticker_events:
-                    logger.info(f"[DB-Mode] {ticker}: Found {peer_count} peer tickers from DB: {peer_tickers[:5]}...")
-
                     # Use first event's date as reference for sector averages
                     reference_date = ticker_events[0]['event_date']
                     # DB 기반 sector average 계산 (API 호출 없음!)
                     sector_averages = await calculate_sector_average_metrics_from_db(
                         pool, peer_tickers, reference_date, metrics_by_domain
                     )
-                    logger.info(f"[DB-Mode] {ticker}: Sector averages calculated from DB: {list(sector_averages.keys())}")
-                else:
-                    logger.warning(f"[DB-Mode] {ticker}: No peer tickers found in config_lv3_targets")
-
-            logger.info(f"[table: txn_events | id: {ticker_context_id}] | ========== PEER DATA PROCESSING END ==========")
-
-            if not sector_averages:
-                logger.warning(f"[PERF] {ticker}: No sector averages available, priceQuantitative will be NULL")
 
         except Exception as e:
-            logger.warning(f"[PERF] {ticker}: Failed to process peer data: {e}")
+            logger.error(f"Failed: ticker={ticker}, reason=Failed to process peer data: {e}")
             sector_averages = {}
 
     except Exception as e:
@@ -258,439 +576,48 @@ async def process_ticker_batch(
     last_checkpoint_time = batch_start_time
     last_checkpoint_idx = 0
 
-    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | ========== EVENT PROCESSING START ==========")
-    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | Processing {total_events} events using CACHED API data (no new API calls)")
 
-    for idx, event in enumerate(ticker_events, 1):
-        event_id = event.get('id')
-        event_date = event['event_date']
-        source = event['source']
-        source_id = event['source_id']
+    qual_cache = await batch_calculate_qualitative_parallel(
+        pool, ticker, ticker_events, consensus_summary_cache, max_concurrent=MAX_CONCURRENT_QUALITATIVE
+    )
 
-        # Row ID logging for user visibility - use txn_events.id
-        event_id_str = str(event_id) if event_id else "unknown"
-        row_context = f"[table: txn_events | id: {event_id_str}]"
+    batch_updates = await batch_process_events_parallel(
+        ticker, ticker_events, ticker_api_cache, engine, target_domains,
+        qual_cache, sector_averages, peer_count, overwrite, metrics_list,
+        max_concurrent=MAX_CONCURRENT_EVENTS
+    )
 
-        logger.info(f"{row_context} | ---------- Event {idx}/{total_events} | source={source} ----------")
+    # Count success/fail from parallel results
+    quant_success = sum(1 for r in batch_updates if r.get('quant_status') == 'success')
+    quant_fail = sum(1 for r in batch_updates if r.get('quant_status') != 'success')
+    qual_success = sum(1 for r in batch_updates if r.get('qual_status') == 'success')
+    qual_fail = sum(1 for r in batch_updates if r.get('qual_status') != 'success')
 
-        try:
-            # I-41: Prepare custom_values for priceQuantitative metric
-            custom_values = {}
+    # Build results list for compatibility
+    results = []
+    for update in batch_updates:
+        results.append(EventProcessingResult(
+            ticker=update['ticker'],
+            event_date=update['event_date'].isoformat() if hasattr(update['event_date'], 'isoformat') else str(update['event_date']),
+            source=update['source'],
+            source_id=str(update['source_id']),
+            status='success' if update.get('quant_status') == 'success' and update.get('qual_status') == 'success' else 'partial',
+            quantitative={
+                'status': update.get('quant_status', 'unknown'),
+                'message': update.get('error') if update.get('quant_status') != 'success' else None
+            },
+            qualitative={
+                'status': update.get('qual_status', 'unknown'),
+                'message': update.get('error') if update.get('qual_status') != 'success' else None
+            }
+        ))
 
-            # ALWAYS calculate priceQuantitative for ALL events (source-agnostic)
-            # per user requirement: "quantitative columns must be filled regardless of source value"
-            # IMPORTANT: Store current_price for later use in position/disparity calculation
-            current_price_for_position = None
+    # ========================================
+    # EVENT PROCESSING COMPLETED - Ready for DB update
+    # ========================================
 
-            if sector_averages:
-                # First, calculate basic quantitative metrics (PER, PBR, etc.) to get current values
-                temp_quant_result = await calculate_quantitative_metrics_fast(
-                    ticker, event_date, ticker_api_cache, engine, target_domains
-                )
-
-                # Get current price for priceQuantitative calculation
-                # For consensus events: get from qualitative metrics (recent data)
-                # For earning events: get historical price at event_date
-                current_price = None
-                if source == 'consensus':
-                    temp_qual_result = await calculate_qualitative_metrics_fast(
-                        pool, ticker, event_date, source, source_id, consensus_summary_cache
-                    )
-                    current_price = temp_qual_result.get('currentPrice')
-                else:
-                    # For earning events: get historical price at event_date
-                    # Use fmp-historical-price-eod-full API cache
-                    if 'fmp-historical-price-eod-full' in ticker_api_cache:
-                        historical_prices = ticker_api_cache['fmp-historical-price-eod-full']
-                        if isinstance(historical_prices, list):
-                            # Convert event_date to date object for comparison
-                            if isinstance(event_date, str):
-                                target_date = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
-                            elif hasattr(event_date, 'date'):
-                                target_date = event_date.date()
-                            else:
-                                target_date = event_date
-
-                            # Find the closest price on or before event_date
-                            for price_record in historical_prices:
-                                record_date_str = price_record.get('date')
-                                if record_date_str:
-                                    try:
-                                        record_date = datetime.fromisoformat(record_date_str.replace('Z', '+00:00')).date()
-                                        if record_date == target_date:
-                                            current_price = price_record.get('close')
-                                            break
-                                    except:
-                                        continue
-
-                # CRITICAL: Save current_price for position/disparity calculation later
-                current_price_for_position = current_price
-
-                # DEBUG: Log price retrieval (first 5 events for detail)
-                if idx <= 4:
-                    logger.info(
-                        f"{row_context} | DEBUG-PRICE-QUANT | "
-                        f"current_price={current_price}, "
-                        f"has_temp_value={temp_quant_result.get('value') is not None}, "
-                        f"has_sector_avg={bool(sector_averages)}, "
-                        f"sector_avg_keys={list(sector_averages.keys())}"
-                    )
-
-                if current_price and temp_quant_result.get('value'):
-                    # PERFORMANCE FIX: Use CACHED sector_averages (NO API CALLS!)
-                    # Instead of calling calculate_price_quantitative_metric which fetches peer data every time,
-                    # we use the sector_averages that were cached once at ticker level
-
-                    if idx <= 4:
-                        temp_value = temp_quant_result.get('value', {})
-                        valuation = temp_value.get('valuation', {}) if isinstance(temp_value, dict) else {}
-                        logger.info(
-                            f"{row_context} | DEBUG-PRICE-QUANT | "
-                            f"Calling calculate_fair_value_from_sector with: "
-                            f"current_price={current_price}, "
-                            f"PER={valuation.get('PER')}, "
-                            f"PBR={valuation.get('PBR')}, "
-                            f"sector_avg_PER={sector_averages.get('PER')}, "
-                            f"sector_avg_PBR={sector_averages.get('PBR')}"
-                        )
-
-                    fair_value = calculate_fair_value_from_sector(
-                        temp_quant_result.get('value'),
-                        sector_averages,  # CACHED at ticker level - NO API calls!
-                        current_price
-                    )
-
-                    if fair_value is not None:
-                        custom_values['priceQuantitative'] = fair_value
-                        if idx <= 4:
-                            logger.info(f"{row_context} | DEBUG-PRICE-QUANT | SUCCESS: priceQuantitative={fair_value:.2f}")
-                    else:
-                        if idx <= 4:
-                            logger.warning(f"{row_context} | DEBUG-PRICE-QUANT | FAILED: calculate_fair_value_from_sector returned None")
-                else:
-                    if idx <= 4:
-                        logger.warning(
-                            f"{row_context} | DEBUG-PRICE-QUANT | SKIPPED: "
-                            f"current_price={'NULL' if not current_price else current_price}, "
-                            f"temp_value={'NULL' if not temp_quant_result.get('value') else 'EXISTS'}"
-                        )
-
-            # Calculate quantitative metrics using CACHED API data + custom values
-            quant_result = await calculate_quantitative_metrics_fast(
-                ticker, event_date, ticker_api_cache, engine, target_domains,
-                custom_values=custom_values  # I-41: Pass custom metrics
-            )
-
-            # Calculate qualitative metrics using CACHED consensus data
-            qual_result = await calculate_qualitative_metrics_fast(
-                pool, ticker, event_date, source, source_id, consensus_summary_cache
-            )
-
-            # Calculate positions and disparities
-            # I-41: Use priceQuantitative from value_quantitative if available
-            value_quant = quant_result.get('value', {})
-
-            # CRITICAL: Use current_price from qualitative OR historical price for earning events
-            current_price = qual_result.get('currentPrice')
-            if not current_price and current_price_for_position:
-                # For earning events: use historical price that was retrieved earlier
-                current_price = current_price_for_position
-
-            # Extract priceQuantitative from valuation domain
-            price_quant_value = None
-            if value_quant and 'valuation' in value_quant:
-                price_quant_value = value_quant['valuation'].get('priceQuantitative')
-
-            # DEBUG: Log position/disparity calculation (first 5 events for detail)
-            if idx <= 4:
-                logger.info(
-                    f"{row_context} | DEBUG-POS-CALC | "
-                    f"price_quant={price_quant_value}, "
-                    f"current_price={current_price}, "
-                    f"has_sector_avg={bool(sector_averages)}, "
-                    f"from_qual={qual_result.get('currentPrice') is not None}, "
-                    f"from_hist={current_price_for_position is not None}"
-                )
-
-            if price_quant_value is not None and current_price:
-                # I-41: Calculate position/disparity using priceQuantitative
-                if price_quant_value > current_price:
-                    position_quant = 'long'
-                elif price_quant_value < current_price:
-                    position_quant = 'short'
-                else:
-                    position_quant = 'neutral'
-
-                disparity_quant = round((price_quant_value / current_price) - 1, 4) if current_price != 0 else None
-
-                if idx <= 4:
-                    logger.info(
-                        f"{row_context} | DEBUG-POS-CALC | SUCCESS: "
-                        f"position={position_quant}, disparity={disparity_quant:.4f}"
-                    )
-            else:
-                # Fallback: No priceQuantitative available
-                if idx <= 4:
-                    logger.warning(
-                        f"{row_context} | DEBUG-POS-CALC | FALLBACK TRIGGERED: "
-                        f"price_quant_value={'NULL' if price_quant_value is None else price_quant_value}, "
-                        f"current_price={'NULL' if current_price is None else current_price}, "
-                        f"Trying calculate_position_disparity with quant_result.value and qual_result.currentPrice"
-                    )
-
-                position_quant, disparity_quant = calculate_position_disparity(
-                    quant_result.get('value'),
-                    qual_result.get('currentPrice')
-                )
-
-                if idx <= 4:
-                    logger.warning(
-                        f"{row_context} | DEBUG-POS-CALC | FALLBACK RESULT: "
-                        f"position={position_quant}, disparity={disparity_quant}"
-                    )
-            
-            position_qual, disparity_qual = calculate_position_disparity(
-                qual_result.get('value'),
-                qual_result.get('currentPrice')
-            )
-
-            # I-42: DON'T format values for database storage
-            # The formatter creates nested structure (values/dateInfo) which breaks database queries
-            # Formatting should only be done for API responses, not database storage
-            #
-            # OLD CODE (BROKEN):
-            # formatted_quant = format_value_quantitative(quant_result.get('value'))
-            # formatted_qual = format_value_qualitative(qual_result.get('value'))
-            #
-            # NEW CODE: Store raw values directly
-            value_quant = quant_result.get('value')
-            value_qual = qual_result.get('value')
-
-            # I-42 DEBUG: Log what we're about to store
-            if value_quant and 'valuation' in value_quant:
-                val_keys = list(value_quant['valuation'].keys())[:5]
-                logger.info(f"[I-42 DEBUG] value_quant valuation keys: {val_keys}")
-                if 'priceQuantitative' in value_quant['valuation']:
-                    logger.info(f"[I-42 DEBUG] priceQuantitative value: {value_quant['valuation']['priceQuantitative']}")
-
-            # Extract priceQuantitative for dedicated column
-            price_quant_col = None
-            if value_quant and 'valuation' in value_quant:
-                price_quant_col = value_quant['valuation'].get('priceQuantitative')
-
-            # Build peer_quantitative JSONB (if priceQuantitative exists)
-            peer_quant_col = None
-            if price_quant_col is not None and sector_averages:
-                peer_quant_col = {
-                    'peerCount': peer_count,
-                    'sectorAverages': sector_averages
-                }
-
-            # DEBUG: Log column values for first few events
-            if idx <= 3:
-                logger.info(f"{row_context} | DEBUG | price_quantitative={price_quant_col}, peer_quantitative={'set' if peer_quant_col else 'NULL'}")
-
-            # Prepare batch update
-            batch_updates.append({
-                'ticker': ticker,
-                'event_date': event_date,
-                'source': source,
-                'source_id': source_id,
-                'value_quantitative': value_quant,
-                'value_qualitative': value_qual,
-                'position_quantitative': position_quant,
-                'position_qualitative': position_qual,
-                'disparity_quantitative': disparity_quant,
-                'disparity_qualitative': disparity_qual,
-                # NEW: Dedicated columns for performance (I-42)
-                'price_quantitative': price_quant_col,
-                'peer_quantitative': peer_quant_col
-            })
-
-            # INCREMENTAL DB UPDATE: Save progress every N events (PERFORMANCE OPTIMIZATION)
-            INCREMENTAL_UPDATE_BATCH_SIZE = 20
-            if len(batch_updates) >= INCREMENTAL_UPDATE_BATCH_SIZE:
-                try:
-                    logger.info(f"[INCR-UPDATE] {ticker}: Saving {len(batch_updates)} events to DB (checkpoint at {idx}/{total_events})")
-                    incr_updated_count = await metrics.batch_update_event_valuations(
-                        pool, batch_updates, overwrite=overwrite, metrics=metrics_list
-                    )
-                    logger.info(f"[INCR-UPDATE] {ticker}: ✓ {incr_updated_count} events saved successfully")
-
-                    # Clear batch after successful update
-                    batch_updates.clear()
-
-                except Exception as e:
-                    logger.warning(f"[INCR-UPDATE] {ticker}: Incremental DB update failed: {e}")
-                    # Don't clear batch_updates on failure - will retry at end
-
-            # Track success/fail
-            if quant_result['status'] == 'success':
-                quant_success += 1
-            elif quant_result['status'] == 'failed':
-                quant_fail += 1
-            
-            if qual_result['status'] == 'success':
-                qual_success += 1
-            elif qual_result['status'] == 'failed':
-                qual_fail += 1
-            
-            # Build position and disparity dicts
-            position_dict = {}
-            if position_quant is not None:
-                position_dict['quantitative'] = position_quant
-            if position_qual is not None:
-                position_dict['qualitative'] = position_qual
-            
-            disparity_dict = {}
-            if disparity_quant is not None:
-                disparity_dict['quantitative'] = disparity_quant
-            if disparity_qual is not None:
-                disparity_dict['qualitative'] = disparity_qual
-            
-            # Build result
-            results.append(EventProcessingResult(
-                ticker=ticker,
-                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
-                source=source,
-                source_id=str(source_id),
-                status='success' if quant_result['status'] == 'success' and qual_result['status'] == 'success' else 'partial',
-                quantitative={
-                    'status': quant_result['status'],
-                    'message': quant_result.get('message')
-                },
-                qualitative={
-                    'status': qual_result['status'],
-                    'message': qual_result.get('message')
-                },
-                position=position_dict if position_dict else None,
-                disparity=disparity_dict if disparity_dict else None
-            ))
-
-            # Log each event completion
-            logger.info(f"{row_context} | Event {idx}/{total_events} completed | quant={'OK' if quant_result['status']=='success' else 'FAIL'}, qual={'OK' if qual_result['status']=='success' else 'FAIL'}")
-
-            # Log event progress every 10 events (reduce I/O overhead)
-            if idx % 10 == 0 or idx == total_events:
-                event_pct = (idx / total_events) * 100
-                current_time = time.time()
-                
-                # Calculate ETA based on last 10 events
-                elapsed_since_checkpoint = current_time - last_checkpoint_time
-                events_processed_since_checkpoint = idx - last_checkpoint_idx
-                if events_processed_since_checkpoint > 0:
-                    avg_time_per_event = elapsed_since_checkpoint / events_processed_since_checkpoint
-                else:
-                    elapsed_total = current_time - batch_start_time
-                    avg_time_per_event = elapsed_total / idx if idx > 0 else 0
-                
-                # Update checkpoint
-                last_checkpoint_time = current_time
-                last_checkpoint_idx = idx
-                
-                remaining_events = total_events - idx
-                eta_seconds = remaining_events * avg_time_per_event
-                eta_minutes = int(eta_seconds / 60)
-                eta_seconds_remainder = int(eta_seconds % 60)
-                
-                # Format ETA
-                if eta_minutes > 60:
-                    eta_hours = eta_minutes // 60
-                    eta_minutes_remainder = eta_minutes % 60
-                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
-                elif eta_minutes > 0:
-                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
-                else:
-                    eta_str = f"{eta_seconds_remainder}s"
-                
-                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Calculate total events progress
-                if completed_events_count is not None:
-                    current_total = completed_events_count.get('count', 0) + idx
-                    total_pct = (current_total / total_events_count * 100) if total_events_count > 0 else 0
-                    all_events_line = f"[ALL EVENTS] {current_total}/{total_events_count} ({total_pct:.1f}%)\n"
-                else:
-                    all_events_line = ""
-                
-                logger.info(
-                    f"\n{'#'*80}\n"
-                    f"{all_events_line}"
-                    f"[{ticker} EVENTS] {idx}/{total_events} ({event_pct:.1f}%)\n"
-                    f"TIMESTAMP: {timestamp_str}\n"
-                    f"ETA: {eta_str}\n"
-                    f"{'#'*80}"
-                )
-            
-        except Exception as e:
-            log_error(logger, f"{row_context} | Event processing failed", exception=e, ticker=ticker)
-
-            quant_fail += 1
-            qual_fail += 1
-            
-            results.append(EventProcessingResult(
-                ticker=ticker,
-                event_date=event_date.isoformat() if hasattr(event_date, 'isoformat') else str(event_date),
-                source=source,
-                source_id=str(source_id),
-                status='failed',
-                error=str(e),
-                errorCode='INTERNAL_ERROR'
-            ))
-            
-            # Log event progress even on error - every 10 events
-            if idx % 10 == 0 or idx == total_events:
-                event_pct = (idx / total_events) * 100
-                current_time = time.time()
-                
-                elapsed_since_checkpoint = current_time - last_checkpoint_time
-                events_processed_since_checkpoint = idx - last_checkpoint_idx
-                if events_processed_since_checkpoint > 0:
-                    avg_time_per_event = elapsed_since_checkpoint / events_processed_since_checkpoint
-                else:
-                    elapsed_total = current_time - batch_start_time
-                    avg_time_per_event = elapsed_total / idx if idx > 0 else 0
-                
-                # Update checkpoint
-                last_checkpoint_time = current_time
-                last_checkpoint_idx = idx
-                
-                remaining_events = total_events - idx
-                eta_seconds = remaining_events * avg_time_per_event
-                eta_minutes = int(eta_seconds / 60)
-                eta_seconds_remainder = int(eta_seconds % 60)
-                
-                # Format ETA
-                if eta_minutes > 60:
-                    eta_hours = eta_minutes // 60
-                    eta_minutes_remainder = eta_minutes % 60
-                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
-                elif eta_minutes > 0:
-                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
-                else:
-                    eta_str = f"{eta_seconds_remainder}s"
-                
-                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Calculate total events progress
-                if completed_events_count is not None:
-                    current_total = completed_events_count.get('count', 0) + idx
-                    total_pct = (current_total / total_events_count * 100) if total_events_count > 0 else 0
-                    all_events_line = f"[ALL EVENTS] {current_total}/{total_events_count} ({total_pct:.1f}%)\n"
-                else:
-                    all_events_line = ""
-                
-                logger.info(
-                    f"\n{'#'*80}\n"
-                    f"{all_events_line}"
-                    f"[{ticker} EVENTS] {idx}/{total_events} ({event_pct:.1f}%)\n"
-                    f"TIMESTAMP: {timestamp_str}\n"
-                    f"ETA: {eta_str}\n"
-                    f"{'#'*80}"
-                )
-
-    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | ========== EVENT PROCESSING END ==========")
-    logger.info(f"[table: txn_events | id: ticker-cache:{ticker}] | Processed {total_events} events | quant_success={quant_success}, qual_success={qual_success}")
+    # Skip deprecated sequential processing code (replaced by parallel processing above)
+    # Old code removed for clarity - git history available if needed
 
     # Batch update DB
     try:
@@ -703,14 +630,14 @@ async def process_ticker_batch(
             log_db_update(logger, "txn_events", updated_count, len(batch_updates))
     except Exception as e:
         log_error(logger, f"DB batch update failed for {ticker}", exception=e, ticker=ticker)
-    
+
     # Update global completed events count
     if completed_events_count is not None:
         completed_events_count['count'] = completed_events_count.get('count', 0) + len(ticker_events)
-    
+
     # Log ticker completion
     log_batch_complete(logger, ticker, len(ticker_events), quant_success + qual_success, quant_fail + qual_fail)
-    
+
     return {
         'ticker': ticker,
         'updates': batch_updates,
@@ -720,6 +647,11 @@ async def process_ticker_batch(
         'qual_success': qual_success,
         'qual_fail': qual_fail
     }
+
+
+# OLD SEQUENTIAL CODE REMOVED
+# The sequential event processing loop has been replaced by parallel processing above
+# Git history contains the original implementation if needed for reference
 
 
 async def calculate_valuations(
