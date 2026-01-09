@@ -178,13 +178,48 @@ async def process_single_event_parallel(
         if value_quant and 'valuation' in value_quant:
             price_quant_value = value_quant['valuation'].get('priceQuantitative')
 
+        # ============================================================
+        # I-45 Phase 4: Position & Disparity Calculation
+        # ============================================================
+        # NOT registered in config_lv2_metric
+        # Reason: Simple comparison logic, no need for separate metric registration
+        # Kept in Python for simplicity and direct integration
+        #
+        # These calculations are derived from priceQuantitative (fair value):
+        # - position_quant: Investment recommendation (long/short/neutral)
+        # - disparity_quant: Percentage deviation from fair value
+        # ============================================================
         if price_quant_value is not None and current_price:
+            # Position calculation: Compare fair value vs current price
             if price_quant_value > current_price:
+                # LONG: Stock is undervalued
+                # Fair value > Current price → Buy signal
+                # Example: fair_value=$150, current_price=$100 → LONG (50% undervalued)
                 position_quant = 'long'
             elif price_quant_value < current_price:
+                # SHORT: Stock is overvalued
+                # Fair value < Current price → Sell signal
+                # Example: fair_value=$80, current_price=$100 → SHORT (25% overvalued)
                 position_quant = 'short'
             else:
+                # NEUTRAL: Fair value = Current price
+                # Stock is fairly valued
                 position_quant = 'neutral'
+
+            # ============================================================
+            # Disparity calculation: (fair_value / current_price) - 1
+            # ============================================================
+            # Positive value = undervalued (fair_value > current_price)
+            # Negative value = overvalued (fair_value < current_price)
+            # Zero = fairly valued
+            #
+            # Example calculations:
+            #   fair_value=$150, current_price=$100
+            #   disparity = (150 / 100) - 1 = 0.5 (50% undervalued)
+            #
+            #   fair_value=$80, current_price=$100
+            #   disparity = (80 / 100) - 1 = -0.2 (20% overvalued)
+            # ============================================================
             disparity_quant = round((price_quant_value / current_price) - 1, 4) if current_price != 0 else None
         else:
             # Fallback: calculate_position_disparity is defined later in this file

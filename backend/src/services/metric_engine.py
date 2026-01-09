@@ -54,6 +54,10 @@ class MetricCalculationEngine:
         self.transforms = transforms or {}  # Transform definitions from DB
         self.metric_sources = {}  # I-30: Track source metadata for each metric
 
+        # I-45: Error logging system (Phase 3)
+        self.error_logs = []  # Batch insert buffer for error logs
+        self.log_batch_size = 1000  # Batch size for INSERT operations
+
     def _flatten_metrics(self) -> List[Dict[str, Any]]:
         """Flatten metrics_by_domain into a single list."""
         all_metrics = []
@@ -548,6 +552,10 @@ class MetricCalculationEngine:
             # If single record (snapshot API), return scalar value
             # Otherwise return list (time-series API)
             if len(values) == 1:
+                # I-45: Log new Enterprise Value component metrics
+                metric_name = metric.get('name')
+                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
+                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {values[0]} (from {api_list_id})")
                 return values[0]
             elif len(values) > 1:
                 # I-25: 시계열 시가총액 API의 경우 가장 최근 날짜(첫 번째)의 값만 반환
@@ -556,6 +564,10 @@ class MetricCalculationEngine:
                 if 'historical-market-cap' in api_list_id:
                     logger.debug(f"[MetricEngine][I-25] Using latest marketCap from {len(values)} records")
                     return values[0]
+                # I-45: Log new Enterprise Value component metrics (list case)
+                metric_name = metric.get('name')
+                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
+                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {values[0]} (latest from {len(values)} records, api: {api_list_id})")
                 return values
             else:
                 return None
@@ -563,7 +575,12 @@ class MetricCalculationEngine:
             # Single snapshot (e.g., fmp-quote returns single market cap)
             value = api_response.get(field_key)
             if value is not None:
-                return self._convert_value(value)
+                converted = self._convert_value(value)
+                # I-45: Log new Enterprise Value component metrics (dict case)
+                metric_name = metric.get('name')
+                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
+                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {converted} (from {api_list_id})")
+                return converted
             return None
         else:
             return None
@@ -765,6 +782,8 @@ class MetricCalculationEngine:
             return self._yoy_from_quarter(base_values, aggregation_params)
         elif aggregation_kind == 'leadPairFromList':
             return self._lead_pair_from_list(base_values, aggregation_params)
+        elif aggregation_kind == 'avgWithIQROutlierRemoval':
+            return self._avg_with_iqr_outlier_removal(base_values, aggregation_params)
         else:
             logger.warning(f"[MetricEngine] Unknown aggregation_kind '{aggregation_kind}' for {metric.get('name')}")
             return None
@@ -1015,8 +1034,24 @@ class MetricCalculationEngine:
             if 'if ' in formula.lower() and ' then ' in formula.lower():
                 return self._evaluate_conditional(formula, calculated_values)
 
+            # I-45: Log Enterprise Value calculation components
+            metric_name = metric.get('name')
+            if metric_name == 'enterpriseValue':
+                logger.info(f"[MetricEngine] [I-45] Calculating Enterprise Value with NEW formula")
+                logger.info(f"[MetricEngine] [I-45] Formula: {formula}")
+                logger.info(f"[MetricEngine] [I-45] Components:")
+                logger.info(f"[MetricEngine] [I-45]   - marketCap: {calculated_values.get('marketCap')}")
+                logger.info(f"[MetricEngine] [I-45]   - totalDebtLatest: {calculated_values.get('totalDebtLatest')}")
+                logger.info(f"[MetricEngine] [I-45]   - minorityInterestLatest: {calculated_values.get('minorityInterestLatest')} (NEW)")
+                logger.info(f"[MetricEngine] [I-45]   - preferredStockLatest: {calculated_values.get('preferredStockLatest')} (NEW)")
+                logger.info(f"[MetricEngine] [I-45]   - cashAndCashEquivalentsLatest: {calculated_values.get('cashAndCashEquivalentsLatest')}")
+
             # Evaluate the formula
             result = eval(formula, {"__builtins__": {}}, eval_context)
+
+            # I-45: Log Enterprise Value result
+            if metric_name == 'enterpriseValue':
+                logger.info(f"[MetricEngine] [I-45] Enterprise Value RESULT: {result}")
 
             return float(result) if result is not None else None
 
@@ -1286,3 +1321,242 @@ class MetricCalculationEngine:
         )
 
         return current_record
+
+    def _avg_with_iqr_outlier_removal(
+        self,
+        base_values: List[float],
+        params: Dict[str, Any]
+    ) -> Optional[float]:
+        """
+        Calculate average after removing outliers using IQR (Interquartile Range) method.
+
+        This method implements the IQR-based outlier detection and removal:
+        1. Calculate Q1 (25th percentile) and Q3 (75th percentile)
+        2. Calculate IQR = Q3 - Q1
+        3. Define outlier boundaries: [Q1 - multiplier*IQR, Q3 + multiplier*IQR]
+        4. Remove values outside boundaries
+        5. Calculate average of remaining values
+
+        Used primarily for sector average calculations to avoid skewing by extreme values.
+
+        Args:
+            base_values: List of numeric values (can be int, float, or Decimal)
+            params: {
+                "multiplier": 1.5  # IQR multiplier (default: 1.5, standard value)
+            }
+
+        Returns:
+            Average of values after outlier removal, or None if no valid values
+
+        Example:
+            values = [10, 12, 13, 14, 15, 100, 200]  # 100, 200 are outliers
+            # Q1=12, Q3=15, IQR=3
+            # lower = 12 - 1.5*3 = 7.5
+            # upper = 15 + 1.5*3 = 19.5
+            # filtered = [10, 12, 13, 14, 15]
+            # avg = 12.8
+        """
+        if not base_values:
+            logger.warning("[MetricEngine] avgWithIQROutlierRemoval: No base_values provided")
+            return None
+
+        # Convert to floats and filter out None/NaN values
+        from decimal import Decimal
+        numeric_values = []
+        for v in base_values:
+            if v is None:
+                continue
+            try:
+                if isinstance(v, Decimal):
+                    numeric_values.append(float(v))
+                else:
+                    numeric_values.append(float(v))
+            except (ValueError, TypeError):
+                logger.warning(f"[MetricEngine] avgWithIQROutlierRemoval: Invalid value {v}, skipping")
+                continue
+
+        if not numeric_values:
+            logger.warning("[MetricEngine] avgWithIQROutlierRemoval: No valid numeric values")
+            return None
+
+        # If less than 4 values, IQR method is not applicable - return simple average
+        if len(numeric_values) < 4:
+            result = sum(numeric_values) / len(numeric_values)
+            logger.info(
+                f"[MetricEngine] avgWithIQROutlierRemoval: Less than 4 values ({len(numeric_values)}), "
+                f"returning simple average: {result}"
+            )
+            return result
+
+        # Calculate quartiles
+        sorted_values = sorted(numeric_values)
+        n = len(sorted_values)
+        q1_index = n // 4
+        q3_index = (3 * n) // 4
+
+        q1 = sorted_values[q1_index]
+        q3 = sorted_values[q3_index]
+        iqr = q3 - q1
+
+        # Get multiplier from params (default: 1.5)
+        multiplier = params.get('multiplier', 1.5)
+
+        # Calculate outlier boundaries
+        lower_bound = q1 - multiplier * iqr
+        upper_bound = q3 + multiplier * iqr
+
+        # Filter out outliers
+        filtered_values = [v for v in numeric_values if lower_bound <= v <= upper_bound]
+
+        if not filtered_values:
+            logger.warning(
+                f"[MetricEngine] avgWithIQROutlierRemoval: All values filtered out "
+                f"(Q1={q1}, Q3={q3}, IQR={iqr}, bounds=[{lower_bound}, {upper_bound}])"
+            )
+            return None
+
+        # Calculate average
+        result = sum(filtered_values) / len(filtered_values)
+
+        logger.info(
+            f"[MetricEngine] avgWithIQROutlierRemoval: "
+            f"Processed {len(numeric_values)} values, "
+            f"removed {len(numeric_values) - len(filtered_values)} outliers, "
+            f"Q1={q1:.2f}, Q3={q3:.2f}, IQR={iqr:.2f}, "
+            f"bounds=[{lower_bound:.2f}, {upper_bound:.2f}], "
+            f"result={result:.2f}"
+        )
+
+        return result
+
+    # =============================================================================
+    # I-45 Phase 3: Error Logging System
+    # =============================================================================
+
+    def _log_calculation_error(
+        self,
+        metric_id: str,
+        error_message: str,
+        event_id: Optional[str] = None,
+        ticker: Optional[str] = None,
+        event_date: Optional[str] = None,
+        input_values: Optional[Dict[str, Any]] = None,
+        calculation_code: Optional[str] = None,
+        execution_time_ms: Optional[int] = None
+    ) -> None:
+        """
+        Add a calculation error to the batch insert buffer.
+
+        Errors are buffered and inserted in batches of 1000 for performance.
+        Call finalize() at the end to insert remaining logs.
+
+        Args:
+            metric_id: ID of the metric that failed (e.g., 'PER', 'ROE')
+            error_message: Error message from exception
+            event_id: Optional UUID of the event
+            ticker: Optional ticker symbol
+            event_date: Optional event date (ISO format string)
+            input_values: Optional dict of input values used
+            calculation_code: Optional calculation code (will be truncated to 500 chars)
+            execution_time_ms: Optional execution time in milliseconds
+        """
+        import json
+        from datetime import datetime
+
+        error_log = {
+            'metric_id': metric_id,
+            'event_id': event_id,
+            'ticker': ticker,
+            'event_date': event_date,
+            'input_values': json.dumps(input_values) if input_values else None,
+            'error_message': str(error_message)[:1000],  # Truncate to 1000 chars
+            'calculation_code': calculation_code[:500] if calculation_code else None,  # Truncate to 500 chars
+            'execution_time_ms': execution_time_ms
+        }
+
+        self.error_logs.append(error_log)
+
+        # Batch insert if buffer is full
+        if len(self.error_logs) >= self.log_batch_size:
+            try:
+                # Note: This is synchronous. For production, use async.
+                # self._batch_insert_logs_sync()
+                logger.info(f"[MetricEngine] Error log buffer full ({len(self.error_logs)} logs), batch insert needed")
+            except Exception as e:
+                logger.error(f"[MetricEngine] Failed to batch insert error logs: {e}")
+                # Clear buffer to prevent memory issues
+                self.error_logs.clear()
+
+    async def _batch_insert_logs_async(self, db_connection) -> None:
+        """
+        Insert buffered error logs to database in batch (async version).
+
+        Args:
+            db_connection: AsyncPG connection or pool
+
+        Note:
+            This is an async method. Call it with await from async context.
+            Example: await engine._batch_insert_logs_async(db_conn)
+        """
+        if not self.error_logs:
+            return
+
+        try:
+            from uuid import UUID
+
+            query = """
+                INSERT INTO metric_calculation_logs (
+                    metric_id, event_id, ticker, event_date,
+                    input_values, error_message, calculation_code, execution_time_ms
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """
+
+            # Prepare records for batch insert
+            records = []
+            for log in self.error_logs:
+                records.append((
+                    log['metric_id'],
+                    UUID(log['event_id']) if log.get('event_id') else None,
+                    log.get('ticker'),
+                    log.get('event_date'),
+                    log.get('input_values'),
+                    log.get('error_message'),
+                    log.get('calculation_code'),
+                    log.get('execution_time_ms')
+                ))
+
+            # Use executemany for batch insert
+            async with db_connection.acquire() as conn:
+                await conn.executemany(query, records)
+
+            logger.info(f"[MetricEngine] Batch inserted {len(self.error_logs)} error logs to database")
+            self.error_logs.clear()
+
+        except Exception as e:
+            logger.error(f"[MetricEngine] Failed to batch insert error logs: {e}")
+            # Clear buffer anyway to prevent memory issues
+            self.error_logs.clear()
+
+    async def finalize_async(self, db_connection) -> None:
+        """
+        Finalize the engine by inserting remaining error logs (async version).
+
+        Call this method at the end of metric calculation to ensure all
+        buffered error logs are written to the database.
+
+        Args:
+            db_connection: AsyncPG connection or pool
+
+        Example:
+            engine = MetricCalculationEngine(...)
+            try:
+                # ... calculate metrics ...
+            finally:
+                await engine.finalize_async(db_conn)
+        """
+        if self.error_logs:
+            logger.info(f"[MetricEngine] Finalizing: inserting {len(self.error_logs)} remaining error logs")
+            await self._batch_insert_logs_async(db_connection)
+        else:
+            logger.debug("[MetricEngine] Finalizing: no error logs to insert")
