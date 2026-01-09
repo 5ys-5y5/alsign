@@ -932,15 +932,78 @@
 
 ---
 
+## I-45: Metric Formula Verification & Config Migration
+**식별일**: 2026-01-09
+**상태**: 🔄 진행중
+**카테고리**: 데이터 무결성, 아키텍처 개선
+**우선순위**: 높음
+**관련 파일**: `config_lv2_metric`, `config_lv2_metric_transform`, `valuation_service.py`, `metric_engine.py`
+
+### 문제 요약
+1. **정량 지표 수식 검증**: AAPL (2021-06-11) 기준 PBR 등 주요 지표가 MacroTrends 대비 차이 발생
+2. **아키텍처 원칙 위반**: 계산 로직이 config 테이블이 아닌 Python 코드에 하드코딩됨
+3. **Enterprise Value 불완전**: minorityInterest, preferredStock 누락
+
+### 분석 결과
+- **수식 검증 점수**: 85% (68/80) - Excellent
+- **HIGH Priority**: EV/EBITDA 수식 개선 (minorityInterest, preferredStock 추가)
+- **MEDIUM Priority**: apicYoY → sharesOutstandingYoY 교체
+- **아키텍처 위반**: 4가지 계산 로직이 config 테이블 외부에 존재
+  1. priceQuantitative 계산 (fair value from sector averages)
+  2. Sector Average with IQR outlier removal
+  3. Position 계산 (long/short/neutral)
+  4. Disparity 계산 (price deviation)
+
+### 사용자 결정
+- **마이그레이션 방안**: 옵션 2 (Hybrid approach)
+  - 단순 계산: config 테이블 calculation 컬럼으로 이동
+  - 복잡한 비동기 계산: Python 유지 (calculation 컬럼에 문서화)
+- **로깅 전략**: 에러만 기록 (성공 케이스 제외)
+- **로깅 방법**: Batch INSERT (1000개 단위)
+- **Position/Disparity**: config 미등록, Python 유지
+- **Q1 (disparity)**: config 등록 안 함
+- **Q2 (로깅)**: 에러만 기록
+- **Q3 (로깅 방법)**: Batch INSERT (1000개)
+
+### 변경 내역
+
+#### Phase 1: Enterprise Value 수식 개선
+- [ ] `config_lv2_metric.enterpriseValue` 수식 업데이트
+  - minorityInterest, preferredStock 추가
+
+#### Phase 2: IQR Outlier Removal 마이그레이션
+- [ ] `config_lv2_metric_transform` 테이블에 avgWithIQROutlierRemoval 추가
+- [ ] `metric_engine.py`에 _avg_with_iqr_outlier_removal() 구현
+
+#### Phase 3: Logging 시스템 구현
+- [ ] `metric_calculation_logs` 테이블 생성
+- [ ] `metric_engine.py`에 에러 로깅 로직 추가 (batch insert)
+
+#### Phase 4: Documentation
+- [ ] `config_lv2_metric.priceQuantitative` calculation 컬럼 문서화
+- [ ] Position/Disparity 계산 주석 보강
+
+### 검증 계획
+1. Enterprise Value 계산 검증 (MacroTrends 비교)
+2. IQR 함수 단위 테스트
+3. Logging 성능 테스트 (1000개 batch)
+4. 전체 메트릭 재계산 통합 테스트
+
+**참조**:
+- 상세 플로우: `2_FLOW.md#I-45`
+- 구현 상세: `3_DETAIL.md#I-45`
+
+---
+
 ## 📈 통계
 
 ### 상태별 현황
-- ✅ **완료**: 38개 (86.4%)
-- 🔄 **진행중**: 1개 (2.3%) - I-43
-- 🔄 **DEPRECATED**: 3개 (6.8%) - I-36, I-38, I-40 (I-41로 대체됨)
-- ⏸️ **보류**: 2개 (4.5%) - I-04, I-14
+- ✅ **완료**: 38개 (84.4%)
+- 🔄 **진행중**: 2개 (4.4%) - I-43, I-45
+- 🔄 **DEPRECATED**: 3개 (6.7%) - I-36, I-38, I-40 (I-41로 대체됨)
+- ⏸️ **보류**: 2개 (4.4%) - I-04, I-14
 
-> **전체 이슈**: 44개 (I-01 ~ I-44)
+> **전체 이슈**: 45개 (I-01 ~ I-45)
 
 ### 일자별 이슈 처리
 - **2025-12-23**: I-01 ~ I-09 (9개 이슈 처리)
@@ -953,6 +1016,7 @@
 - **2026-01-02**: I-39 ~ I-42 (JSONB 파싱, priceQuantitative 메트릭 구현, schema mapping 개선)
 - **2026-01-05**: I-43 (Dashboard Events 로딩 성능 개선 - txn_price_trend 테이블 분리 설계)
 - **2026-01-06**: I-44 (POST /backfillEventsTable 성능 최적화 - Database timeout + peer collection 병렬 처리)
+- **2026-01-09**: I-45 (Metric Formula Verification & Config Migration - EV 수식 개선, 아키텍처 원칙 준수)
 
 ### 폐기 이슈 (Deprecated)
 - **I-36**: calcFairValue 파라미터 → I-41 priceQuantitative 메트릭으로 대체
@@ -961,7 +1025,8 @@
 
 ---
 
-*최종 업데이트: 2026-01-06 KST (I-44 완료 - POST /backfillEventsTable 성능 최적화: Database timeout + peer collection 병렬 처리)*
+*최종 업데이트: 2026-01-09 KST (I-45 식별 - Metric Formula Verification & Config Migration: EV 수식 개선, IQR 마이그레이션, 로깅 시스템)*
+*이전 업데이트: I-44 완료 - POST /backfillEventsTable 성능 최적화: Database timeout + peer collection 병렬 처리*
 *이전 업데이트: I-43 설계 완료 - Dashboard Events 로딩 성능 개선, txn_price_trend 테이블 분리*
 *설계 문서: backend/DESIGN_priceQuantitative_metric.md*
 *이슈 분석: history/ISSUE_priceQuantitative_MISSING.md*

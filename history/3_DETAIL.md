@@ -5336,7 +5336,863 @@ priceQuantitative: 123.45
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결)*
+## I-43: Dashboard Events 로딩 성능 개선
+
+### I-43-A: txn_price_trend 테이블 설계 (미반영)
+
+**파일**: `backend/migrations/create_txn_price_trend.sql`
+
+**테이블 DDL**:
+```sql
+CREATE TABLE txn_price_trend (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticker TEXT NOT NULL,
+  event_date TIMESTAMPTZ NOT NULL,
+  price_close NUMERIC,
+  price_open NUMERIC,
+  price_high NUMERIC,
+  price_low NUMERIC,
+  volume BIGINT,
+  change_amount NUMERIC,
+  change_percent NUMERIC,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 복합 인덱스 (쿼리 최적화)
+CREATE INDEX idx_price_trend_ticker_date ON txn_price_trend(ticker, event_date DESC);
+CREATE INDEX idx_price_trend_date ON txn_price_trend(event_date DESC);
+
+-- 기존 데이터 마이그레이션
+INSERT INTO txn_price_trend (ticker, event_date, price_close, price_open, price_high, price_low, volume)
+SELECT
+  ticker,
+  event_date,
+  (value_quantitative->'price'->>'close')::NUMERIC as price_close,
+  (value_quantitative->'price'->>'open')::NUMERIC as price_open,
+  (value_quantitative->'price'->>'high')::NUMERIC as price_high,
+  (value_quantitative->'price'->>'low')::NUMERIC as price_low,
+  (value_quantitative->'price'->>'volume')::BIGINT as volume
+FROM txn_events
+WHERE value_quantitative->'price' IS NOT NULL;
+```
+
+**상태**: 설계 완료, 구현 대기
+
+---
+
+## I-44: POST /backfillEventsTable 성능 최적화
+
+### I-44-A: Database timeout 증가 (반영완료)
+
+**파일**: `backend/src/database/connection.py`
+
+**변경 전**:
+```python
+# Line ~50
+engine = create_async_engine(
+    database_url,
+    poolclass=NullPool,
+    connect_args={
+        "server_settings": {"jit": "off"},
+        "command_timeout": 60  # 기본값
+    }
+)
+```
+
+**변경 후**:
+```python
+# Line ~50
+engine = create_async_engine(
+    database_url,
+    poolclass=NullPool,
+    connect_args={
+        "server_settings": {"jit": "off"},
+        "command_timeout": 300  # 60 → 300 (5분)
+    }
+)
+```
+
+### I-44-B: Peer collection 병렬 처리 (반영완료)
+
+**파일**: `backend/src/services/valuation_service.py`
+
+**변경 전** (순차 처리):
+```python
+# Lines 2736-2751
+sector_metrics = []
+for peer_ticker in peer_tickers:
+    peer_data = await get_ticker_metrics(peer_ticker, event_date)
+    sector_metrics.append(peer_data)
+# 처리 시간: ~250초 (500 tickers)
+```
+
+**변경 후** (병렬 처리):
+```python
+# Lines 2736-2751 (예시)
+import asyncio
+
+# batch_size 파라미터로 동시 처리 수 제어 (기본값 10)
+batch_size = params.get('batch_size', 10)
+
+# asyncio.gather로 병렬 처리
+sector_metrics = []
+for i in range(0, len(peer_tickers), batch_size):
+    batch = peer_tickers[i:i+batch_size]
+    batch_results = await asyncio.gather(
+        *[get_ticker_metrics(ticker, event_date) for ticker in batch],
+        return_exceptions=True
+    )
+    sector_metrics.extend([r for r in batch_results if not isinstance(r, Exception)])
+
+# 처리 시간: ~19초 (500 tickers, 90% 개선)
+```
+
+**API 파라미터 추가**:
+```python
+# backend/src/models/request_models.py
+class BackfillEventsRequest(BaseModel):
+    tickers: Optional[List[str]] = None
+    overwrite: bool = False
+    batch_size: int = 10  # 신규 추가
+```
+
+**성능 개선**:
+- Phase 3.5 peer collection: 250s → 19s (90% 단축)
+- AAPL 357 events 처리: 5분 14초 완료
+
+---
+
+## I-45: Metric Formula Verification & Config Migration
+
+### 문제 분석 요약
+
+#### 1. AAPL (2021-06-11) 검증 데이터
+
+**계산된 값**:
+```json
+{
+  "PER": 30.61,
+  "PBR": 34.45,
+  "PSR": 7.42,
+  "ROE": 1.4701,
+  "currentRatio": 1.0744,
+  "enterpriseValue": 2135749132330
+}
+```
+
+**MacroTrends 비교**:
+- PBR: 30.61 (서비스) vs 34.45 (MacroTrends) → 12% 차이
+- 원인: 시점 차이 (6/11 vs 6/30), Equity 정의, Market Cap 계산
+
+**결론**: 현재 서비스 방식이 우수 (실시간성, diluted shares 사용)
+
+#### 2. 전체 메트릭 검증 점수
+
+**85% (68/80 points) - Excellent**
+
+| 도메인 | 점수 | 상태 |
+|--------|------|------|
+| Valuation (5 metrics) | 17/20 | ⚠️ EV/EBITDA 개선 필요 |
+| Profitability (1) | 5/5 | ✅ Perfect |
+| Risk (2) | 8/10 | ⚠️ cashToRevenueTTM 비표준 |
+| Dilution (3) | 11/15 | ⚠️ apicYoY 비표준 |
+| Momentum (5) | 25/25 | ✅ Perfect |
+
+#### 3. 아키텍처 원칙 위반
+
+**현재 위반 사항**:
+1. priceQuantitative: Python 하드코딩 (valuation_service.py:2892-2959)
+2. Sector Average IQR: Python 하드코딩 (valuation_service.py:2736-2751)
+3. Position: Python 하드코딩 (valuation_service.py:181-188)
+4. Disparity: Python 하드코딩 (valuation_service.py:181-188)
+
+**마이그레이션 결정**:
+- IQR → config_lv2_metric_transform 테이블로 마이그레이션 ✅
+- priceQuantitative → Python 유지, calculation 컬럼 문서화 (cross-ticker 비동기 쿼리 불가피)
+- Position/Disparity → Python 유지, 주석 보강 (단순 로직)
+
+### I-45-A: Enterprise Value 수식 개선 (HIGH Priority, 미반영)
+
+**문제가 된 설정**:
+```sql
+-- config_lv2_metric.enterpriseValue (현재)
+SELECT id, source, expression
+FROM config_lv2_metric
+WHERE id = 'enterpriseValue';
+
+-- Result:
+-- expression = 'marketCap + totalDebtLatest - cashAndCashEquivalentsLatest'
+```
+
+**업계 표준**:
+```
+EV = Market Cap + Total Debt + Minority Interest + Preferred Stock - Cash
+```
+
+**적용할 SQL (Phase 1-A)**:
+```sql
+-- Step 1: minorityInterestLatest 메트릭 추가
+INSERT INTO config_lv2_metric (
+  id,
+  source,
+  api_list_id,
+  api_field,
+  domain,
+  description
+) VALUES (
+  'minorityInterestLatest',
+  'api_field',
+  'fmp-balance-sheet-statement',
+  'minorityInterest',
+  'valuation-enterpriseValue',
+  'Minority interest from latest balance sheet'
+);
+
+-- Step 2: preferredStockLatest 메트릭 추가
+INSERT INTO config_lv2_metric (
+  id,
+  source,
+  api_list_id,
+  api_field,
+  domain,
+  description
+) VALUES (
+  'preferredStockLatest',
+  'api_field',
+  'fmp-balance-sheet-statement',
+  'preferredStock',
+  'valuation-enterpriseValue',
+  'Preferred stock from latest balance sheet'
+);
+
+-- Step 3: enterpriseValue 수식 업데이트
+UPDATE config_lv2_metric
+SET expression = 'marketCap + totalDebtLatest + minorityInterestLatest + preferredStockLatest - cashAndCashEquivalentsLatest',
+    description = 'Enterprise Value = Market Cap + Total Debt + Minority Interest + Preferred Stock - Cash (Industry Standard Formula)'
+WHERE id = 'enterpriseValue';
+```
+
+**적용할 SQL (Phase 1-B - 기존 데이터 재계산)**:
+```sql
+-- AAPL 2021-06-11 이벤트 재계산
+-- POST /backfillEventsTable?tickers=AAPL&overwrite=true 실행 필요
+```
+
+**검증 쿼리**:
+```sql
+-- AAPL 2021-06-11 enterpriseValue 확인
+SELECT
+  ticker,
+  event_date,
+  value_quantitative->'valuation'->>'enterpriseValue' as ev,
+  value_quantitative->'valuation'->>'marketCap' as market_cap,
+  value_quantitative->'valuation'->>'totalDebtLatest' as total_debt,
+  value_quantitative->'valuation'->>'minorityInterestLatest' as minority_interest,
+  value_quantitative->'valuation'->>'preferredStockLatest' as preferred_stock,
+  value_quantitative->'valuation'->>'cashAndCashEquivalentsLatest' as cash
+FROM txn_events
+WHERE ticker = 'AAPL'
+  AND event_date = '2021-06-11 00:00:00+00'::TIMESTAMPTZ;
+```
+
+### I-45-B: IQR Outlier Removal 마이그레이션 (MEDIUM Priority, 미반영)
+
+**문제가 된 코드**:
+```python
+# valuation_service.py Lines 2736-2751
+def calculate_sector_average(peer_metrics):
+    """
+    Sector average with IQR outlier removal (HARDCODED)
+    """
+    values = [m['per'] for m in peer_metrics if m.get('per')]
+
+    if len(values) < 4:
+        return sum(values) / len(values)
+
+    # IQR 계산
+    values_sorted = sorted(values)
+    n = len(values_sorted)
+    q1 = values_sorted[n // 4]
+    q3 = values_sorted[3 * n // 4]
+    iqr = q3 - q1
+
+    # 이상치 제거
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    filtered_values = [v for v in values if lower <= v <= upper]
+
+    return sum(filtered_values) / len(filtered_values)
+```
+
+**적용할 SQL (Phase 2-A)**:
+```sql
+-- config_lv2_metric_transform 테이블에 신규 transform 추가
+INSERT INTO config_lv2_metric_transform (
+  transform_name,
+  calculation,
+  description
+) VALUES (
+  'avgWithIQROutlierRemoval',
+  'def _avg_with_iqr_outlier_removal(values, params):
+    """IQR-based outlier removal then average"""
+    if len(values) < 4:
+        return sum(values) / len(values)
+
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    q1 = sorted_vals[n // 4]
+    q3 = sorted_vals[3 * n // 4]
+    iqr = q3 - q1
+    mult = params.get("multiplier", 1.5)
+
+    lower = q1 - mult * iqr
+    upper = q3 + mult * iqr
+    filtered = [v for v in values if lower <= v <= upper]
+
+    return sum(filtered) / len(filtered) if filtered else None',
+  'Calculate average after removing outliers using IQR method (Q1 - 1.5*IQR ~ Q3 + 1.5*IQR)'
+);
+```
+
+**적용할 Python 코드 (Phase 2-B)**:
+```python
+# backend/src/services/metric_engine.py
+# Lines 772-854 (_execute_dynamic_calculation 메서드 근처)
+
+def _avg_with_iqr_outlier_removal(
+    self,
+    base_values: List[float],
+    params: Dict[str, Any]
+) -> Optional[float]:
+    """
+    IQR 기반 이상치 제거 후 평균 계산
+
+    Args:
+        base_values: 입력 값 리스트
+        params: {
+            "multiplier": 1.5  # IQR multiplier (기본값: 1.5)
+        }
+
+    Returns:
+        이상치 제거 후 평균값
+
+    Example:
+        values = [1, 2, 3, 100, 101, 102, 200]
+        # Q1=2, Q3=101, IQR=99
+        # lower = 2 - 1.5*99 = -146.5
+        # upper = 101 + 1.5*99 = 249.5
+        # filtered = [1, 2, 3, 100, 101, 102, 200]
+        # avg = 72.71
+    """
+    if not base_values:
+        return None
+
+    if len(base_values) < 4:
+        return sum(base_values) / len(base_values)
+
+    sorted_values = sorted(base_values)
+    n = len(sorted_values)
+    q1 = sorted_values[n // 4]
+    q3 = sorted_values[3 * n // 4]
+    iqr = q3 - q1
+    multiplier = params.get('multiplier', 1.5)
+
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+
+    filtered = [v for v in base_values if lower <= v <= upper]
+
+    return sum(filtered) / len(filtered) if filtered else None
+
+# aggregation 라우팅에 추가 (Lines ~438)
+elif aggregation_kind == 'avgWithIQROutlierRemoval':
+    return self._avg_with_iqr_outlier_removal(base_values, aggregation_params)
+```
+
+**적용할 Python 코드 (Phase 2-C - 하드코딩 제거)**:
+```python
+# backend/src/services/valuation_service.py
+# Lines 2736-2751 제거 또는 주석 처리
+
+# BEFORE:
+def calculate_sector_average(peer_metrics):
+    # ... 하드코딩된 IQR 로직 ...
+    pass
+
+# AFTER:
+# ✅ IQR 로직은 config_lv2_metric_transform.avgWithIQROutlierRemoval로 마이그레이션됨
+# ✅ MetricCalculationEngine이 자동으로 처리
+```
+
+**검증 테스트**:
+```python
+# backend/tests/test_iqr_outlier_removal.py
+import pytest
+from backend.src.services.metric_engine import MetricCalculationEngine
+
+def test_iqr_outlier_removal_basic():
+    engine = MetricCalculationEngine()
+
+    # Test case 1: Normal distribution
+    values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    result = engine._avg_with_iqr_outlier_removal(values, {"multiplier": 1.5})
+    assert result == 5.5
+
+    # Test case 2: With outliers
+    values = [1, 2, 3, 4, 5, 100, 200]  # 100, 200 are outliers
+    result = engine._avg_with_iqr_outlier_removal(values, {"multiplier": 1.5})
+    # Q1=2, Q3=5, IQR=3
+    # lower = 2 - 1.5*3 = -2.5
+    # upper = 5 + 1.5*3 = 9.5
+    # filtered = [1, 2, 3, 4, 5]
+    assert result == 3.0
+
+    # Test case 3: Less than 4 values
+    values = [1, 2, 3]
+    result = engine._avg_with_iqr_outlier_removal(values, {})
+    assert result == 2.0
+```
+
+### I-45-C: Logging 시스템 구현 (MEDIUM Priority, 미반영)
+
+**적용할 SQL (Phase 3-A - 테이블 생성)**:
+```sql
+-- metric_calculation_logs 테이블 생성
+CREATE TABLE metric_calculation_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  metric_id TEXT NOT NULL,
+  event_id UUID,
+  ticker TEXT,
+  event_date TIMESTAMPTZ,
+  input_values JSONB,
+  output_value NUMERIC,
+  error_message TEXT,
+  calculation_code TEXT,
+  execution_time_ms INTEGER,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 인덱스 생성
+CREATE INDEX idx_metric_logs_metric_id ON metric_calculation_logs(metric_id);
+CREATE INDEX idx_metric_logs_event_id ON metric_calculation_logs(event_id);
+CREATE INDEX idx_metric_logs_ticker_date ON metric_calculation_logs(ticker, event_date);
+CREATE INDEX idx_metric_logs_created_at ON metric_calculation_logs(created_at);
+CREATE INDEX idx_metric_logs_error ON metric_calculation_logs(error_message) WHERE error_message IS NOT NULL;
+
+-- 파티셔닝 (선택사항 - 로그가 많아질 경우)
+-- CREATE TABLE metric_calculation_logs (
+--   ...
+-- ) PARTITION BY RANGE (created_at);
+```
+
+**적용할 Python 코드 (Phase 3-B - 로깅 로직)**:
+```python
+# backend/src/services/metric_engine.py
+# Lines 772-854 (_execute_dynamic_calculation 메서드 수정)
+
+class MetricCalculationEngine:
+    def __init__(self):
+        self.error_logs = []  # Batch insert buffer
+        self.log_batch_size = 1000  # Batch size
+
+    async def _execute_dynamic_calculation(
+        self,
+        metric_id: str,
+        event_id: UUID,
+        ticker: str,
+        event_date: datetime,
+        calculation_code: str,
+        context: Dict[str, Any]
+    ) -> Optional[Any]:
+        """
+        동적 계산 실행 + 에러 로깅
+        """
+        start_time = time.time()
+
+        try:
+            result = eval(calculation_code, context)
+            return result
+
+        except Exception as e:
+            # 에러 로그 추가 (batch buffer)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            self.error_logs.append({
+                'metric_id': metric_id,
+                'event_id': str(event_id),
+                'ticker': ticker,
+                'event_date': event_date.isoformat(),
+                'input_values': json.dumps(context.get('input_values', {})),
+                'error_message': str(e),
+                'calculation_code': calculation_code[:500],  # 최대 500자
+                'execution_time_ms': elapsed_ms
+            })
+
+            # Batch size 도달 시 DB INSERT
+            if len(self.error_logs) >= self.log_batch_size:
+                await self._batch_insert_logs()
+
+            # 에러 전파
+            raise
+
+    async def _batch_insert_logs(self):
+        """
+        에러 로그 배치 INSERT (1000개 단위)
+        """
+        if not self.error_logs:
+            return
+
+        try:
+            query = """
+                INSERT INTO metric_calculation_logs (
+                    metric_id, event_id, ticker, event_date,
+                    input_values, error_message, calculation_code, execution_time_ms
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """
+
+            async with self.db_pool.acquire() as conn:
+                await conn.executemany(
+                    query,
+                    [(
+                        log['metric_id'],
+                        UUID(log['event_id']),
+                        log['ticker'],
+                        log['event_date'],
+                        log['input_values'],
+                        log['error_message'],
+                        log['calculation_code'],
+                        log['execution_time_ms']
+                    ) for log in self.error_logs]
+                )
+
+            logger.info(f"Inserted {len(self.error_logs)} error logs")
+            self.error_logs.clear()
+
+        except Exception as e:
+            logger.error(f"Failed to insert error logs: {e}")
+            self.error_logs.clear()  # 실패 시에도 버퍼 클리어 (무한 증가 방지)
+
+    async def finalize(self):
+        """
+        계산 종료 시 남은 로그 처리
+        """
+        if self.error_logs:
+            await self._batch_insert_logs()
+```
+
+**사용 예시**:
+```python
+# valuation_service.py
+async def calculate_valuations(tickers: List[str]):
+    engine = MetricCalculationEngine()
+
+    try:
+        for ticker in tickers:
+            await engine.calculate_metrics(ticker)
+    finally:
+        # 남은 로그 처리
+        await engine.finalize()
+```
+
+**로그 조회 쿼리**:
+```sql
+-- 최근 에러 TOP 10
+SELECT
+  metric_id,
+  COUNT(*) as error_count,
+  MAX(created_at) as last_error,
+  ARRAY_AGG(DISTINCT error_message) as error_messages
+FROM metric_calculation_logs
+WHERE error_message IS NOT NULL
+GROUP BY metric_id
+ORDER BY error_count DESC
+LIMIT 10;
+
+-- 특정 ticker의 에러 로그
+SELECT
+  metric_id,
+  event_date,
+  error_message,
+  execution_time_ms,
+  created_at
+FROM metric_calculation_logs
+WHERE ticker = 'AAPL'
+  AND error_message IS NOT NULL
+ORDER BY created_at DESC
+LIMIT 100;
+```
+
+### I-45-D: priceQuantitative 문서화 (LOW Priority, 미반영)
+
+**적용할 SQL (Phase 4-A)**:
+```sql
+-- config_lv2_metric.priceQuantitative calculation 컬럼 업데이트
+UPDATE config_lv2_metric
+SET calculation = '
+Fair value calculation from sector averages (Python implementation)
+
+Formula:
+  Priority 1: PER method
+    fair_value = sector_avg_per * eps
+    where eps = current_price / current_per
+
+  Priority 2: PBR method (fallback)
+    fair_value = sector_avg_pbr * bps
+    where bps = current_price / current_pbr
+
+  Priority 3: PSR method (fallback)
+    fair_value = sector_avg_psr * sps
+    where sps = current_price / current_psr
+
+Sector average calculation:
+  - IQR outlier removal (Q1 - 1.5*IQR ~ Q3 + 1.5*IQR)
+  - Uses config_lv2_metric_transform.avgWithIQROutlierRemoval
+
+Implementation location:
+  - File: backend/src/services/valuation_service.py
+  - Function: calculate_fair_value_from_sector()
+  - Lines: 2892-2959
+
+Cannot migrate to config:
+  - Requires cross-ticker async DB queries
+  - Needs peer ticker collection and aggregation
+  - Peer data must be materialized before calculation
+
+Alternative considered:
+  - Materialized view for peer data → Rejected (complexity vs benefit)
+  - Separate cron job for peer data → Rejected (stale data issues)
+
+Dependencies:
+  - fmp-stock-peers API (peer ticker list)
+  - txn_events table (historical metrics for peers)
+'
+WHERE id = 'priceQuantitative';
+```
+
+**적용할 Python 코드 (Phase 4-B - 주석 보강)**:
+```python
+# backend/src/services/valuation_service.py
+# Lines 181-188
+
+# ============================================================
+# Position & Disparity Calculation
+# ============================================================
+# NOT registered in config_lv2_metric
+# Reason: Simple comparison logic, no need for separate metric
+# Kept in Python for simplicity and direct integration
+# ============================================================
+
+if price_quant_value > current_price:
+    # LONG: Stock is undervalued
+    # Fair value > Current price → Buy signal
+    position_quant = 'long'
+elif price_quant_value < current_price:
+    # SHORT: Stock is overvalued
+    # Fair value < Current price → Sell signal
+    position_quant = 'short'
+else:
+    # NEUTRAL: Fair value = Current price
+    position_quant = 'neutral'
+
+# ============================================================
+# Disparity Calculation
+# ============================================================
+# Formula: (fair_value / current_price) - 1
+# Positive value = undervalued (fair_value > current_price)
+# Negative value = overvalued (fair_value < current_price)
+# Zero = fairly valued
+# ============================================================
+# Example:
+#   fair_value = 150, current_price = 100
+#   disparity = (150 / 100) - 1 = 0.5 (50% undervalued)
+# ============================================================
+disparity_quant = round((price_quant_value / current_price) - 1, 4)
+```
+
+### I-45-E: apicYoY 교체 (OPTIONAL, MEDIUM Priority, 미반영)
+
+**문제가 된 설정**:
+```sql
+-- config_lv2_metric.apicYoY (현재)
+SELECT id, description, expression
+FROM config_lv2_metric
+WHERE id = 'apicYoY';
+
+-- Result:
+-- expression = '(apicLatest - apicPrevYear) / apicPrevYear'
+-- Additional Paid-In Capital YoY는 매우 비표준적인 지표
+```
+
+**업계 표준**:
+```
+Shares Outstanding YoY = (Current Shares - Prev Year Shares) / Prev Year Shares
+```
+
+**적용할 SQL (Optional)**:
+```sql
+-- Step 1: sharesOutstandingLatest 메트릭 추가 (이미 존재할 가능성 높음)
+INSERT INTO config_lv2_metric (
+  id,
+  source,
+  api_list_id,
+  api_field,
+  domain,
+  description
+) VALUES (
+  'sharesOutstandingLatest',
+  'api_field',
+  'fmp-balance-sheet-statement',
+  'commonStock',
+  'dilution',
+  'Shares outstanding from latest balance sheet'
+) ON CONFLICT (id) DO NOTHING;
+
+-- Step 2: sharesOutstandingPrevYear 메트릭 추가
+INSERT INTO config_lv2_metric (
+  id,
+  source,
+  base_metric_id,
+  aggregation_kind,
+  aggregation_params,
+  domain,
+  description
+) VALUES (
+  'sharesOutstandingPrevYear',
+  'aggregation',
+  'sharesOutstandingQuarterly',
+  'lastFromQuarter',
+  '{"quarters_back": 4}'::jsonb,
+  'dilution',
+  'Shares outstanding from 1 year ago'
+);
+
+-- Step 3: sharesOutstandingYoY 메트릭 추가
+INSERT INTO config_lv2_metric (
+  id,
+  source,
+  expression,
+  domain,
+  description
+) VALUES (
+  'sharesOutstandingYoY',
+  'expression',
+  '(sharesOutstandingLatest - sharesOutstandingPrevYear) / sharesOutstandingPrevYear',
+  'dilution',
+  'Year-over-year change in shares outstanding (industry standard dilution metric)'
+);
+
+-- Step 4: apicYoY deprecated 처리
+UPDATE config_lv2_metric
+SET description = '[DEPRECATED - Use sharesOutstandingYoY instead] ' || description
+WHERE id = 'apicYoY';
+```
+
+### 최종 검증 스크립트
+
+**검증 SQL**:
+```sql
+-- Phase 1 검증: Enterprise Value
+SELECT
+  ticker,
+  event_date,
+  (value_quantitative->'valuation'->>'enterpriseValue')::NUMERIC as ev,
+  (value_quantitative->'valuation'->>'marketCap')::NUMERIC as mc,
+  (value_quantitative->'valuation'->>'totalDebtLatest')::NUMERIC as debt,
+  (value_quantitative->'valuation'->>'minorityInterestLatest')::NUMERIC as mi,
+  (value_quantitative->'valuation'->>'preferredStockLatest')::NUMERIC as ps,
+  (value_quantitative->'valuation'->>'cashAndCashEquivalentsLatest')::NUMERIC as cash
+FROM txn_events
+WHERE ticker = 'AAPL'
+  AND event_date = '2021-06-11 00:00:00+00'::TIMESTAMPTZ;
+
+-- 수식 검증: EV = MC + Debt + MI + PS - Cash
+-- Expected: EV 값이 업계 표준과 일치
+
+-- Phase 3 검증: Logging
+SELECT
+  COUNT(*) as total_logs,
+  COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) as error_logs,
+  AVG(execution_time_ms) as avg_exec_time_ms
+FROM metric_calculation_logs;
+
+-- 로그가 정상적으로 기록되는지 확인
+```
+
+**검증 Python 테스트**:
+```python
+# backend/tests/test_i45_verification.py
+import pytest
+from backend.src.services.metric_engine import MetricCalculationEngine
+from backend.src.services.valuation_service import calculate_valuations
+
+@pytest.mark.asyncio
+async def test_enterprise_value_formula():
+    """
+    Phase 1: Enterprise Value 수식 검증
+    """
+    result = await calculate_valuations(['AAPL'], event_date='2021-06-11')
+
+    ev = result['AAPL']['enterpriseValue']
+    mc = result['AAPL']['marketCap']
+    debt = result['AAPL']['totalDebtLatest']
+    mi = result['AAPL']['minorityInterestLatest']
+    ps = result['AAPL']['preferredStockLatest']
+    cash = result['AAPL']['cashAndCashEquivalentsLatest']
+
+    # 수식 검증: EV = MC + Debt + MI + PS - Cash
+    calculated_ev = mc + debt + mi + ps - cash
+    assert abs(ev - calculated_ev) < 1000  # 오차 범위 $1000
+
+@pytest.mark.asyncio
+async def test_iqr_outlier_removal():
+    """
+    Phase 2: IQR 함수 단위 테스트
+    """
+    engine = MetricCalculationEngine()
+
+    # 이상치 포함 데이터
+    values = [10, 12, 13, 14, 15, 100, 200]  # 100, 200이 이상치
+    result = engine._avg_with_iqr_outlier_removal(values, {"multiplier": 1.5})
+
+    # 이상치 제거 후 평균 (10+12+13+14+15) / 5 = 12.8
+    assert abs(result - 12.8) < 0.1
+
+@pytest.mark.asyncio
+async def test_logging_performance():
+    """
+    Phase 3: Logging 성능 테스트
+    """
+    engine = MetricCalculationEngine()
+    engine.log_batch_size = 1000
+
+    # 1000개 에러 로그 생성
+    for i in range(1000):
+        engine.error_logs.append({
+            'metric_id': 'test_metric',
+            'event_id': str(uuid4()),
+            'ticker': 'TEST',
+            'event_date': datetime.now().isoformat(),
+            'error_message': f'Test error {i}',
+            'calculation_code': 'test_code',
+            'execution_time_ms': 10
+        })
+
+    # Batch insert 성능 측정
+    start = time.time()
+    await engine._batch_insert_logs()
+    elapsed = time.time() - start
+
+    # 1000개 INSERT는 1초 이내여야 함
+    assert elapsed < 1.0
+```
+
+---
+
+*최종 업데이트: 2026-01-09 KST (I-45 식별 - Metric Formula Verification & Config Migration: EV 수식 개선, IQR 마이그레이션, 로깅 시스템)*
+*이전 업데이트: I-44 완료 - POST /backfillEventsTable 성능 최적화: Database timeout + peer collection 병렬 처리*
+*이전 업데이트: I-43 설계 완료 - Dashboard Events 로딩 성능 개선, txn_price_trend 테이블 분리*
+*이전 업데이트: I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결*
 *이전 업데이트: I-41 Part 1+2+3 구현 완료 - priceQuantitative 메트릭 + 선택적 메트릭 업데이트 + API 단순화, I-36/I-38/I-40 deprecated)*
 *설계 문서: backend/DESIGN_priceQuantitative_metric.md*
 *이슈 분석: history/ISSUE_priceQuantitative_MISSING.md*

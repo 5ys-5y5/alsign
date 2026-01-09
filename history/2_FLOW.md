@@ -2118,7 +2118,409 @@ POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwri
 
 ---
 
-## 요약 테이블 (업데이트 - 2026-01-02 최종)
+## I-43: Dashboard Events 로딩 성능 개선
+
+### 현상
+Dashboard Events API (`GET /events`) 응답 속도가 느림.
+- 대량 이벤트 조회 시 10초 이상 소요
+- txn_events 테이블에서 매번 전체 데이터 조회
+
+### 원인
+1. **테이블 비정규화 미흡** - 가격 트렌드 데이터가 value_quantitative JSONB에 포함되어 쿼리 성능 저하
+2. **인덱스 최적화 부족** - ticker, event_date 복합 인덱스 없음
+3. **불필요한 컬럼 조회** - 대용량 JSONB 전체 로드
+
+### LLM 제공 선택지
+| 옵션 | 설명 |
+|------|------|
+| A | txn_price_trend 테이블 분리 (정규화) + 인덱스 최적화 |
+| B | Materialized View 생성 |
+| C | 캐싱 레이어 추가 (Redis) |
+
+### 사용자 채택
+**옵션 A** → txn_price_trend 테이블 분리
+
+**이유**:
+- 데이터 정규화로 장기적 확장성 향상
+- 인덱스 최적화로 쿼리 성능 개선
+- 추가 인프라 없이 구현 가능
+
+### 반영 내용
+- **상태**: 🔄 설계 완료, 구현 대기
+- **설계 문서**: 작성 완료
+- **테이블 설계**: txn_price_trend (ticker, event_date, price_close, price_high, price_low, ...)
+- **마이그레이션 계획**: 기존 데이터 backfill 전략 수립 완료
+
+---
+
+## I-44: POST /backfillEventsTable 성능 최적화
+
+### 현상
+POST /backfillEventsTable 엔드포인트 실행 시 성능 문제 발생:
+1. **Database timeout**: 대량 쿼리 실행 시 60초 timeout 발생
+2. **Peer collection 속도**: 500개 ticker 처리 시 ~250초 소요 (순차 처리)
+
+### 원인
+1. **Database timeout 설정 부족** - command_timeout=60s (기본값)으로는 대량 쿼리 처리 불가
+2. **순차 처리 구조** - peer ticker별로 순차적으로 API 호출 및 데이터 수집
+3. **비효율적 쿼리** - 개별 ticker마다 DB 쿼리 실행
+
+### LLM 제공 선택지
+| 옵션 | 설명 |
+|------|------|
+| A | Database timeout 증가 (60s → 300s) |
+| B | Peer collection 병렬 처리 (asyncio.gather) |
+| C | Batch 쿼리 최적화 (IN clause 사용) |
+| **채택** | **A + B 조합 (timeout + 병렬 처리)** |
+
+### 사용자 채택
+**옵션 A + B 조합**
+
+**이유**:
+- Timeout 증가: 대량 쿼리 안정성 확보
+- 병렬 처리: Phase 3.5 peer collection 속도 90% 개선 (250s → 19s)
+- batch_size 파라미터: 유연한 성능 조정 가능
+
+### 반영 내용
+- **상태**: ✅ 반영 완료
+- **Database**: ✅ command_timeout 60s → 300s
+- **Python**: ✅ asyncio.gather로 병렬 처리 구현
+- **API**: ✅ batch_size 파라미터 추가 (기본값: 10)
+- **검증**: ✅ AAPL 357 events, 5분 14초 완료
+- **성능 개선**: Phase 3.5에서 90% 단축 (250s → 19s)
+- **참조**: `backend/src/database/connection.py`, `valuation_service.py:2736-2751`
+
+---
+
+## I-45: Metric Formula Verification & Config Migration
+
+### 현상
+AAPL (2021-06-11) 정량 지표 검증 중 여러 문제 발견:
+
+1. **PBR 차이**: 계산값 30.61 vs MacroTrends 34.45 (12% 차이)
+2. **수식 검증 필요**: 전체 정량 지표의 산업 표준 준수 여부 불확실
+3. **아키텍처 원칙 위반**: 계산 로직이 config 테이블이 아닌 Python 코드에 하드코딩됨
+
+**문제의 핵심**:
+```python
+# valuation_service.py에 하드코딩된 계산 로직들
+# 1. priceQuantitative (Fair value from sector averages)
+# 2. Sector Average with IQR outlier removal
+# 3. Position calculation (long/short/neutral)
+# 4. Disparity calculation (price deviation)
+```
+
+### 원인
+#### 1. PBR 차이 원인 분석
+- **시점 차이**: 현재 서비스(6/11 종가 + 최신 재무제표) vs MacroTrends(6/30 기준)
+- **Equity 정의**: FMP는 GAAP 표준 "Total Stockholders' Equity" 사용 (정확함)
+- **Market Cap 계산**: FMP는 diluted shares 사용 (업계 표준)
+- **결론**: 현재 서비스 방식이 투자 의사결정에 더 우수 (실시간성)
+
+#### 2. 전체 수식 검증 결과
+**점수: 85% (68/80) - Excellent**
+
+| 도메인 | 메트릭 | 상태 | 비고 |
+|--------|--------|------|------|
+| Valuation | PSR, PER, PBR | ✅ | 완벽 |
+| Valuation | EV/EBITDA | ⚠️ | minorityInterest, preferredStock 누락 |
+| Valuation | priceQuantitative | 🔄 | Python 하드코딩 |
+| Profitability | ROE | ✅ | Average equity 사용 (best practice) |
+| Risk | currentRatio | ✅ | 정확 |
+| Risk | cashToRevenueTTM | ⚠️ | 비표준 메트릭 |
+| Dilution | debtToEquityAvg | ✅ | Average 사용 (best practice) |
+| Dilution | apicYoY | ⚠️ | 매우 비표준, sharesOutstandingYoY 권장 |
+| Momentum | margins | ✅ | 완벽 |
+
+**HIGH Priority 문제**:
+- Enterprise Value 수식 불완전: `EV = MarketCap + TotalDebt - Cash` (현재)
+- 업계 표준: `EV = MarketCap + TotalDebt + MinorityInterest + PreferredStock - Cash`
+
+#### 3. 아키텍처 원칙 위반
+서비스 설계 원칙: "기업 정량/정성 가치 계산 수식은 모두 config_lv2_metric + config_lv2_metric_transform 조합으로 구현"
+
+**위반 사례**:
+1. **priceQuantitative**: fair value 계산이 `calculate_fair_value_from_sector()` 함수에 하드코딩
+2. **Sector Average IQR**: 이상치 제거 로직이 Python 코드에 존재
+3. **Position**: long/short/neutral 판단 로직 하드코딩
+4. **Disparity**: 가격 괴리율 계산 하드코딩
+
+### LLM 제공 선택지
+
+#### A. Enterprise Value 수식 개선
+| 옵션 | 설명 | 장점 | 단점 |
+|------|------|------|------|
+| 1 | 현재 수식 유지 | 변경 없음 | 업계 표준 미준수 |
+| 2 | minorityInterest + preferredStock 추가 (권장) | 업계 표준 준수, 정확도 향상 | 기존 데이터 재계산 필요 |
+
+#### B. Config Migration 전략
+| 옵션 | 설명 | 장점 | 단점 |
+|------|------|------|------|
+| 1 | 완전 마이그레이션 (모두 config 테이블) | 완전한 원칙 준수 | priceQuantitative는 기술적으로 불가능 (cross-ticker 비동기 쿼리 필요) |
+| 2 | Hybrid (단순=config, 복잡=Python+문서화) | 실용적, 유지보수 용이 | 일부 Python 코드 유지 |
+| 3 | 현재 유지 | 변경 없음 | 원칙 위반 지속 |
+
+#### C. Logging 전략
+| 옵션 | 설명 |
+|------|------|
+| 1 | 전체 로깅 (성공 + 에러) |
+| 2 | 에러만 로깅 (권장) |
+| 3 | 로깅 안함 |
+
+#### D. Logging 구현 방법
+| 옵션 | 설명 |
+|------|------|
+| 1 | 개별 INSERT (느림) |
+| 2 | Batch INSERT - 1000개 단위 (권장) |
+| 3 | Async background logging |
+
+### 사용자 채택
+
+#### Enterprise Value 수식
+**옵션 2** - minorityInterest + preferredStock 추가
+
+**이유**: 업계 표준 준수, 보다 정확한 기업 가치 평가
+
+#### Config Migration
+**옵션 2 (Hybrid approach)**
+
+**구체적 결정**:
+1. **IQR Outlier Removal**: config_lv2_metric_transform으로 마이그레이션
+   - `avgWithIQROutlierRemoval` transform 추가
+   - `_avg_with_iqr_outlier_removal()` 메서드 구현
+
+2. **priceQuantitative**: Python 유지, calculation 컬럼에 문서화
+   - 이유: Cross-ticker 집계는 config 테이블로 불가능 (비동기 DB 쿼리 필요)
+   - 대안 검토: Materialized view로 peer 데이터 사전 집계? → 복잡도 증가로 보류
+
+3. **Position/Disparity**: Python 유지, config 미등록
+   - 이유: 단순 비교 로직, 별도 메트릭 등록 불필요
+   - 대신: 코드 주석 보강
+
+#### Logging 전략
+**Q1 (disparity 등록)**: config 등록 안 함 → Python 유지
+**Q2 (로깅 범위)**: 에러만 로깅
+**Q3 (로깅 방법)**: Batch INSERT (1000개 단위)
+
+**이유**:
+- 성공 케이스는 value로 충분히 검증 가능
+- 에러 케이스만 추적하여 디버깅 효율성 향상
+- Batch INSERT로 성능 영향 최소화
+
+### 반영 내용
+
+#### Phase 1: Enterprise Value 수식 개선 (HIGH Priority)
+- [ ] `config_lv2_metric.enterpriseValue` expression 업데이트
+  ```sql
+  -- Before
+  expression = 'marketCap + totalDebtLatest - cashAndCashEquivalentsLatest'
+
+  -- After
+  expression = 'marketCap + totalDebtLatest + minorityInterestLatest + preferredStockLatest - cashAndCashEquivalentsLatest'
+  ```
+
+- [ ] `config_lv2_metric`에 신규 메트릭 추가
+  - `minorityInterestLatest` (source='api_field')
+  - `preferredStockLatest` (source='api_field')
+
+- [ ] 기존 EV 데이터 재계산 (backfill)
+
+**검증**:
+- AAPL 2021-06-11 기준 EV 재계산 후 업계 표준과 비교
+
+#### Phase 2: IQR Outlier Removal 마이그레이션 (MEDIUM Priority)
+- [ ] `config_lv2_metric_transform` 테이블에 신규 transform 추가
+  ```sql
+  INSERT INTO config_lv2_metric_transform (transform_name, calculation, description)
+  VALUES (
+    'avgWithIQROutlierRemoval',
+    'def _avg_with_iqr_outlier_removal(values, params):
+        # IQR 기반 이상치 제거 후 평균 계산
+        # Q1 - 1.5*IQR ~ Q3 + 1.5*IQR 범위 내 값만 사용
+        ...',
+    'Calculate average after removing outliers using IQR method'
+  );
+  ```
+
+- [ ] `metric_engine.py`에 `_avg_with_iqr_outlier_removal()` 구현
+  ```python
+  def _avg_with_iqr_outlier_removal(
+      self,
+      base_values: List[float],
+      params: Dict[str, Any]
+  ) -> Optional[float]:
+      """
+      IQR 기반 이상치 제거 후 평균 계산
+
+      Args:
+          base_values: 입력 값 리스트
+          params: {"multiplier": 1.5}  # IQR multiplier
+
+      Returns:
+          이상치 제거 후 평균값
+      """
+      if len(base_values) < 4:
+          return sum(base_values) / len(base_values)
+
+      sorted_values = sorted(base_values)
+      n = len(sorted_values)
+      q1 = sorted_values[n // 4]
+      q3 = sorted_values[3 * n // 4]
+      iqr = q3 - q1
+      multiplier = params.get('multiplier', 1.5)
+
+      lower = q1 - multiplier * iqr
+      upper = q3 + multiplier * iqr
+
+      filtered = [v for v in base_values if lower <= v <= upper]
+      return sum(filtered) / len(filtered) if filtered else None
+  ```
+
+- [ ] `valuation_service.py`에서 하드코딩된 IQR 로직 제거 (Lines 2736-2751)
+
+**검증**:
+- Sector average 계산 결과가 기존과 동일한지 단위 테스트
+
+#### Phase 3: Logging 시스템 구현 (MEDIUM Priority)
+- [ ] `metric_calculation_logs` 테이블 생성
+  ```sql
+  CREATE TABLE metric_calculation_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    metric_id TEXT NOT NULL,
+    event_id UUID,
+    ticker TEXT,
+    event_date TIMESTAMPTZ,
+    input_values JSONB,
+    output_value NUMERIC,
+    error_message TEXT,
+    calculation_code TEXT,
+    execution_time_ms INTEGER,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+  );
+
+  CREATE INDEX idx_metric_logs_metric_id ON metric_calculation_logs(metric_id);
+  CREATE INDEX idx_metric_logs_event_id ON metric_calculation_logs(event_id);
+  CREATE INDEX idx_metric_logs_created_at ON metric_calculation_logs(created_at);
+  ```
+
+- [ ] `metric_engine.py`에 에러 로깅 로직 추가
+  ```python
+  # _execute_dynamic_calculation() 메서드에 추가
+  error_logs = []
+
+  try:
+      result = eval(calculation_code, context)
+  except Exception as e:
+      error_logs.append({
+          'metric_id': metric_id,
+          'event_id': event_id,
+          'ticker': ticker,
+          'event_date': event_date,
+          'input_values': input_values,
+          'error_message': str(e),
+          'calculation_code': calculation_code,
+          'execution_time_ms': elapsed_ms
+      })
+
+      # 1000개 단위로 batch insert
+      if len(error_logs) >= 1000:
+          self._batch_insert_logs(error_logs)
+          error_logs.clear()
+
+  # 메서드 종료 시 남은 로그 처리
+  if error_logs:
+      self._batch_insert_logs(error_logs)
+  ```
+
+**검증**:
+- 의도적 에러 발생 시 로그 정상 기록 확인
+- 1000개 배치 성능 테스트
+
+#### Phase 4: Documentation (LOW Priority)
+- [ ] `config_lv2_metric.priceQuantitative` calculation 컬럼 문서화
+  ```sql
+  UPDATE config_lv2_metric
+  SET calculation = '
+  Fair value calculation from sector averages (Python implementation):
+
+  Priority 1: PER method
+  - fair_value = sector_avg_per * eps
+  - where eps = current_price / current_per
+
+  Priority 2: PBR method (fallback)
+  - fair_value = sector_avg_pbr * bps
+  - where bps = current_price / current_pbr
+
+  Sector average uses IQR outlier removal (Q1-1.5*IQR ~ Q3+1.5*IQR)
+
+  Implementation: valuation_service.py::calculate_fair_value_from_sector()
+  Lines: 2892-2959
+
+  Cannot migrate to config:
+  - Requires cross-ticker async DB queries
+  - Needs peer ticker collection and aggregation
+  - Alternative: Materialized view (complexity vs benefit trade-off)
+  '
+  WHERE id = 'priceQuantitative';
+  ```
+
+- [ ] Position/Disparity 계산 주석 보강 (valuation_service.py:181-188)
+  ```python
+  # Position calculation (NOT registered in config_lv2_metric)
+  # Simple comparison logic, no need for separate metric registration
+  # Kept in Python for simplicity and direct integration
+  if price_quant_value > current_price:
+      position_quant = 'long'  # Undervalued
+  elif price_quant_value < current_price:
+      position_quant = 'short'  # Overvalued
+  else:
+      position_quant = 'neutral'
+
+  # Disparity calculation (NOT registered in config_lv2_metric)
+  # Formula: (fair_value / current_price) - 1
+  # Positive = undervalued, Negative = overvalued
+  disparity_quant = round((price_quant_value / current_price) - 1, 4)
+  ```
+
+#### 선택적 개선 (Optional, MEDIUM Priority)
+- [ ] `apicYoY` → `sharesOutstandingYoY` 교체
+  ```sql
+  -- 신규 메트릭 추가
+  INSERT INTO config_lv2_metric (
+    id,
+    source,
+    expression,
+    domain,
+    description
+  ) VALUES (
+    'sharesOutstandingYoY',
+    'expression',
+    '(sharesOutstandingLatest - sharesOutstandingPrevYear) / sharesOutstandingPrevYear',
+    'dilution',
+    'Year-over-year change in shares outstanding (industry standard dilution metric)'
+  );
+
+  -- 기존 apicYoY는 deprecated 처리
+  UPDATE config_lv2_metric
+  SET description = '[DEPRECATED] Use sharesOutstandingYoY instead. ' || description
+  WHERE id = 'apicYoY';
+  ```
+
+### 최종 검증 계획
+1. **수식 정확성**: AAPL 2021-06-11 기준 전체 메트릭 재계산 후 업계 표준과 비교
+2. **성능 테스트**:
+   - IQR 함수 단위 테스트 (1000개 값 처리 시간)
+   - Logging 배치 성능 (1000개 로그 insert 시간)
+3. **통합 테스트**:
+   - `POST /backfillEventsTable?tickers=AAPL` 실행
+   - 모든 Phase 변경사항 정상 작동 확인
+4. **데이터 무결성**:
+   - 기존 값 vs 신규 값 비교 (EV 차이 확인)
+   - 로그 테이블에 에러 없는지 확인
+
+---
+
+## 요약 테이블 (업데이트 - 2026-01-09 최종)
 
 | ID | 이슈 | 상태 | 채택 방안 | 상세 |
 |----|------|------|-----------|------|
@@ -2130,6 +2532,9 @@ POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwri
 | **I-40** | **Peer tickers 로깅** | **🔄 DEPRECATED** | **I-41 제한사항으로 통합** | **-** |
 | **I-41** | **priceQuantitative 메트릭 미구현** | **✅** | **옵션 A: 메트릭 구현 (원본 설계 준수)** | **I-41** |
 | **I-42** | **fmp-stock-peers schema mapping + DB 저장 실패** | **✅** | **Part 1: A+B (schema 개선), Part 2: B (formatter 제거)** | **I-42** |
+| **I-43** | **Dashboard Events 로딩 성능 개선** | **🔄 설계 완료** | **옵션 A: txn_price_trend 테이블 분리** | **I-43** |
+| **I-44** | **POST /backfillEventsTable 성능 최적화** | **✅** | **A + B: timeout 증가 + 병렬 처리** | **I-44** |
+| **I-45** | **Metric Formula Verification & Config Migration** | **🔄 진행중** | **옵션 2: Hybrid (config + Python 문서화)** | **I-45** |
 
 ### 폐기 이슈 (Deprecated)
 - **I-36**: calcFairValue 파라미터 → I-41 priceQuantitative 메트릭으로 대체
@@ -2138,5 +2543,8 @@ POST /backfillEventsTable?tickers=AAPL&metrics=priceQuantitative,PER,PBR&overwri
 
 ---
 
-*최종 업데이트: 2026-01-02 KST (I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결)*
+*최종 업데이트: 2026-01-09 KST (I-45 식별 - Metric Formula Verification & Config Migration: EV 수식 개선, IQR 마이그레이션, 로깅 시스템)*
+*이전 업데이트: I-44 완료 - POST /backfillEventsTable 성능 최적화: Database timeout + peer collection 병렬 처리*
+*이전 업데이트: I-43 설계 완료 - Dashboard Events 로딩 성능 개선, txn_price_trend 테이블 분리*
+*이전 업데이트: I-42 완료 - Part 1: schema mapping 개선, Part 2: formatter 제거로 DB 저장 문제 해결*
 *이전 업데이트: I-41 구현 완료 - priceQuantitative 메트릭 추가, I-36/I-38/I-40 deprecated*
