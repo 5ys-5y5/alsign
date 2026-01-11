@@ -70,6 +70,11 @@ class SourceDataQueryParams(BaseModel):
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
 
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose logging. If true, outputs detailed per-mode and per-ticker logs. If false (default), outputs only summary logs for efficient problem identification."
+    )
+
     @validator('mode')
     def validate_mode(cls, v):
         """Validate mode parameter contains only allowed values."""
@@ -221,6 +226,11 @@ class SetEventsTableQueryParams(BaseModel):
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
 
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose logging. If true, outputs detailed per-table and per-event logs. If false (default), outputs only summary logs for efficient problem identification."
+    )
+
     @validator('table')
     def validate_table(cls, v):
         """Validate table parameter matches evt_* pattern."""
@@ -274,6 +284,11 @@ class BackfillEventsTableQueryParams(BaseModel):
         ge=1,
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
+    )
+
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose logging. If true, outputs detailed per-event and per-ticker logs. If false (default), outputs only summary logs for efficient problem identification."
     )
 
     def get_ticker_list(self) -> Optional[List[str]]:
@@ -336,6 +351,79 @@ class FillAnalystQueryParams(BaseModel):
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
+
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose logging. If true, outputs detailed per-analyst and per-group logs. If false (default), outputs only summary logs for efficient problem identification."
+    )
+
+
+class QuantitativesQueryParams(BaseModel):
+    """Query parameters for POST /getQuantitatives endpoint."""
+
+    model_config = ConfigDict(extra='forbid', populate_by_name=True)
+
+    overwrite: bool = Field(
+        default=False,
+        description="If true, refetch all APIs even if data exists. If false, skip APIs with existing data."
+    )
+
+    apis: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of APIs to fetch. Available: ratios,key-metrics,cash-flow,balance-sheet,market-cap,price,income,quote. If not specified, fetches all APIs."
+    )
+
+    tickers: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. If not specified, processes all targets and their peers."
+    )
+
+    max_workers: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
+    )
+
+    verbose: bool = Field(
+        default=False,
+        description="Enable verbose logging. If true, outputs detailed per-ticker and per-API logs. If false (default), outputs only summary logs for efficient problem identification."
+    )
+
+    def get_api_list(self) -> Optional[List[str]]:
+        """
+        Parse apis parameter into a list of API names.
+
+        Returns:
+            List of API names, or None if apis parameter is not provided
+        """
+        if self.apis is None:
+            return None
+
+        # Split by comma and clean up whitespace
+        api_list = [api.strip() for api in self.apis.split(',') if api.strip()]
+
+        return api_list if api_list else None
+
+    def get_ticker_list(self) -> Optional[List[str]]:
+        """
+        Parse tickers parameter into a list of ticker symbols.
+
+        Returns:
+            List of ticker symbols, or None if tickers parameter is not provided
+        """
+        if self.tickers is None:
+            return None
+
+        # Remove brackets if present and split by comma
+        tickers_str = self.tickers.strip()
+        if tickers_str.startswith('[') and tickers_str.endswith(']'):
+            tickers_str = tickers_str[1:-1]
+
+        # Split by comma and clean up whitespace
+        ticker_list = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
+
+        return ticker_list if ticker_list else None
 
 
 class TradeRecord(BaseModel):

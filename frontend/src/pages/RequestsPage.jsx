@@ -805,6 +805,13 @@ export default function RequestsPage() {
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
             },
+            {
+              key: 'verbose',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '상세 로그 출력. true면 모드별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
+            },
             { ...TIMEOUT_FIELD },
           ]}
           onRequestStart={handleRequestStart}
@@ -850,6 +857,13 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 ticker worker 수 (1-100). DB CPU에 따라 조정. 기본값: 20',
+            },
+            {
+              key: 'verbose',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '상세 로그 출력. true면 티커별, API별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}
@@ -900,6 +914,13 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            {
+              key: 'verbose',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '상세 로그 출력. true면 테이블별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}
@@ -976,6 +997,13 @@ export default function RequestsPage() {
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
             },
+            {
+              key: 'verbose',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '상세 로그 출력. true면 이벤트별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
+            },
             { ...TIMEOUT_FIELD },
           ]}
           bodyFields={[
@@ -1037,6 +1065,13 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
+            },
+            {
+              key: 'verbose',
+              type: 'boolean',
+              control: 'checkbox',
+              required: false,
+              description: '상세 로그 출력. true면 티커별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}

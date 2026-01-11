@@ -22,6 +22,7 @@ from ..utils.logging_utils import (
 from .utils.batch_utils import calculate_eta, format_eta_ms
 from .utils.quantitative_cache import (
     get_peer_tickers_from_db,
+    get_batch_peer_tickers_from_db,
     get_quantitative_data_from_db,
     get_batch_quantitative_data_from_db,
     calculate_sector_average_from_cache,
@@ -110,6 +111,9 @@ async def process_single_event_parallel(
     event_id_str = str(event_id) if event_id else "unknown"
     row_context = f"[table: txn_events | id: {event_id_str}]"
 
+    # Define key metrics to track for summary logging
+    track_metrics = ['PER', 'PBR', 'PSR', 'priceQuantitative', 'ROE', 'ROA']
+
     try:
         # I-41: Prepare custom_values for priceQuantitative metric
         custom_values = {}
@@ -161,10 +165,10 @@ async def process_single_event_parallel(
                 if fair_value is not None:
                     custom_values['priceQuantitative'] = fair_value
 
-        # Calculate quantitative metrics with custom values
+        # Calculate quantitative metrics with custom values and track key metrics
         quant_result = await calculate_quantitative_metrics_fast(
             ticker, event_date, ticker_api_cache, engine, target_domains,
-            custom_values=custom_values
+            custom_values=custom_values, track_metrics=track_metrics
         )
 
         # Calculate positions and disparities
@@ -251,17 +255,15 @@ async def process_single_event_parallel(
                 'sectorAverages': sector_averages
             }
 
-        # Log success concisely
-        if quant_result['status'] == 'success':
-            logger.info(f"Success: txn_events.id={event_id_str}")
-        else:
-            logger.error(f"Failed: txn_events.id={event_id_str}, reason={quant_result.get('message', 'Unknown')}")
+        # Log at debug level only (remove per-event logs to prevent excessive output)
+        if quant_result['status'] != 'success':
+            logger.debug(f"Failed: txn_events.id={event_id_str}, reason={quant_result.get('message', 'Unknown')}")
 
         # Remove _meta from value_quantitative before storing
         value_quant_cleaned = remove_meta_from_value_quantitative(value_quant)
 
         # Return update dictionary
-        return {
+        result = {
             'ticker': ticker,
             'event_date': event_date,
             'source': source,
@@ -278,6 +280,12 @@ async def process_single_event_parallel(
             'qual_status': qual_result['status'],
             'event_id': event_id
         }
+
+        # Add metric_status for summary logging
+        if 'metric_status' in quant_result:
+            result['metric_status'] = quant_result['metric_status']
+
+        return result
 
     except Exception as e:
         logger.error(f"Failed: txn_events.id={event_id_str}, reason={str(e)}")
@@ -369,25 +377,26 @@ async def batch_calculate_qualitative_parallel(
     pool,
     ticker: str,
     events: List[Dict[str, Any]],
-    consensus_summary_cache: Optional[Dict],
+    engine: MetricCalculationEngine,
     max_concurrent: int = MAX_CONCURRENT_QUALITATIVE
 ) -> Dict[str, Dict]:
     """
-    Calculate qualitative metrics for all events in parallel with concurrency control.
+    Batch calculate qualitative metrics for multiple events (DB-driven).
 
-    This function uses asyncio.Semaphore to limit concurrent OpenAI API calls,
-    respecting rate limits while maximizing throughput.
+    Uses calculate_qualitative_metrics_fast which:
+    - Fetches priceTarget data from evt_consensus (DB)
+    - Delegates calculation to MetricCalculationEngine (DB calculation code)
 
     Args:
         pool: Database connection pool
         ticker: Ticker symbol
-        events: List of events to process
-        consensus_summary_cache: Consensus data cache (optional)
-        max_concurrent: Maximum concurrent API calls (default: 10)
+        events: List of events for this ticker
+        engine: Pre-initialized MetricCalculationEngine
+        max_concurrent: Max concurrent calculations
 
     Returns:
-        Dict[event_key, qual_result]
-        Example: {"2024-01-15_earning_123": {...}, ...}
+        Dict mapping event_key to qualitative result
+        Example: {"2024-01-15_consensus_uuid": {"status": "success", ...}, ...}
     """
     semaphore = asyncio.Semaphore(max_concurrent)
 
@@ -401,23 +410,17 @@ async def batch_calculate_qualitative_parallel(
             # Create unique key for this event
             event_key = f"{event_date}_{source}_{source_id}"
 
-            try:
-                qual_result = await calculate_qualitative_metrics_fast(
-                    pool, ticker, event_date, source, source_id, consensus_summary_cache
-                )
-                return event_key, qual_result
-            except Exception as e:
-                logger.error(f"Failed: txn_events qualitative calculation for {ticker}, reason={str(e)}")
-                return event_key, {
-                    'status': 'failed',
-                    'message': f'Qualitative calculation failed: {str(e)}',
-                    'currentPrice': None
-                }
+            # Call DB-driven calculation
+            qual_result = await calculate_qualitative_metrics_fast(
+                pool, ticker, event_date, source, source_id, engine
+            )
+
+            return event_key, qual_result
 
     # Create tasks for all events
     tasks = [calculate_with_limit(event) for event in events]
 
-    # Execute all tasks in parallel (with semaphore limiting concurrency)
+    # Execute all tasks in parallel
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Convert results to dict
@@ -427,7 +430,6 @@ async def batch_calculate_qualitative_parallel(
             event_key, qual_result = result
             qual_cache[event_key] = qual_result
         else:
-            # Handle unexpected exceptions
             logger.error(f"Failed: Unexpected exception during qualitative calculation: {result}")
 
     return qual_cache
@@ -461,7 +463,8 @@ async def process_ticker_batch(
     completed_events_count: Dict[str, int] = None,
     metrics_list: Optional[List[str]] = None,
     global_peer_cache: Dict[str, Dict[str, Any]] = None,
-    ticker_to_peers: Dict[str, List[str]] = None
+    ticker_to_peers: Dict[str, List[str]] = None,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
     Process all events for a single ticker (with REAL API caching + GLOBAL PEER CACHE).
@@ -488,8 +491,9 @@ async def process_ticker_batch(
     quant_fail = 0
     qual_success = 0
     qual_fail = 0
-    
-    log_batch_start(logger, ticker, len(ticker_events))
+
+    if verbose:
+        log_batch_start(logger, ticker, len(ticker_events))
     
     # ========================================
     # CRITICAL: Fetch API data ONCE for ticker
@@ -524,12 +528,6 @@ async def process_ticker_batch(
                 'fail_counts': {'quant': len(ticker_events), 'qual': len(ticker_events)}
             }
 
-        # Consensus summary는 qualitative 계산에서 사용되지 않음
-        # calculate_qualitative_metrics_fast에서 evt_consensus 테이블을 직접 조회하므로
-        # 여기서는 None으로 설정
-        consensus_summary_cache = None
-
-        
         # OPTIMIZATION: Load transforms and engine ONCE per ticker (not per event!)
         transforms = await metrics.select_metric_transforms(pool)
         engine = MetricCalculationEngine(metrics_by_domain, transforms)
@@ -613,7 +611,7 @@ async def process_ticker_batch(
 
 
     qual_cache = await batch_calculate_qualitative_parallel(
-        pool, ticker, ticker_events, consensus_summary_cache, max_concurrent=MAX_CONCURRENT_QUALITATIVE
+        pool, ticker, ticker_events, engine, max_concurrent=MAX_CONCURRENT_QUALITATIVE
     )
 
     batch_updates = await batch_process_events_parallel(
@@ -670,8 +668,40 @@ async def process_ticker_batch(
     if completed_events_count is not None:
         completed_events_count['count'] = completed_events_count.get('count', 0) + len(ticker_events)
 
-    # Log ticker completion
-    log_batch_complete(logger, ticker, len(ticker_events), quant_success + qual_success, quant_fail + qual_fail)
+    # Log ticker completion (verbose only)
+    if verbose:
+        log_batch_complete(logger, ticker, len(ticker_events), quant_success + qual_success, quant_fail + qual_fail)
+
+    # ========================================
+    # TICKER SUMMARY: Aggregate metric status
+    # ========================================
+    # Collect metric status from all events and create summary
+    if batch_updates:
+        # Track metrics across all events
+        metric_totals = {}
+        for update in batch_updates:
+            if 'metric_status' in update:
+                for metric_name, success in update['metric_status'].items():
+                    if metric_name not in metric_totals:
+                        metric_totals[metric_name] = {'success': 0, 'fail': 0}
+                    if success:
+                        metric_totals[metric_name]['success'] += 1
+                    else:
+                        metric_totals[metric_name]['fail'] += 1
+
+        # Build summary string: metric1=o/x, metric2=o/x, ...
+        if metric_totals and verbose:
+            summary_parts = []
+            for metric_name in sorted(metric_totals.keys()):
+                success_count = metric_totals[metric_name]['success']
+                fail_count = metric_totals[metric_name]['fail']
+                total_count = success_count + fail_count
+
+                # Use unicode symbols: ✓ for success, ✗ for fail
+                summary_parts.append(f"{metric_name}={success_count}✓/{fail_count}✗")
+
+            # Log ticker-level summary (verbose mode only)
+            logger.info(f"[TICKER] {ticker}: {quant_success}✓/{quant_fail}✗ | {', '.join(summary_parts)}")
 
     return {
         'ticker': ticker,
@@ -697,7 +727,8 @@ async def calculate_valuations(
     cancel_event: Optional[asyncio.Event] = None,
     metrics_list: Optional[List[str]] = None,
     batch_size: Optional[int] = None,
-    max_workers: int = 20
+    max_workers: int = 20,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
     Calculate quantitative and qualitative valuations for all events in txn_events.
@@ -721,6 +752,8 @@ async def calculate_valuations(
         batch_size: Optional batch size for processing events. If None, processes all events in one batch.
         max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
                      Default: 20. Recommended: 10-30 depending on DB capacity.
+        verbose: Enable verbose logging. If True, outputs detailed per-event and per-ticker logs.
+                 If False (default), outputs only summary logs for efficient problem identification.
 
     Returns:
         Dict with summary and per-event results
@@ -736,115 +769,42 @@ async def calculate_valuations(
     
     from .utils.logging_utils import create_log_context
 
-    logger.info("=" * 80)
-    logger.info(
-        "[backfillEventsTable] START - Processing valuations",
-        extra=create_log_context(
-            endpoint='POST /backfillEventsTable',
-            phase='start',
-            elapsed_ms=0
-        )
-    )
-    logger.info(f"[backfillEventsTable] Parameters: overwrite={overwrite}, from_date={from_date}, to_date={to_date}, tickers={tickers}, batch_size={batch_size}")
-    logger.info("=" * 80)
+    logger.info(f"[backfillEventsTable] START - overwrite={overwrite}, from={from_date}, to={to_date}, tickers={tickers}, batch={batch_size}")
 
     pool = await db_pool.get_pool()
-    logger.info("[backfillEventsTable] Database pool acquired")
 
     # Phase 1: Load metric definitions
-    logger.info("[backfillEventsTable] Phase 1: Loading metric definitions")
-    logger.info(
-        "Loading metric definitions",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'load_metrics',
-            'elapsed_ms': 0,
-            'counters': {},
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
-    )
-
     try:
         metrics_by_domain = await metrics.select_metric_definitions(pool)
-        logger.info(f"[backfillEventsTable] Metrics loaded: {len(metrics_by_domain)} domains")
+        logger.info(f"[Phase 1] Loaded {len(metrics_by_domain)} metric domains")
     except Exception as e:
-        logger.error(f"[backfillEventsTable] FAILED to load metrics: {e}")
+        logger.error(f"[Phase 1] FAILED to load metrics: {e}")
         raise
 
     if not metrics_by_domain:
-        logger.warning(
-            "No metrics found in config_lv2_metric",
-            extra={
-                'endpoint': 'POST /backfillEventsTable',
-                'phase': 'load_metrics',
-                'elapsed_ms': int((time.time() - start_time) * 1000),
-                'counters': {},
-                'progress': {},
-                'rate': {},
-                'batch': {},
-                'warn': ['NO_METRICS_DEFINED']
-            }
-        )
+        logger.warning("[Phase 1] No metrics found in config_lv2_metric")
 
     # Phase 2: Load events to process
-    logger.info("[backfillEventsTable] Phase 2: Loading events from database")
-    logger.info(
-        "Loading events for valuation",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'load_events',
-            'elapsed_ms': 0,
-            'counters': {},
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
-    )
-
     phase2_start = time.time()
     try:
-        logger.info(f"[backfillEventsTable] Calling metrics.select_events_for_valuation...")
         events = await metrics.select_events_for_valuation(
             pool,
-            limit=batch_size,  # ✅ batch_size를 SELECT LIMIT로 적용
+            limit=batch_size,
             from_date=from_date,
             to_date=to_date,
-            tickers=tickers
+            tickers=tickers,
+            overwrite=overwrite,
+            metrics_list=metrics_list
         )
         phase2_elapsed = time.time() - phase2_start
-        logger.info("=" * 80)
-        logger.info(f"[backfillEventsTable] ✓ Phase 2 completed in {phase2_elapsed:.2f}s")
-        logger.info(f"[backfillEventsTable] Events loaded: {len(events)} events")
-        if tickers:
-            logger.info(f"[backfillEventsTable] Filtered by tickers: {tickers}")
-        logger.info("=" * 80)
+        logger.info(f"[Phase 2] Loaded {len(events)} events in {phase2_elapsed:.2f}s")
     except Exception as e:
-        logger.error("=" * 80)
-        logger.error(f"[backfillEventsTable] ✗ FAILED to load events: {e}")
-        logger.error("=" * 80)
+        logger.error(f"[Phase 2] FAILED to load events: {e}")
         raise
-
-    logger.info(
-        f"Processing {len(events)} events",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'load_events',
-            'elapsed_ms': int((time.time() - start_time) * 1000),
-            'counters': {'total': len(events)},
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
-    )
 
     # Early return if no events to process
     if len(events) == 0:
-        logger.info("[backfillEventsTable] No events to process - returning early")
+        logger.info("[backfillEventsTable] No events to process")
         summary = {
             'totalEventsProcessed': 0,
             'quantitativeSuccess': 0,
@@ -855,84 +815,45 @@ async def calculate_valuations(
             'priceTrendFail': 0,
             'elapsedMs': int((time.time() - start_time) * 1000)
         }
-        logger.info("=" * 80)
-        logger.info("[backfillEventsTable] COMPLETE - No events processed")
-        logger.info("=" * 80)
         return {
             'summary': summary,
             'results': []
         }
 
-    # BATCH PROCESSING: Log batch info (actual batching happens at query level via LIMIT)
-    if batch_size and len(events) > batch_size:
-        logger.info("=" * 80)
-        logger.warning(f"[BATCH] Note: Loaded {len(events)} events (more than batch_size={batch_size})")
-        logger.warning(f"[BATCH] Tip: For true batch processing, use date filters to limit events at query time")
-        logger.warning(f"[BATCH] Example: ?from_date=2024-01-01&to_date=2024-03-31&batch_size=5000")
-        logger.info("=" * 80)
-    elif batch_size:
-        logger.info(f"[BATCH] Batch size set to {batch_size}, but only {len(events)} events loaded (within limit)")
-
-    # Process all loaded events
-    logger.info("[backfillEventsTable] Processing all loaded events")
-
     # Phase 3: Group events by ticker
     phase3_start = time.time()
-    logger.info("=" * 80)
-    logger.info(f"[backfillEventsTable] Phase 3: Grouping {len(events)} events by ticker")
     ticker_groups = group_events_by_ticker(events)
     phase3_elapsed = time.time() - phase3_start
-    logger.info(f"[backfillEventsTable] ✓ Phase 3 completed in {phase3_elapsed:.2f}s - grouped into {len(ticker_groups)} tickers")
-    logger.info("=" * 80)
+    logger.info(f"[Phase 3] Grouped {len(events)} events into {len(ticker_groups)} tickers ({phase3_elapsed:.2f}s)")
 
-    # Phase 3.5: Global Peer Collection & Parallel Fetching (DB-BASED - NO API CALLS!)
-    logger.info("=" * 80)
-    logger.info(f"[backfillEventsTable] Phase 3.5: GLOBAL PEER COLLECTION & PARALLEL FETCHING")
-    logger.info("=" * 80)
-
+    # Phase 3.5: Global Peer Collection
     global_peer_cache = {}
     ticker_to_peers = {}
 
     try:
-        # ========================================
-        # NEW: DB에서 글로벌 peer 캐시 구축 (API 호출 제거!)
-        # ========================================
-        # Step 1: 모든 ticker의 peer 목록 수집 (DB에서)
+        # Step 1: Load peer mappings
         peer_collect_start = time.time()
-        logger.info(f"[DB-Mode] Step 1/2: Loading peer mappings for {len(ticker_groups)} tickers from DB...")
-        logger.info(f"[DB-Mode] Using function: get_peer_tickers_from_db() from quantitative_cache module")
+        ticker_to_peers = await get_batch_peer_tickers_from_db(pool, list(ticker_groups.keys()))
 
-        ticker_to_peers = {}
+        # Limit to 10 peers per ticker
         unique_peers = set()
-
-        for ticker in ticker_groups.keys():
-            peer_list = await get_peer_tickers_from_db(pool, ticker)
+        for ticker, peer_list in ticker_to_peers.items():
             if peer_list:
-                ticker_to_peers[ticker] = peer_list[:10]  # 최대 10개
+                ticker_to_peers[ticker] = peer_list[:10]
                 unique_peers.update(peer_list[:10])
 
         peer_collect_elapsed = time.time() - peer_collect_start
-        logger.info(f"[DB-Mode] ✓ Step 1/2: Peer mapping loaded in {peer_collect_elapsed:.2f}s from config_lv3_targets")
-        logger.info(f"[DB-Mode] Found {len(ticker_to_peers)} tickers with peers, {len(unique_peers)} unique peers total")
 
-        # Step 2: 모든 unique peer의 재무 데이터 일괄 조회 (DB에서, 배치 쿼리!)
+        # Step 2: Load peer financials
         if unique_peers:
             peer_fetch_start = time.time()
-            logger.info(f"[DB-Mode] Step 2/2: Loading {len(unique_peers)} peer financials from DB (batch query)...")
 
-            # MetricEngine에서 필요한 API 목록 확인
             transforms = await metrics.select_metric_transforms(pool)
             engine = MetricCalculationEngine(metrics_by_domain, transforms)
             required_apis = engine.get_required_apis()
-
-            # CRITICAL: Sector averages 계산을 위해 fmp-ratios 추가 (peer 데이터용)
-            # calculate_sector_average_from_cache()에서 peer_data['fmp-ratios'] 접근
             required_apis_with_ratios = set(required_apis)
             required_apis_with_ratios.add('fmp-ratios')
 
-            logger.info(f"[DB-Mode] Required APIs for peers (with fmp-ratios): {sorted(required_apis_with_ratios)}")
-
-            # 배치 쿼리로 모든 peer 데이터 한 번에 조회 (단일 DB 쿼리!)
             global_peer_cache = await get_batch_quantitative_data_from_db(
                 pool,
                 list(unique_peers),
@@ -940,40 +861,15 @@ async def calculate_valuations(
             )
 
             peer_fetch_elapsed = time.time() - peer_fetch_start
-
-            logger.info("=" * 80)
-            logger.info(f"[DB-Mode] ✓ Step 2/2: Global peer cache ready: {len(global_peer_cache)} peers loaded from config_lv3_quantitatives")
-            logger.info(f"[DB-Mode] ✓ Total DB query time: {peer_fetch_elapsed:.2f}s (single batch query)")
-            logger.info(f"[DB-Mode] ✓ Estimated speedup vs API: ~1000x faster (DB vs API calls)")
-            logger.info("=" * 80)
+            logger.info(f"[Phase 3.5] Loaded {len(global_peer_cache)} peers in {peer_fetch_elapsed:.2f}s")
         else:
-            logger.warning("[DB-Mode] No peer tickers found for any ticker - skipping Step 2/2")
+            logger.warning("[Phase 3.5] No peer tickers found")
             global_peer_cache = {}
 
     except Exception as e:
-        logger.error("=" * 80)
-        logger.error(f"[DB-Mode] ✗ Failed to build global peer cache from DB: {e}", exc_info=True)
-        logger.warning("[DB-Mode] Falling back to per-ticker peer fetching from DB")
-        logger.error("=" * 80)
+        logger.error(f"[Phase 3.5] Failed to build peer cache: {e}")
         global_peer_cache = {}
         ticker_to_peers = {}
-    
-    logger.info(
-        f"Processing {len(ticker_groups)} ticker groups",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'group_tickers',
-            'elapsed_ms': int((time.time() - start_time) * 1000),
-            'counters': {
-                'tickers': len(ticker_groups),
-                'events': len(events)
-            },
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
-    )
     
     # Phase 4: Process tickers in parallel with concurrency control
     # CRITICAL: DB CPU is the bottleneck, use user-configured max_workers
@@ -1011,72 +907,52 @@ async def calculate_valuations(
                 total_events_count, completed_events_count,
                 metrics_list,  # I-41: Pass selective update parameters
                 global_peer_cache,  # PERF-OPT: Global peer cache
-                ticker_to_peers  # PERF-OPT: Ticker to peers mapping
+                ticker_to_peers,  # PERF-OPT: Ticker to peers mapping
+                verbose  # Verbose logging flag
             )
             
             # Update progress
             completed_tickers += 1
-            
+
             # Calculate ETA for tickers
             progress_pct = (completed_tickers / total_tickers) * 100
             current_time = time.time()
-            
-            # Calculate ETA based on last 10 tickers (or all tickers if < 10)
-            if completed_tickers >= 10 and completed_tickers % 10 == 0:
-                elapsed_since_checkpoint = current_time - ticker_last_checkpoint_time
-                tickers_processed_since_checkpoint = completed_tickers - ticker_last_checkpoint_idx
-                avg_time_per_ticker = elapsed_since_checkpoint / tickers_processed_since_checkpoint
-                
-                # Update checkpoint
-                ticker_last_checkpoint_time = current_time
-                ticker_last_checkpoint_idx = completed_tickers
-            else:
-                # Use overall average
+
+            # Log progress only at 20% intervals or final ticker
+            milestone_pct = int(progress_pct / 20) * 20
+            prev_milestone = int(((completed_tickers - 1) / total_tickers * 100) / 20) * 20
+            should_log = (milestone_pct > prev_milestone) or (completed_tickers == total_tickers)
+
+            if should_log:
+                # Calculate ETA
                 elapsed_total = current_time - ticker_start_time
                 avg_time_per_ticker = elapsed_total / completed_tickers if completed_tickers > 0 else 0
-            
-            remaining_tickers = total_tickers - completed_tickers
-            eta_seconds = remaining_tickers * avg_time_per_ticker
-            eta_minutes = int(eta_seconds / 60)
-            eta_seconds_remainder = int(eta_seconds % 60)
-            
-            # Format ETA
-            if eta_minutes > 60:
-                eta_hours = eta_minutes // 60
-                eta_minutes_remainder = eta_minutes % 60
-                eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
-            elif eta_minutes > 0:
-                eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
-            else:
-                eta_str = f"{eta_seconds_remainder}s"
-            
-            # Current timestamp
-            timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            logger.info(
-                f"\n\n{'='*90}\n"
-                f"{'='*90}\n"
-                f"[TICKER PROGRESS] {completed_tickers}/{total_tickers} ({progress_pct:.1f}%) | Latest: {ticker}\n"
-                f"TIMESTAMP: {timestamp_str}\n"
-                f"ETA: {eta_str}\n"
-                f"{'='*90}\n"
-                f"{'='*90}\n"
-            )
+
+                remaining_tickers = total_tickers - completed_tickers
+                eta_seconds = remaining_tickers * avg_time_per_ticker
+                eta_minutes = int(eta_seconds / 60)
+                eta_seconds_remainder = int(eta_seconds % 60)
+
+                # Format ETA
+                if eta_minutes > 60:
+                    eta_hours = eta_minutes // 60
+                    eta_minutes_remainder = eta_minutes % 60
+                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
+                elif eta_minutes > 0:
+                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
+                else:
+                    eta_str = f"{eta_seconds_remainder}s"
+
+                # Current timestamp
+                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                logger.info(
+                    f"[PROGRESS] {completed_tickers}/{total_tickers} ({progress_pct:.1f}%) | Latest: {ticker} | ETA: {eta_str} | {timestamp_str}"
+                )
             
             return result
     
-    logger.info(f"[backfillEventsTable] Phase 4: Processing tickers with concurrency={max_workers}")
-    
-    start_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    logger.info(
-        f"\n\n{'='*90}\n"
-        f"{'='*90}\n"
-        f"[TICKER PROGRESS] 0/{total_tickers} (0.0%) | STARTING...\n"
-        f"TIMESTAMP: {start_timestamp}\n"
-        f"{'='*90}\n"
-        f"{'='*90}\n"
-    )
+    logger.info(f"[backfillEventsTable] Phase 4: Processing {total_tickers} tickers with concurrency={max_workers}")
     
     # Create tasks for all ticker groups
     tasks = [
@@ -1185,24 +1061,7 @@ async def calculate_valuations(
         'elapsedMs': total_elapsed_ms
     }
 
-    logger.info("=" * 80)
-    logger.info("[backfillEventsTable] COMPLETE")
-    logger.info(f"[backfillEventsTable] Summary: {summary}")
-    logger.info("=" * 80)
-
-    logger.info(
-        "POST /backfillEventsTable completed",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'complete',
-            'elapsed_ms': total_elapsed_ms,
-            'counters': summary,
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
-    )
+    logger.info(f"[backfillEventsTable] COMPLETE - Processed: {len(events)}, Success: {quantitative_success}/{qualitative_success}, Fail: {quantitative_fail}/{qualitative_fail}, Elapsed: {total_elapsed_ms}ms")
 
     return {
         'summary': summary,
@@ -1216,15 +1075,28 @@ async def calculate_quantitative_metrics_fast(
     api_cache: Dict[str, List[Dict[str, Any]]],
     engine: MetricCalculationEngine,
     target_domains: List[str],
-    custom_values: Optional[Dict[str, Any]] = None
+    custom_values: Optional[Dict[str, Any]] = None,
+    track_metrics: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     ULTRA-FAST quantitative metrics calculation.
-    
+
     Uses pre-initialized engine and pre-fetched API cache.
     Only performs date filtering per event - NO DB queries, NO engine init!
-    
+
     Performance: ~50x faster than calculate_quantitative_metrics_cached
+
+    Args:
+        ticker: Ticker symbol
+        event_date: Event date
+        api_cache: Cached API data
+        engine: Pre-initialized MetricCalculationEngine
+        target_domains: Domains to calculate
+        custom_values: Pre-calculated custom metrics
+        track_metrics: Optional list of metric names to track (for summary logging)
+
+    Returns:
+        Dict with status, value, message, and optionally metric_status
     """
     try:
         # Convert event_date to date object
@@ -1234,43 +1106,58 @@ async def calculate_quantitative_metrics_fast(
             event_date_obj = event_date.date()
         else:
             event_date_obj = event_date
-        
+
         # Filter by event_date (temporal validity) - OPTIMIZED
         api_data_filtered = {}
         for api_id, records in api_cache.items():
             if not records:
                 api_data_filtered[api_id] = []
                 continue
-            
+
             if isinstance(records, list):
                 # Filter by date - use list comprehension for speed
                 # IMPORTANT: Keep records WITHOUT 'date' field (snapshot APIs like fmp-quote)
                 # These are current-value APIs, not time-series data
                 api_data_filtered[api_id] = [
-                    r for r in records 
+                    r for r in records
                     if _get_record_date(r) is None or _get_record_date(r) <= event_date_obj
                 ]
             else:
                 # Single record (e.g., quote, market status)
                 api_data_filtered[api_id] = records
-        
+
         # Calculate metrics using PRE-INITIALIZED engine
         # I-41: Pass custom_values for priceQuantitative metric
-        result = engine.calculate_all(api_data_filtered, target_domains, custom_values)
-        
-        return {
+        # calculate_all now returns (quantitative, qualitative, metric_status) tuple
+        value_quantitative, value_qualitative, metric_status = engine.calculate_all(
+            api_data_filtered, target_domains, custom_values, track_metrics
+        )
+
+        result = {
             'status': 'success',
-            'value': result,
+            'value': value_quantitative,  # Return only quantitative for this function
             'message': 'Quantitative metrics calculated (fast)'
         }
-        
+
+        # Add metric_status if tracking was requested
+        if track_metrics:
+            result['metric_status'] = metric_status
+
+        return result
+
     except Exception as e:
         logger.error(f"[calculate_quantitative_metrics_fast] Failed for {ticker}: {e}")
-        return {
+        result = {
             'status': 'failed',
             'value': None,
             'message': str(e)
         }
+
+        # Add empty metric_status if tracking was requested
+        if track_metrics:
+            result['metric_status'] = {m: False for m in track_metrics}
+
+        return result
 
 
 def _get_record_date(record: Dict[str, Any]):
@@ -1347,11 +1234,12 @@ async def calculate_quantitative_metrics_cached(
         
         # Calculate metrics
         target_domains = ['valuation', 'profitability', 'momentum', 'risk', 'dilution']
-        result = engine.calculate_all(api_data_filtered, target_domains)
-        
+        # calculate_all now returns (quantitative, qualitative, metric_status) tuple
+        value_quantitative, value_qualitative, _ = engine.calculate_all(api_data_filtered, target_domains)
+
         return {
             'status': 'success',
-            'value': result,
+            'value': value_quantitative,  # Return only quantitative for this function
             'message': 'Quantitative metrics calculated (cached)'
         }
         
@@ -1492,7 +1380,8 @@ async def calculate_quantitative_metrics(
         target_domains = [domain for domain in metrics_by_domain.keys() if domain != 'internal']
         logger.info(f"[calculate_quantitative_metrics] Target domains: {target_domains}")
 
-        value_quantitative = engine.calculate_all(api_data, target_domains)
+        # calculate_all now returns (quantitative, qualitative, metric_status) tuple
+        value_quantitative, value_qualitative, _ = engine.calculate_all(api_data, target_domains)
 
         # Get sector and industry from config_lv3_targets
         company_info = await targets.get_company_info(pool, ticker)
@@ -1565,90 +1454,31 @@ async def calculate_qualitative_metrics_fast(
     event_date,
     source: str,
     source_id: str,
-    consensus_summary_cache: Optional[Dict[str, Any]] = None
+    engine: MetricCalculationEngine
 ) -> Dict[str, Any]:
     """
-    ULTRA-FAST qualitative metrics calculation.
-    
-    Uses pre-fetched consensus summary - NO API calls!
-    
+    ULTRA-FAST qualitative metrics calculation (DB-driven).
+
+    Hybrid approach:
+    1. Fetch priceTarget data from evt_consensus (async DB query in Python)
+    2. Pass to MetricCalculationEngine for calculation (dynamic calculation from DB)
+
+    This combines:
+    - DB data source (evt_consensus) - no duplication in txn_quantitatives
+    - DB calculation logic (config_lv2_metric.calculation) - no hardcoded business logic
+
     Args:
         pool: Database connection pool
         ticker: Ticker symbol
         event_date: Event date
-        source: Source table name
+        source: Source table name (e.g., 'consensus')
         source_id: evt_consensus.id (UUID string)
-        consensus_summary_cache: Pre-fetched consensus summary from fmp-price-target-consensus
-    
+        engine: Pre-initialized MetricCalculationEngine
+
     Returns:
-        Dict with status, value (jsonb), currentPrice, message
+        Dict with status, value (qualitative metrics), currentPrice, message
     """
     try:
-        # Only calculate for consensus events
-        if source != 'consensus':
-            return {
-                'status': 'skipped',
-                'value': None,
-                'currentPrice': None,
-                'message': 'Not a consensus event'
-            }
-
-        # Fetch consensus data using source_id for exact row match
-        consensus_data = await metrics.select_consensus_data(
-            pool, ticker, event_date, source_id
-        )
-
-        if not consensus_data:
-            return {
-                'status': 'failed',
-                'value': None,
-                'currentPrice': None,
-                'message': f'Consensus data not found for source_id={source_id}'
-            }
-
-        # Extract Phase 2 data
-        price_target = consensus_data.get('price_target')
-        price_when_posted = consensus_data.get('price_when_posted')
-        price_target_prev = consensus_data.get('price_target_prev')
-        price_when_posted_prev = consensus_data.get('price_when_posted_prev')
-        direction = consensus_data.get('direction')
-
-        # Build consensusSignal
-        consensus_signal = {
-            'direction': direction,
-            'last': {
-                'price_target': float(price_target) if price_target else None,
-                'price_when_posted': float(price_when_posted) if price_when_posted else None
-            }
-        }
-
-        # Add prev and delta if available
-        if price_target_prev is not None and price_when_posted_prev is not None:
-            consensus_signal['prev'] = {
-                'price_target': float(price_target_prev),
-                'price_when_posted': float(price_when_posted_prev)
-            }
-
-            # Calculate delta and deltaPct
-            if price_target and price_target_prev:
-                delta = float(price_target) - float(price_target_prev)
-                delta_pct = (delta / float(price_target_prev)) * 100 if price_target_prev != 0 else None
-
-                consensus_signal['delta'] = delta
-                consensus_signal['deltaPct'] = delta_pct
-            else:
-                consensus_signal['delta'] = None
-                consensus_signal['deltaPct'] = None
-        else:
-            consensus_signal['prev'] = None
-            consensus_signal['delta'] = None
-            consensus_signal['deltaPct'] = None
-
-        # I-26: Check if event_date is historical (more than 7 days ago)
-        # FMP price-target-consensus API only provides current consensus, not historical
-        from datetime import timedelta
-        today = datetime.now().date()
-        
         # Convert event_date to date object
         if isinstance(event_date, str):
             event_date_obj = datetime.fromisoformat(event_date.replace('Z', '+00:00')).date()
@@ -1656,52 +1486,69 @@ async def calculate_qualitative_metrics_fast(
             event_date_obj = event_date.date()
         else:
             event_date_obj = event_date
-        
-        is_historical_event = event_date_obj < (today - timedelta(days=7))
-        
-        # Use CACHED consensus summary - NO API CALL!
-        # But only for recent events (within 7 days)
-        # Read targetSummary from evt_consensus.target_summary (pre-calculated by GET /sourceData Phase 3)
-        target_summary = consensus_data.get('target_summary')
-        
-        if target_summary:
-            # Extract targetMedian from the pre-calculated summary (I-37: use actual Median, not Avg)
-            target_median = target_summary.get('allTimeMedianPriceTarget')
-            target_average = target_summary.get('allTimeAvgPriceTarget')
-            consensus_meta = {
-                'dataAvailable': True,
-                'source': 'evt_consensus.target_summary',
-                'event_date': event_date_obj.isoformat()
-            }
-            logger.debug(f"[QualitativeMetrics] targetSummary read from evt_consensus for {ticker} at {event_date_obj}")
-        else:
-            # targetSummary not calculated yet - run GET /sourceData?mode=consensus first
-            target_median = None
-            consensus_meta = {
-                'dataAvailable': False,
-                'reason': 'targetSummary not calculated. Run GET /sourceData?mode=consensus first.',
-                'event_date': event_date_obj.isoformat()
-            }
-            logger.debug(f"[QualitativeMetrics] targetSummary not available for {ticker} at {event_date_obj} - run GET /sourceData first")
 
-        # value_qualitative 구성
-        # targetSummary: 측정 당시(event_date 기준)의 price target 요약 (evt_consensus에서 계산)
-        value_qualitative = {
-            'targetMedian': target_median,
-            'targetSummary': target_summary,  # 측정 당시의 요약 (replaced consensusSummary)
-            'consensusSignal': consensus_signal,
-            '_meta': consensus_meta
+        # Fetch ALL priceTarget data for this ticker from evt_consensus
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT
+                    price_target as "priceTarget",
+                    price_when_posted as "priceWhenPosted",
+                    event_date as "publishedDate",
+                    analyst_company as "analystCompany"
+                FROM evt_consensus
+                WHERE ticker = $1
+                ORDER BY event_date DESC
+            """, ticker)
+
+        # Convert to list of dicts (mimics fmp-price-target API format)
+        price_target_data = [dict(row) for row in rows]
+
+        # Only log if NO data found (error case)
+        if len(price_target_data) == 0:
+            logger.warning(f"[QUALITATIVE FAIL] {ticker}: No consensus data. Run GET /sourceData?mode=consensus")
+
+        # Pass priceTarget data and event_date to calculation code
+        custom_values = {
+            'priceTarget': price_target_data,  # Raw data for consensus calculation
+            'event_date': event_date_obj  # Used by consensus calculation to filter
         }
+
+        # Calculate metrics using PRE-INITIALIZED engine (DB-driven)
+        _, value_qualitative, _ = engine.calculate_all(
+            {},  # No API data needed
+            target_domains=['valuation'],
+            custom_values=custom_values
+        )
+
+        # Extract consensus data (flatten structure to match original format)
+        consensus_data = {}
+        current_price = None
+
+        if value_qualitative and 'valuation' in value_qualitative:
+            consensus = value_qualitative['valuation'].get('consensus')
+
+            if consensus and isinstance(consensus, dict):
+                consensus_data = consensus
+
+                # Extract currentPrice from consensusSignal
+                consensus_signal = consensus.get('consensusSignal')
+                if consensus_signal and isinstance(consensus_signal, dict):
+                    last_data = consensus_signal.get('last', {})
+                    current_price = last_data.get('price_when_posted')
+            else:
+                logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: consensus calculation returned invalid data")
+        else:
+            logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: valuation domain missing in engine result")
 
         return {
             'status': 'success',
-            'value': value_qualitative,
-            'currentPrice': float(price_when_posted) if price_when_posted else None,
-            'message': 'Qualitative metrics calculated (fast)'
+            'value': consensus_data,  # Flat structure matching original format
+            'currentPrice': current_price,
+            'message': 'Qualitative metrics calculated (DB-driven from evt_consensus)'
         }
 
     except Exception as e:
-        logger.error(f"Qualitative calculation failed for {ticker}: {e}")
+        logger.error(f"[calculate_qualitative_metrics_fast] Failed for {ticker}: {e}", exc_info=True)
         return {
             'status': 'failed',
             'value': None,
@@ -2664,7 +2511,8 @@ async def fetch_single_peer_financials(
                 filtered_cache[api_id] = records
 
         # 메트릭 계산
-        result = engine.calculate_all(filtered_cache, ['valuation'])
+        # calculate_all now returns (quantitative, qualitative, metric_status) tuple
+        value_quantitative, value_qualitative, _ = engine.calculate_all(filtered_cache, ['valuation'])
 
         logger.debug(f"[PERF-OPT] Successfully fetched and calculated metrics for peer {peer_ticker}")
 
@@ -2672,7 +2520,7 @@ async def fetch_single_peer_financials(
             'ticker': peer_ticker,
             'api_cache': peer_api_cache,
             'filtered_cache': filtered_cache,
-            'calculated_metrics': result
+            'calculated_metrics': value_quantitative  # Use quantitative metrics only
         }
 
     except Exception as e:
@@ -2884,11 +2732,12 @@ async def calculate_sector_average_metrics(
                         filtered_cache[api_id] = records
                 
                 # 메트릭 계산
-                result = engine.calculate_all(filtered_cache, ['valuation'])
-                
+                # calculate_all now returns (quantitative, qualitative, metric_status) tuple
+                value_quantitative, value_qualitative, _ = engine.calculate_all(filtered_cache, ['valuation'])
+
                 # 타겟 메트릭 수집
-                if 'valuation' in result:
-                    valuation = result['valuation']
+                if 'valuation' in value_quantitative:
+                    valuation = value_quantitative['valuation']
                     for metric in target_metrics:
                         value = valuation.get(metric)
                         if value is not None and isinstance(value, (int, float)) and value > 0:

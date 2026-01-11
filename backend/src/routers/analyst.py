@@ -41,7 +41,8 @@ async def fill_analyst(
     try:
         result = await analyst_service.aggregate_analyst_performance(
             overwrite=params.overwrite,
-            max_workers=params.max_workers
+            max_workers=params.max_workers,
+            verbose=params.verbose
         )
 
         # Check if there was a global error

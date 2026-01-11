@@ -3,7 +3,7 @@ Quantitatives Router
 
 Handles collection of quantitative financial data for tickers and their peers.
 """
-from fastapi import APIRouter, Request, Response, Query
+from fastapi import APIRouter, Request, Response, Query, Depends
 from fastapi.responses import StreamingResponse
 from typing import Optional, List, Dict
 import uuid
@@ -13,6 +13,7 @@ import logging
 import time
 
 from ..services.quantitatives_service import get_quantitatives
+from ..models.request_models import QuantitativesQueryParams
 
 logger = logging.getLogger("alsign")
 
@@ -26,24 +27,7 @@ active_streams: Dict[str, asyncio.Event] = {}
 async def get_quantitatives_endpoint(
     request: Request,
     response: Response,
-    overwrite: bool = Query(
-        default=False,
-        description="If True, refetch all APIs even if data exists. If False, skip APIs with existing data."
-    ),
-    apis: Optional[str] = Query(
-        default=None,
-        description="Comma-separated list of APIs to fetch. Available: ratios,key-metrics,cash-flow,balance-sheet,market-cap,price,income,quote. If not specified, fetches all APIs."
-    ),
-    tickers: Optional[str] = Query(
-        default=None,
-        description="Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. If not specified, processes all targets and their peers."
-    ),
-    max_workers: Optional[int] = Query(
-        default=20,
-        ge=1,
-        le=100,
-        description="Maximum number of concurrent ticker workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30 depending on DB capacity."
-    ),
+    params: QuantitativesQueryParams = Depends()
 ):
     """
     Collect quantitative financial data for all target tickers and their peers.
@@ -73,22 +57,17 @@ async def get_quantitatives_endpoint(
     # Get request ID from middleware
     req_id = request.state.reqId if hasattr(request.state, 'reqId') else str(uuid.uuid4())
 
-    # Parse API list
-    api_list = None
-    if apis:
-        api_list = [api.strip() for api in apis.split(',') if api.strip()]
-
-    # Parse ticker list
-    ticker_list = None
-    if tickers:
-        ticker_list = [ticker.strip().upper() for ticker in tickers.split(',') if ticker.strip()]
+    # Parse API list and ticker list from params
+    api_list = params.get_api_list()
+    ticker_list = params.get_ticker_list()
 
     try:
         result = await get_quantitatives(
-            overwrite=overwrite,
+            overwrite=params.overwrite,
             apis=api_list,
             tickers=ticker_list,
-            max_workers=max_workers
+            max_workers=params.max_workers,
+            verbose=params.verbose
         )
 
         return {
@@ -106,24 +85,7 @@ async def get_quantitatives_endpoint(
 @router.api_route("/getQuantitatives/stream", methods=["GET", "POST"])
 async def stream_get_quantitatives(
     request: Request,
-    overwrite: bool = Query(
-        default=False,
-        description="If True, refetch all APIs even if data exists. If False, skip APIs with existing data."
-    ),
-    apis: Optional[str] = Query(
-        default=None,
-        description="Comma-separated list of APIs to fetch. Available: ratios,key-metrics,cash-flow,balance-sheet,market-cap,price,income,quote. If not specified, fetches all APIs."
-    ),
-    tickers: Optional[str] = Query(
-        default=None,
-        description="Comma-separated list of tickers to process. Only tickers that exist in config_lv3_targets (ticker or peer column) will be processed. If not specified, processes all targets and their peers."
-    ),
-    max_workers: Optional[int] = Query(
-        default=20,
-        ge=1,
-        le=100,
-        description="Maximum number of concurrent ticker workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30 depending on DB capacity."
-    ),
+    params: QuantitativesQueryParams = Depends()
 ):
     """
     Stream quantitatives collection with real-time logs via SSE.
@@ -182,15 +144,9 @@ async def stream_get_quantitatives(
                         }
                     )
 
-                    # Parse API list
-                    api_list = None
-                    if apis:
-                        api_list = [api.strip() for api in apis.split(',') if api.strip()]
-
-                    # Parse ticker list
-                    ticker_list = None
-                    if tickers:
-                        ticker_list = [ticker.strip().upper() for ticker in tickers.split(',') if ticker.strip()]
+                    # Parse API list and ticker list from params
+                    api_list = params.get_api_list()
+                    ticker_list = params.get_ticker_list()
 
                     # Check for cancellation
                     if cancel_event.is_set():
@@ -215,10 +171,11 @@ async def stream_get_quantitatives(
 
                     # Execute quantitatives collection
                     result = await get_quantitatives(
-                        overwrite=overwrite,
+                        overwrite=params.overwrite,
                         apis=api_list,
                         tickers=ticker_list,
-                        max_workers=max_workers
+                        max_workers=params.max_workers,
+                        verbose=params.verbose
                     )
 
                     total_elapsed_ms = int((time.time() - start_time) * 1000)

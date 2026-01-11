@@ -34,7 +34,8 @@ async def select_metric_definitions(
             """
             SELECT id, domain, expression, description,
                    source, api_list_id, base_metric_id,
-                   aggregation_kind, aggregation_params, response_key
+                   aggregation_kind, aggregation_params, response_key,
+                   calculation
             FROM config_lv2_metric
             WHERE domain LIKE 'quantitative-%'
                OR domain LIKE 'qualitative-%'
@@ -76,7 +77,8 @@ async def select_metric_definitions(
                 'base_metric_id': row['base_metric_id'],
                 'aggregation_kind': row['aggregation_kind'],
                 'aggregation_params': agg_params,
-                'response_key': resp_key
+                'response_key': resp_key,
+                'calculation': row['calculation']
             })
 
         return metrics_by_domain
@@ -87,7 +89,9 @@ async def select_events_for_valuation(
     limit: int = None,
     from_date = None,
     to_date = None,
-    tickers: List[str] = None
+    tickers: List[str] = None,
+    overwrite: bool = False,
+    metrics_list: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """
     Select events from txn_events that need valuation processing.
@@ -98,23 +102,28 @@ async def select_events_for_valuation(
         from_date: Optional start date for filtering events by event_date
         to_date: Optional end date for filtering events by event_date
         tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
+        overwrite: If False, only select events with NULL value_quantitative (skip already processed).
+                   If True, select all events regardless of existing values.
+        metrics_list: Optional list of metric IDs. When specified with overwrite=False,
+                      selects events where specific metrics are missing (advanced filtering).
 
     Returns:
         List of event dictionaries with ticker, event_date, source, source_id
     """
     start_time = time.time()
     logger.info("=" * 80)
-    logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}")
+    logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}, overwrite={overwrite}, metrics_list={metrics_list}")
 
     async with pool.acquire() as conn:
         logger.info(f"[select_events_for_valuation] Database connection acquired in {time.time() - start_time:.2f}s")
 
+        # Set statement timeout to match asyncio timeout (5 minutes)
+        # This prevents PostgreSQL from killing the query before asyncio timeout
+        await conn.execute("SET statement_timeout = '300s'")
+
         query = """
             SELECT id, ticker, event_date, source, source_id,
-                   sector, industry,
-                   value_quantitative, value_qualitative,
-                   position_quantitative, position_qualitative,
-                   disparity_quantitative, disparity_qualitative
+                   sector, industry
             FROM txn_events
             WHERE 1=1
         """
@@ -135,6 +144,21 @@ async def select_events_for_valuation(
             query += f" AND ticker = ANY(${param_idx})"
             params.append(tickers)
             param_idx += 1
+
+        # Pre-filter: Skip already processed events when overwrite=False
+        if not overwrite:
+            logger.info(f"[select_events_for_valuation] Pre-filter: Adding WHERE value_quantitative IS NULL (overwrite=False)")
+            if metrics_list is not None:
+                # Advanced: Check if specific metrics are missing in value_quantitative JSONB
+                # This is more complex, so for now we use simpler NULL check
+                # TODO: Implement JSONB path check for specific metrics
+                logger.info(f"[select_events_for_valuation] Note: metrics_list specified but using simple NULL check (advanced filtering not yet implemented)")
+                query += " AND value_quantitative IS NULL"
+            else:
+                # Simple: Skip events with any value_quantitative data
+                query += " AND value_quantitative IS NULL"
+        else:
+            logger.info(f"[select_events_for_valuation] Processing all events (overwrite=True)")
 
         query += " ORDER BY ticker, event_date"
 

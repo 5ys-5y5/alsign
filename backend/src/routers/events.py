@@ -55,7 +55,8 @@ async def set_events_table(
             dry_run=params.dryRun,
             schema=params.schema,
             table_filter=table_filter,
-            max_workers=params.max_workers
+            max_workers=params.max_workers,
+            verbose=params.verbose
         )
 
         # Build response
@@ -110,13 +111,9 @@ async def backfill_events_table(
     # Parse metrics list (I-41)
     metrics_list = params.get_metrics_list()
 
-    logger.info("=" * 80)
-    logger.info(f"[ROUTER] POST /backfillEventsTable RECEIVED - reqId={req_id}")
-    logger.info(f"[ROUTER] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}, metrics={metrics_list}, batch_size={params.batch_size}")
-    logger.info("=" * 80)
+    logger.info(f"[POST /backfillEventsTable] reqId={req_id}, overwrite={params.overwrite}, from={params.from_date}, to={params.to_date}")
 
     try:
-        logger.info(f"[ROUTER] Calling valuation_service.calculate_valuations")
         result = await valuation_service.calculate_valuations(
             overwrite=params.overwrite,
             from_date=params.from_date,
@@ -124,16 +121,14 @@ async def backfill_events_table(
             tickers=ticker_list,
             metrics_list=metrics_list,
             batch_size=params.batch_size,
-            max_workers=params.max_workers
+            max_workers=params.max_workers,
+            verbose=params.verbose
         )
-        logger.info(f"[ROUTER] valuation_service.calculate_valuations completed successfully")
 
         # Determine HTTP status code
-        # 207 Multi-Status if some events failed, otherwise 200
         summary = result['summary']
         if summary['quantitativeFail'] > 0 or summary['qualitativeFail'] > 0:
             response.status_code = 207
-            logger.info(f"[ROUTER] Setting status code to 207 (Multi-Status) due to failures")
 
         # Build response
         api_response = BackfillEventsTableResponse(
@@ -144,16 +139,10 @@ async def backfill_events_table(
             results=result['results']
         )
 
-        logger.info("=" * 80)
-        logger.info(f"[ROUTER] POST /backfillEventsTable COMPLETE - Returning response")
-        logger.info("=" * 80)
-
+        logger.info(f"[POST /backfillEventsTable] COMPLETE - reqId={req_id}, status={response.status_code}")
         return api_response
 
     except Exception as e:
-        logger.error("=" * 80)
-        logger.error(f"[ROUTER] POST /backfillEventsTable FAILED")
-        logger.error("=" * 80)
-
+        logger.error(f"[POST /backfillEventsTable] FAILED - reqId={req_id}")
         log_error(logger, "POST /backfillEventsTable failed", exception=e)
         raise HTTPException(status_code=500, detail=str(e))

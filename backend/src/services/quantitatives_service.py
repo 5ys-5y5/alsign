@@ -212,17 +212,24 @@ async def _process_ticker(
     # Determine status: if all APIs were skipped (no updates), mark as skipped
     result_status = "skipped" if not updated_columns and skipped_columns else "success"
 
-    # Log success/failure concisely
-    if result_status == "success":
-        logger.info(f"Success: config_lv3_quantitatives.ticker={ticker}")
-    elif result_status == "skipped":
-        logger.info(f"Skipped: config_lv3_quantitatives.ticker={ticker} (all APIs fresh)")
+    # Build API status summary: api1=✓, api2=✗, api3=skip, ...
+    api_status = {}
+    for api_id, column in API_COLUMN_MAP.items():
+        if selected_apis is not None and api_id not in selected_apis:
+            continue
+        if column in updated_columns:
+            api_status[api_id] = "✓"
+        elif column in skipped_columns:
+            api_status[api_id] = "skip"
+        else:
+            api_status[api_id] = "✗"
 
     return {
         "ticker": ticker,
         "status": result_status,
         "updatedColumns": updated_columns,
         "skippedColumns": skipped_columns,
+        "apiStatus": api_status,  # Add API status for summary logging
     }
 
 
@@ -738,7 +745,7 @@ async def get_quantitatives(
                     else:
                         fail_count += 1
                 except Exception as exc:
-                    logger.error(f"Failed: config_lv3_quantitatives.ticker={ticker}, reason={str(exc)}")
+                    logger.error(f"FAIL ticker={ticker}: {str(exc)}")
                     results.append(
                         {
                             "ticker": ticker,
@@ -776,6 +783,44 @@ async def get_quantitatives(
 
         # Process only work targets (new + update tickers)
         await asyncio.gather(*[worker(target_info['ticker']) for target_info in work_targets])
+
+    # ========================================
+    # GLOBAL SUMMARY: Aggregate API status across all tickers
+    # ========================================
+    # Collect API status from all processed tickers
+    api_totals = {}
+    for result in results:
+        if 'apiStatus' in result:
+            for api_id, status in result['apiStatus'].items():
+                if api_id not in api_totals:
+                    api_totals[api_id] = {'success': 0, 'skip': 0, 'fail': 0}
+                if status == '✓':
+                    api_totals[api_id]['success'] += 1
+                elif status == 'skip':
+                    api_totals[api_id]['skip'] += 1
+                elif status == '✗':
+                    api_totals[api_id]['fail'] += 1
+
+    # Build summary string: api1=success/skip/fail, api2=...
+    if api_totals:
+        summary_parts = []
+        for api_id in sorted(api_totals.keys()):
+            success = api_totals[api_id]['success']
+            skip = api_totals[api_id]['skip']
+            fail = api_totals[api_id]['fail']
+
+            # Simplified format for readability
+            summary_parts.append(f"{api_id}={success}✓/{skip}⊘/{fail}✗")
+
+        # Log global summary
+        logger.info(
+            f"\n{'='*80}\n"
+            f"[GLOBAL SUMMARY] POST /getQuantitatives\n"
+            f"  Total: {len(tickers_to_process)} tickers | "
+            f"{success_count}✓ / {skipped_count}⊘ / {fail_count}✗\n"
+            f"  APIs: {', '.join(summary_parts)}\n"
+            f"{'='*80}"
+        )
 
     return {
         "summary": {

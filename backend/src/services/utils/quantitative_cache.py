@@ -69,6 +69,108 @@ async def get_peer_tickers_from_db(pool, ticker: str) -> List[str]:
         return peer_list
 
 
+async def get_batch_peer_tickers_from_db(pool, tickers: List[str]) -> Dict[str, List[str]]:
+    """
+    config_lv3_targets.peer 컬럼에서 여러 ticker의 peer 목록을 일괄 조회 (최적화)
+
+    단일 배치 쿼리로 여러 ticker의 peer 데이터를 한 번에 조회하여 성능 향상.
+    DB CPU 부하 최소화: Query planning 1회, Index scan 1회 (batch)
+
+    Args:
+        pool: Database connection pool
+        tickers: Ticker 목록 (e.g., ["AAPL", "MSFT", "GOOGL"])
+
+    Returns:
+        {ticker: [peer1, peer2, ...], ...} 형태의 dict (자기 자신 제외)
+
+    Example:
+        >>> result = await get_batch_peer_tickers_from_db(pool, ["AAPL", "MSFT"])
+        >>> # Returns: {
+        ...     "AAPL": ["MSFT", "GOOGL", "META", ...],
+        ...     "MSFT": ["AAPL", "GOOGL", "META", ...]
+        ... }
+    """
+    if not tickers:
+        return {}
+
+    # 배치 쿼리로 모든 ticker의 peer 데이터 한 번에 조회
+    tickers_upper = [t.upper() for t in tickers]
+    logger.info(f"[DB-Cache] Batch query from config_lv3_targets: {len(tickers_upper)} tickers (Peer mappings)")
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT ticker, peer
+            FROM config_lv3_targets
+            WHERE ticker = ANY($1::text[])
+            """,
+            tickers_upper
+        )
+
+    # 결과 변환: DB row → {ticker: [peers]} 형식
+    result = {}
+    success_tickers = []
+    failed_tickers = []
+
+    for row in rows:
+        ticker = row['ticker']
+        peers = row['peer']
+
+        if not peers:
+            result[ticker] = []
+            failed_tickers.append(ticker)
+            continue
+
+        # JSONB array 파싱
+        if isinstance(peers, list):
+            # PostgreSQL JSONB는 자동으로 list로 반환됨
+            peer_list = [p for p in peers if p != ticker]
+        elif isinstance(peers, str):
+            # 문자열인 경우 JSON 파싱 시도
+            try:
+                peers_list = json.loads(peers)
+                peer_list = [p for p in peers_list if p != ticker]
+            except Exception as e:
+                logger.error(f"[DB-Cache] Failed to parse peer JSON for {ticker}: {e}")
+                peer_list = []
+                failed_tickers.append(ticker)
+                result[ticker] = peer_list
+                continue
+        else:
+            logger.warning(f"[DB-Cache] Unexpected peer format for {ticker}: {type(peers)}")
+            peer_list = []
+            failed_tickers.append(ticker)
+            result[ticker] = peer_list
+            continue
+
+        result[ticker] = peer_list
+        if peer_list:
+            success_tickers.append(f"{ticker}({len(peer_list)})")
+
+    # 누락된 ticker 체크
+    missing_tickers = set(tickers_upper) - set(result.keys())
+    if missing_tickers:
+        # 누락된 ticker는 빈 리스트로 초기화
+        for ticker in missing_tickers:
+            result[ticker] = []
+            failed_tickers.append(ticker)
+
+    # 요약 로그 출력
+    logger.info(
+        f"[DB-Cache] ✓ config_lv3_targets query complete: "
+        f"Success={len(success_tickers)}, Failed={len(failed_tickers)} | "
+        f"Samples: {', '.join(success_tickers[:5])}{', ...' if len(success_tickers) > 5 else ''}"
+    )
+
+    if failed_tickers:
+        logger.warning(
+            f"[DB-Cache] Tickers without peers ({len(failed_tickers)}): "
+            f"{', '.join(failed_tickers[:10])}{', ...' if len(failed_tickers) > 10 else ''}"
+        )
+
+    return result
+
+
 async def get_quantitative_data_from_db(
     pool,
     ticker: str,
@@ -186,7 +288,7 @@ async def get_batch_quantitative_data_from_db(
     columns_str = ", ".join(columns_to_fetch)
 
     # 배치 쿼리로 모든 ticker 데이터 한 번에 조회
-    logger.info(f"[DB-Cache] Batch fetching {len(tickers)} tickers with {len(required_apis)} APIs from DB...")
+    logger.info(f"[DB-Cache] Batch query from config_lv3_quantitatives: {len(tickers)} tickers × {len(required_apis)} APIs (No API calls)")
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -200,9 +302,13 @@ async def get_batch_quantitative_data_from_db(
 
     # 결과 변환: DB row → API cache 형식
     result = {}
+    success_tickers = []
+    parse_errors = []
+
     for row in rows:
         ticker = row['ticker']
         api_cache = {}
+        ticker_has_error = False
 
         for api_id in required_apis:
             column_name = API_COLUMN_MAP.get(api_id)
@@ -214,23 +320,41 @@ async def get_batch_quantitative_data_from_db(
                     if isinstance(column_data, str):
                         try:
                             column_data = json.loads(column_data)
-                            logger.debug(f"[DB-Cache] Parsed JSON string for {ticker}.{column_name} (API: {api_id})")
                         except Exception as e:
                             logger.error(f"[DB-Cache] Failed to parse JSON for {ticker}.{column_name}: {e}")
                             column_data = []
+                            ticker_has_error = True
                     api_cache[api_id] = column_data
                 else:
                     api_cache[api_id] = []
 
         result[ticker] = api_cache
+        if not ticker_has_error:
+            success_tickers.append(ticker)
+        else:
+            parse_errors.append(ticker)
 
-    logger.info(f"[DB-Cache] Batch loaded {len(result)}/{len(tickers)} tickers with {len(required_apis)} APIs from DB")
-
-    # 누락된 ticker 체크 및 경고
+    # 누락된 ticker 체크
     missing_tickers = set(tickers) - set(result.keys())
+
+    # 요약 로그 출력
+    logger.info(
+        f"[DB-Cache] ✓ config_lv3_quantitatives query complete: "
+        f"Success={len(success_tickers)}, ParseError={len(parse_errors)}, Missing={len(missing_tickers)} | "
+        f"APIs={len(required_apis)} | "
+        f"Samples: {', '.join(success_tickers[:5])}{', ...' if len(success_tickers) > 5 else ''}"
+    )
+
+    if parse_errors:
+        logger.warning(
+            f"[DB-Cache] Tickers with parse errors ({len(parse_errors)}): "
+            f"{', '.join(parse_errors[:10])}{', ...' if len(parse_errors) > 10 else ''}"
+        )
+
     if missing_tickers:
         logger.warning(
-            f"[DB-Cache] Missing data for {len(missing_tickers)} tickers: {list(missing_tickers)[:5]}... "
+            f"[DB-Cache] Missing tickers ({len(missing_tickers)}): "
+            f"{', '.join(list(missing_tickers)[:10])}{', ...' if len(missing_tickers) > 10 else ''} | "
             f"Run POST /getQuantitatives to fetch missing data."
         )
 
@@ -260,32 +384,20 @@ async def calculate_sector_average_from_cache(
     """
     from ..metric_engine import MetricCalculationEngine
 
-    logger.info(f"[DEBUG-SECTOR-AVG-CALC] Starting calculation for {len(peer_tickers)} peers")
-    logger.info(f"[DEBUG-SECTOR-AVG-CALC] Peer tickers: {peer_tickers[:5]}...")
-    logger.info(f"[DEBUG-SECTOR-AVG-CALC] Cache has {len(global_peer_cache)} entries")
-
     sector_averages = {}
     metric_values = {}  # {metric_name: [value1, value2, ...]}
     peers_with_data_count = 0
     peers_without_ratios = []
+    peers_not_in_cache = []
 
     for peer_ticker in peer_tickers:
         peer_data = global_peer_cache.get(peer_ticker)
         if not peer_data:
-            logger.warning(f"[DEBUG-SECTOR-AVG-CALC] Peer {peer_ticker} NOT in global_peer_cache")
+            peers_not_in_cache.append(peer_ticker)
             continue
 
         # 각 peer의 financial ratios에서 메트릭 추출
         ratios = peer_data.get('fmp-ratios')
-
-        # DIAGNOSTIC: Log detailed type information
-        logger.debug(
-            f"[DEBUG-SECTOR-AVG-CALC] Peer {peer_ticker}: "
-            f"ratios type={type(ratios).__name__}, "
-            f"is_list={isinstance(ratios, list)}, "
-            f"is_str={isinstance(ratios, str)}, "
-            f"length={len(ratios) if isinstance(ratios, (list, str)) else 'N/A'}"
-        )
 
         if ratios and isinstance(ratios, list) and len(ratios) > 0:
             latest_ratio = ratios[0]  # 가장 최근 데이터
@@ -301,19 +413,6 @@ async def calculate_sector_average_from_cache(
                     metric_values[metric_name].append(float(value))
         else:
             peers_without_ratios.append(peer_ticker)
-            if ratios is None:
-                ratios_desc = 'None'
-            elif isinstance(ratios, list):
-                ratios_desc = f'empty list (len={len(ratios)})'
-            else:
-                ratios_desc = 'not list'
-            logger.warning(
-                f"[DEBUG-SECTOR-AVG-CALC] Peer {peer_ticker}: ratios={ratios_desc}"
-            )
-
-    logger.info(f"[DEBUG-SECTOR-AVG-CALC] Peers with valid ratios: {peers_with_data_count}/{len(peer_tickers)}")
-    if peers_without_ratios:
-        logger.warning(f"[DEBUG-SECTOR-AVG-CALC] Peers without ratios: {peers_without_ratios[:5]}...")
 
     # Calculate averages and convert to short names (PER, PBR, PSR)
     metric_name_map = {
@@ -330,15 +429,32 @@ async def calculate_sector_average_from_cache(
             avg_value = sum(values) / len(values)
             short_name = metric_name_map.get(metric_name, metric_name)
             sector_averages[short_name] = avg_value
-            logger.info(f"[DEBUG-SECTOR-AVG-CALC] {short_name}: {avg_value:.2f} (from {len(values)} values)")
 
-    logger.info(f"[DB-Cache] Calculated sector averages from {len(peer_tickers)} peers: {list(sector_averages.keys())}")
+    # 요약 로그 출력
+    metrics_str = ', '.join([f"{k}={v:.2f}" for k, v in sector_averages.items()])
+    logger.info(
+        f"[DB-Cache] ✓ Sector average calculation complete (from global_peer_cache via config_lv3_quantitatives): "
+        f"ValidPeers={peers_with_data_count}/{len(peer_tickers)}, Metrics={len(sector_averages)} | "
+        f"{metrics_str}"
+    )
+
+    if peers_not_in_cache:
+        logger.warning(
+            f"[DB-Cache] Peers not in cache ({len(peers_not_in_cache)}): "
+            f"{', '.join(peers_not_in_cache[:10])}{', ...' if len(peers_not_in_cache) > 10 else ''}"
+        )
+
+    if peers_without_ratios:
+        logger.warning(
+            f"[DB-Cache] Peers without ratios ({len(peers_without_ratios)}): "
+            f"{', '.join(peers_without_ratios[:10])}{', ...' if len(peers_without_ratios) > 10 else ''}"
+        )
 
     if not sector_averages:
         logger.error(
-            f"[DEBUG-SECTOR-AVG-CALC] CRITICAL: Empty sector_averages! "
-            f"metric_values keys: {list(metric_values.keys())}, "
-            f"peers_with_data: {peers_with_data_count}"
+            f"[DB-Cache] CRITICAL: Empty sector_averages! "
+            f"ValidPeers={peers_with_data_count}, NotInCache={len(peers_not_in_cache)}, "
+            f"WithoutRatios={len(peers_without_ratios)}"
         )
 
     return sector_averages

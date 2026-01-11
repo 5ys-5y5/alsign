@@ -153,11 +153,8 @@ def log_batch_start(logger: logging.Logger, ticker: str, event_count: int):
         ticker: Stock ticker
         event_count: Number of events to process
     """
-    logger.info(
-        f"\n{'*'*90}\n"
-        f"[BATCH START] {ticker} | {event_count} events to process\n"
-        f"{'*'*90}"
-    )
+    # Reduced to debug level to minimize console output
+    logger.debug(f"[BATCH] {ticker} - Processing {event_count} events")
 
 
 def log_batch_complete(logger: logging.Logger, ticker: str, event_count: int, success_count: int, fail_count: int):
@@ -171,8 +168,5 @@ def log_batch_complete(logger: logging.Logger, ticker: str, event_count: int, su
         success_count: Successful events
         fail_count: Failed events
     """
-    logger.info(
-        f"\n{'*'*90}\n"
-        f"[BATCH COMPLETE] {ticker} | Processed: {event_count}, Success: {success_count}, Failed: {fail_count}\n"
-        f"{'*'*90}"
-    )
+    # Reduced to debug level to minimize console output
+    logger.debug(f"[BATCH] {ticker} - Done: {success_count}/{event_count} success, {fail_count} failed")

@@ -210,10 +210,11 @@ class MetricCalculationEngine:
         self,
         api_data: Dict[str, List[Dict[str, Any]]],
         target_domains: Optional[List[str]] = None,
-        custom_values: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        custom_values: Optional[Dict[str, Any]] = None,
+        track_metrics: Optional[List[str]] = None
+    ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, bool]]:
         """
-        Calculate all metrics for target domains.
+        Calculate all metrics for target domains, separating quantitative and qualitative.
 
         Args:
             api_data: API responses keyed by api_list_id
@@ -226,10 +227,17 @@ class MetricCalculationEngine:
                            If None, calculates all domains.
             custom_values: Pre-calculated values for custom metrics (I-41)
                           Example: {'priceQuantitative': 185.0}
+            track_metrics: Optional list of metric names to track success/failure
+                          Example: ['PER', 'PBR', 'priceQuantitative']
 
         Returns:
-            Dict with calculated metrics grouped by domain
-            Example: {
+            Tuple of (quantitative_result, qualitative_result, metric_status)
+            - quantitative_result: {'valuation': {...}, 'profitability': {...}} from quantitative-* domains
+            - qualitative_result: {'valuation': {...}} from qualitative-* domains
+            - metric_status: Dict mapping tracked metric names to success status (True/False)
+                            Example: {'PER': True, 'PBR': False, 'priceQuantitative': True}
+
+            Example quantitative_result: {
                 'valuation': {
                     'PER': 25.5,
                     'PBR': 3.2,
@@ -237,6 +245,13 @@ class MetricCalculationEngine:
                     '_meta': {'date_range': '...', 'calcType': 'TTM_fullQuarter', 'count': 4}
                 },
                 'profitability': {...}
+            }
+
+            Example qualitative_result: {
+                'valuation': {
+                    'consensus': {...},
+                    '_meta': {...}
+                }
             }
         """
         # Build calculation order if not already done
@@ -248,8 +263,15 @@ class MetricCalculationEngine:
         if custom_values is None:
             custom_values = {}
 
+        # Initialize metric status tracking
+        metric_status = {}
+        if track_metrics:
+            for metric_name in track_metrics:
+                metric_status[metric_name] = False
+
         # Calculate each metric in order
-        calculated_values = {}
+        # Pre-populate calculated_values with custom_values for access in calculation code
+        calculated_values = dict(custom_values)  # Copy custom_values to calculated_values
         self.metric_sources = {}  # I-30: Reset sources for each calculation run
 
         for metric_name in self.calculation_order:
@@ -271,36 +293,32 @@ class MetricCalculationEngine:
             try:
                 value, failure_reason = self._calculate_metric_with_reason(metric, api_data, calculated_values, custom_values)
                 calculated_values[metric_name] = value
-                if value is not None:
-                    # Smart formatting: show first item + count for lists, full value for scalars
-                    if isinstance(value, list) and len(value) > 0:
-                        first_item = value[0]
-                        value_str = f"[{first_item}, ...] ({len(value)} items)"
-                    else:
-                        value_str = str(value)
-                    
-                    # Truncate only if still too long (for safety)
-                    if len(value_str) > 150:
-                        value_str = value_str[:150] + "..."
-                    
-                    logger.debug(f"[MetricEngine] ✓ {metric_name} = {value_str} (source: {metric.get('source')})")
-                else:
-                    # Log NULL values with reason at INFO level for visibility
-                    # This helps distinguish between: API data missing vs calculation failure
+
+                # Track status for requested metrics
+                if track_metrics and metric_name in track_metrics:
+                    metric_status[metric_name] = (value is not None)
+
+                # Only log failures, suppress success logs
+                if value is None:
                     domain = metric.get('domain', '')
                     domain_suffix = domain.split('-', 1)[1] if '-' in domain else domain
-                    
+
                     # Only log for target domains (not internal metrics)
                     if domain != 'internal' and (not target_domains or domain_suffix in target_domains):
-                        reason_str = failure_reason if failure_reason else "Unknown reason"
-                        logger.info(f"[MetricEngine] ✗ NULL: {metric_name} | domain={domain_suffix} | reason={reason_str}")
+                        # Simplified failure log (debug level to reduce console noise)
+                        reason_str = failure_reason if failure_reason else "Unknown"
+                        logger.debug(f"[NULL] {metric_name}: {reason_str}")
             except Exception as e:
                 logger.error(f"[MetricEngine] Failed to calculate {metric_name}: {e}")
                 calculated_values[metric_name] = None
 
-        # Group by domain
-        result = self._group_by_domain(calculated_values, target_domains)
-        return result
+                # Track failure for requested metrics
+                if track_metrics and metric_name in track_metrics:
+                    metric_status[metric_name] = False
+
+        # Group by domain (separates quantitative and qualitative)
+        quantitative_result, qualitative_result = self._group_by_domain(calculated_values, target_domains)
+        return quantitative_result, qualitative_result, metric_status
 
     def _calculate_metric_with_reason(
         self,
@@ -326,12 +344,27 @@ class MetricCalculationEngine:
 
         # I-41: Handle custom metrics
         if source == 'custom':
+            # First, check if pre-calculated value exists in custom_values
             if custom_values and metric_name in custom_values:
                 value = custom_values[metric_name]
-                logger.debug(f"[MetricEngine] ✓ Custom metric {metric_name} = {value}")
+                logger.info(f"[MetricEngine] ✓ {metric_name} (Hardcoded via custom_values)")
                 return value, None
+
+            # If not pre-calculated, check if calculation code exists in DB
+            calculation_code = metric.get('calculation')
+            if calculation_code:
+                try:
+                    # Execute calculation code dynamically
+                    value = self._execute_calculation_code(calculation_code, api_data, calculated_values, metric)
+                    if value is not None:
+                        return value, None
+                    else:
+                        return None, f"Calculation returned None"
+                except Exception as e:
+                    logger.error(f"[CALC ERROR] {metric_name}: {e}")
+                    return None, f"Calculation failed: {str(e)}"
             else:
-                return None, f"Custom metric '{metric_name}' not provided in custom_values"
+                return None, f"Custom metric '{metric_name}' not provided in custom_values and no calculation code found"
 
         if source == 'api_field':
             value, source_info = self._calculate_api_field_with_source(metric, api_data)
@@ -480,14 +513,14 @@ class MetricCalculationEngine:
         response_key_json = metric.get('response_key')
 
         if not api_list_id or not response_key_json:
-            logger.warning(f"[MetricEngine] Missing api_list_id or response_key for {metric.get('name')}")
+            logger.debug(f"[MetricEngine] Missing api_list_id or response_key for {metric.get('name')}")
             return None
 
         # Get API data
         api_response = api_data.get(api_list_id)
         if not api_response:
             if metric.get('name') == 'priceEodOHLC':
-                logger.warning(f"[MetricEngine][priceEodOHLC] No API data for api_list_id={api_list_id}, available APIs: {list(api_data.keys())}")
+                logger.debug(f"[MetricEngine][priceEodOHLC] No API data for api_list_id={api_list_id}, available APIs: {list(api_data.keys())}")
             logger.debug(f"[MetricEngine] No API data for {api_list_id}")
             return None
 
@@ -552,22 +585,11 @@ class MetricCalculationEngine:
             # If single record (snapshot API), return scalar value
             # Otherwise return list (time-series API)
             if len(values) == 1:
-                # I-45: Log new Enterprise Value component metrics
-                metric_name = metric.get('name')
-                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
-                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {values[0]} (from {api_list_id})")
                 return values[0]
             elif len(values) > 1:
                 # I-25: 시계열 시가총액 API의 경우 가장 최근 날짜(첫 번째)의 값만 반환
-                # historical-market-cap API는 event_date 이전의 모든 날짜를 반환하므로
-                # 첫 번째 값이 event_date에 가장 가까운 marketCap
                 if 'historical-market-cap' in api_list_id:
-                    logger.debug(f"[MetricEngine][I-25] Using latest marketCap from {len(values)} records")
                     return values[0]
-                # I-45: Log new Enterprise Value component metrics (list case)
-                metric_name = metric.get('name')
-                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
-                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {values[0]} (latest from {len(values)} records, api: {api_list_id})")
                 return values
             else:
                 return None
@@ -576,10 +598,6 @@ class MetricCalculationEngine:
             value = api_response.get(field_key)
             if value is not None:
                 converted = self._convert_value(value)
-                # I-45: Log new Enterprise Value component metrics (dict case)
-                metric_name = metric.get('name')
-                if metric_name in ('minorityInterestLatest', 'preferredStockLatest'):
-                    logger.info(f"[MetricEngine] [I-45] NEW METRIC: {metric_name} = {converted} (from {api_list_id})")
                 return converted
             return None
         else:
@@ -740,13 +758,13 @@ class MetricCalculationEngine:
         aggregation_params = metric.get('aggregation_params', {})
 
         if not base_metric_id or not aggregation_kind:
-            logger.warning(f"[MetricEngine] Missing base_metric_id or aggregation_kind for {metric.get('name')}")
+            logger.debug(f"[MetricEngine] Missing base_metric_id or aggregation_kind for {metric.get('name')}")
             return None
 
         # Get base metric values
         base_values = calculated_values.get(base_metric_id)
         if base_values is None:
-            logger.warning(f"[MetricEngine] Base metric {base_metric_id} not found for {metric.get('name')} (available: {list(calculated_values.keys())[:10]}...)")
+            logger.debug(f"[MetricEngine] Base metric {base_metric_id} not found for {metric.get('name')} (available: {list(calculated_values.keys())[:10]}...)")
             return None
 
         # Ensure base_values is a list (quarterly data)
@@ -1034,24 +1052,8 @@ class MetricCalculationEngine:
             if 'if ' in formula.lower() and ' then ' in formula.lower():
                 return self._evaluate_conditional(formula, calculated_values)
 
-            # I-45: Log Enterprise Value calculation components
-            metric_name = metric.get('name')
-            if metric_name == 'enterpriseValue':
-                logger.info(f"[MetricEngine] [I-45] Calculating Enterprise Value with NEW formula")
-                logger.info(f"[MetricEngine] [I-45] Formula: {formula}")
-                logger.info(f"[MetricEngine] [I-45] Components:")
-                logger.info(f"[MetricEngine] [I-45]   - marketCap: {calculated_values.get('marketCap')}")
-                logger.info(f"[MetricEngine] [I-45]   - totalDebtLatest: {calculated_values.get('totalDebtLatest')}")
-                logger.info(f"[MetricEngine] [I-45]   - minorityInterestLatest: {calculated_values.get('minorityInterestLatest')} (NEW)")
-                logger.info(f"[MetricEngine] [I-45]   - preferredStockLatest: {calculated_values.get('preferredStockLatest')} (NEW)")
-                logger.info(f"[MetricEngine] [I-45]   - cashAndCashEquivalentsLatest: {calculated_values.get('cashAndCashEquivalentsLatest')}")
-
             # Evaluate the formula
             result = eval(formula, {"__builtins__": {}}, eval_context)
-
-            # I-45: Log Enterprise Value result
-            if metric_name == 'enterpriseValue':
-                logger.info(f"[MetricEngine] [I-45] Enterprise Value RESULT: {result}")
 
             return float(result) if result is not None else None
 
@@ -1125,18 +1127,21 @@ class MetricCalculationEngine:
         self,
         calculated_values: Dict[str, Any],
         target_domains: Optional[List[str]]
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Group calculated metrics by domain.
+        Group calculated metrics by domain, separating quantitative and qualitative.
 
         Args:
             calculated_values: All calculated metrics
             target_domains: Domains to include (filters out 'internal' domain)
 
         Returns:
-            Dict grouped by domain with _meta information (I-30: includes sources)
+            Tuple of (quantitative_result, qualitative_result)
+            - quantitative_result: {suffix: {metric: value}} for quantitative-* domains
+            - qualitative_result: {suffix: {metric: value}} for qualitative-* domains
         """
-        result = {}
+        quantitative_result = {}
+        qualitative_result = {}
 
         for metric_name, value in calculated_values.items():
             metric = self.metrics_by_name.get(metric_name)
@@ -1147,57 +1152,165 @@ class MetricCalculationEngine:
             if not domain or domain == 'internal':
                 continue
 
-            # Extract domain suffix
-            domain_suffix = domain.split('-', 1)[1] if '-' in domain else domain
+            # Extract prefix and suffix
+            if '-' in domain:
+                domain_prefix, domain_suffix = domain.split('-', 1)
+            else:
+                # No prefix (e.g., 'internal') - skip
+                continue
 
             # Filter by target domains
             if target_domains and domain_suffix not in target_domains:
                 continue
 
-            # Initialize domain group if needed
-            if domain_suffix not in result:
-                result[domain_suffix] = {}
+            # Route to correct result dict based on prefix
+            if domain_prefix == 'quantitative':
+                if domain_suffix not in quantitative_result:
+                    quantitative_result[domain_suffix] = {}
+                quantitative_result[domain_suffix][metric_name] = value
+            elif domain_prefix == 'qualitative':
+                if domain_suffix not in qualitative_result:
+                    qualitative_result[domain_suffix] = {}
+                qualitative_result[domain_suffix][metric_name] = value
 
-            result[domain_suffix][metric_name] = value
+        # I-30: Add _meta with sources to each domain (both quantitative and qualitative)
+        def add_meta_to_result(result_dict: Dict[str, Any]):
+            """Helper to add _meta to each domain in result dict"""
+            for domain_suffix in result_dict:
+                if '_meta' not in result_dict[domain_suffix]:
+                    # Collect sources for all metrics in this domain
+                    domain_sources = {}
+                    domain_dates = set()
 
-        # I-30: Add _meta with sources to each domain
-        for domain_suffix in result:
-            if '_meta' not in result[domain_suffix]:
-                # Collect sources for all metrics in this domain
-                domain_sources = {}
-                domain_dates = set()
-                
-                for metric_name in result[domain_suffix]:
-                    if metric_name.startswith('_'):
-                        continue
-                    source_info = self.metric_sources.get(metric_name)
-                    if source_info:
-                        domain_sources[metric_name] = source_info
-                        # Collect dates for summary
-                        if 'date' in source_info:
-                            domain_dates.add(source_info['date'])
-                        elif 'dates' in source_info:
-                            domain_dates.update(source_info['dates'])
-                
-                # Build _meta
-                result[domain_suffix]['_meta'] = {
-                    'calcType': 'TTM_fullQuarter',
-                    'count': 4
-                }
-                
-                # Add sources if available
-                if domain_sources:
-                    result[domain_suffix]['_meta']['sources'] = domain_sources
-                
-                # Add date range summary
-                if domain_dates:
-                    sorted_dates = sorted(domain_dates)
-                    if len(sorted_dates) == 1:
-                        result[domain_suffix]['_meta']['dateRange'] = sorted_dates[0]
-                    else:
-                        result[domain_suffix]['_meta']['dateRange'] = f"{sorted_dates[0]} ~ {sorted_dates[-1]}"
+                    for metric_name in result_dict[domain_suffix]:
+                        if metric_name.startswith('_'):
+                            continue
+                        source_info = self.metric_sources.get(metric_name)
+                        if source_info:
+                            domain_sources[metric_name] = source_info
+                            # Collect dates for summary
+                            if 'date' in source_info:
+                                domain_dates.add(source_info['date'])
+                            elif 'dates' in source_info:
+                                domain_dates.update(source_info['dates'])
 
-        return result
+                    # Build _meta
+                    result_dict[domain_suffix]['_meta'] = {
+                        'calcType': 'TTM_fullQuarter',
+                        'count': 4
+                    }
+
+                    # Add sources if available
+                    if domain_sources:
+                        result_dict[domain_suffix]['_meta']['sources'] = domain_sources
+
+                    # Add date range summary
+                    if domain_dates:
+                        sorted_dates = sorted(domain_dates)
+                        if len(sorted_dates) == 1:
+                            result_dict[domain_suffix]['_meta']['dateRange'] = sorted_dates[0]
+                        else:
+                            result_dict[domain_suffix]['_meta']['dateRange'] = f"{sorted_dates[0]} ~ {sorted_dates[-1]}"
+
+        add_meta_to_result(quantitative_result)
+        add_meta_to_result(qualitative_result)
+
+        return quantitative_result, qualitative_result
+
+    def _execute_calculation_code(
+        self,
+        calculation_code: str,
+        api_data: Dict[str, List[Dict[str, Any]]],
+        calculated_values: Dict[str, Any],
+        metric: Dict[str, Any]
+    ) -> Any:
+        """
+        Execute calculation code from config_lv2_metric.calculation column.
+
+        Args:
+            calculation_code: Python code string from DB
+            api_data: API responses
+            calculated_values: Already calculated metrics
+            metric: Metric definition
+
+        Returns:
+            Calculated value or None
+
+        Raises:
+            Exception: If code execution fails
+        """
+        # Build safe execution context
+        # Provide limited globals for security
+        datetime_module = __import__('datetime')
+        statistics_module = __import__('statistics')
+
+        safe_globals = {
+            '__builtins__': {
+                'len': len,
+                'sum': sum,
+                'min': min,
+                'max': max,
+                'abs': abs,
+                'round': round,
+                'int': int,
+                'float': float,
+                'str': str,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'set': set,
+                'tuple': tuple,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'sorted': sorted,
+                'isinstance': isinstance,
+                'hasattr': hasattr,
+                'getattr': getattr,
+            },
+            # Provide datetime module and its classes directly
+            'datetime': datetime_module.datetime,
+            'timedelta': datetime_module.timedelta,
+            'date': datetime_module.date,
+            # Provide statistics module
+            'statistics': statistics_module,
+        }
+
+        # Provide local context with data
+        local_context = {
+            'api_data': api_data,
+            'calculated_values': calculated_values,
+            'event_date': calculated_values.get('event_date'),  # Pass event_date if available
+        }
+
+        metric_name = metric.get('name')
+
+        try:
+            # Execute the calculation code
+            try:
+                exec(calculation_code, safe_globals, local_context)
+            except Exception as calc_err:
+                logger.error(f"[CALC EXCEPTION] {metric_name}: {calc_err}")
+                return None
+
+            # The code should set a 'result' variable or return via last expression
+            if 'result' in local_context:
+                result = local_context['result']
+
+                # Only log if calculation failed (dataAvailable=False) or result is None
+                if result is None:
+                    logger.warning(f"[CALC FAIL] {metric_name}: returned None")
+                elif isinstance(result, dict) and result.get('_meta', {}).get('dataAvailable') == False:
+                    logger.debug(f"[CALC NULL] {metric_name}: dataAvailable=False")
+                return result
+            else:
+                # If no 'result' variable, return None
+                logger.warning(f"[CALC FAIL] {metric_name}: no 'result' variable set")
+                return None
+
+        except Exception as e:
+            logger.error(f"[CALC ERROR] {metric_name}: {e}")
+            raise
 
     def _lead_pair_from_list(
         self,

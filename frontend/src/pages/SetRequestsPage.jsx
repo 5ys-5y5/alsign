@@ -74,6 +74,27 @@ const ENDPOINT_FLOWS = {
         required: false,
         description: 'calc_scope=event_date_range일 때 필수: 종료 날짜 (YYYY-MM-DD)'
       },
+      {
+        name: 'max_workers',
+        type: 'number',
+        required: false,
+        default: '20',
+        min: 1,
+        max: 100,
+        description: '동시 실행 worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정',
+        examples: [
+          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
+          { value: '20', description: '기본값 (균형)' },
+          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
+        ]
+      },
+      {
+        name: 'verbose',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '상세 로그 출력. true면 모드별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
+      },
     ],
     usageExamples: [
       {
@@ -256,6 +277,13 @@ const ENDPOINT_FLOWS = {
           { value: '20', description: '기본값 (균형)' },
           { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
         ]
+      },
+      {
+        name: 'verbose',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '상세 로그 출력. true면 티커별, API별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       }
     ],
     usageExamples: [
@@ -391,8 +419,8 @@ const ENDPOINT_FLOWS = {
   backfillEventsTable: {
     id: 'backfillEventsTable',
     title: 'POST /backfillEventsTable',
-    description: 'txn_events 테이블의 이벤트에 valuation metrics 계산 (Price Trend 제외)',
-    performanceNote: '100개 이벤트 (10개 티커) 처리 시: ~480 API calls, ~4분 소요. Peer 데이터 수집이 85% 시간 차지 (400 API calls)',
+    description: 'txn_events 테이블의 이벤트에 valuation metrics 계산 (Price Trend 제외). config_lv3_quantitatives 테이블에서 데이터 조회 (API 호출 없음)',
+    performanceNote: '100개 이벤트 (10개 티커) 처리 시: API 호출 0개, DB 조회만 수행. 사전에 POST /getQuantitatives로 quantitative 데이터가 준비되어 있어야 함',
     parameters: [
       {
         name: 'overwrite',
@@ -424,6 +452,41 @@ const ENDPOINT_FLOWS = {
         type: 'string',
         required: false,
         description: '업데이트할 메트릭 ID 리스트 (쉼표 구분, 예: "priceQuantitative,PER,PBR"). 미지정 시 전체 메트릭 계산 (I-41)'
+      },
+      {
+        name: 'batch_size',
+        type: 'number',
+        required: false,
+        default: 'None',
+        min: 100,
+        max: 50000,
+        description: '배치 처리 크기 (100-50000). 미지정 시 전체 이벤트를 한 번에 처리. 더 작은 배치(1000-5000)는 빠른 피드백과 진행 상황 추적 제공 (I-44)',
+        examples: [
+          { value: '1000', description: '빠른 피드백을 위한 작은 배치' },
+          { value: '5000', description: '균형잡힌 배치 크기 (권장)' },
+          { value: '10000', description: '대용량 처리를 위한 큰 배치' }
+        ]
+      },
+      {
+        name: 'max_workers',
+        type: 'number',
+        required: false,
+        default: '20',
+        min: 1,
+        max: 100,
+        description: '동시 실행 worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정',
+        examples: [
+          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
+          { value: '20', description: '기본값 (균형)' },
+          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
+        ]
+      },
+      {
+        name: 'verbose',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '상세 로그 출력. true면 이벤트별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       },
     ],
     behaviorMatrix: [
@@ -465,6 +528,11 @@ const ENDPOINT_FLOWS = {
         url: 'POST /backfillEventsTable?batch_size=5000',
         description: '5,000개씩 배치 처리하여 빠른 진행 피드백 제공 (I-44)'
       },
+      {
+        title: '상세 로그 활성화 (문제 디버깅)',
+        url: 'POST /backfillEventsTable?verbose=true',
+        description: '이벤트별, 티커별 상세 로그 출력으로 문제 원인 상세 파악'
+      },
     ],
     phases: [
       {
@@ -484,81 +552,69 @@ const ENDPOINT_FLOWS = {
       {
         id: 'group_tickers',
         title: '3. 티커 그룹화',
-        description: '이벤트를 티커별로 그룹화 (10개 티커 병렬 처리)',
+        description: '이벤트를 티커별로 그룹화 (max_workers 설정만큼 병렬 처리)',
         apiId: null,
-        note: '메모리 작업 (semaphore limit=10)'
+        note: '메모리 작업 (semaphore limit=max_workers)'
       },
       {
-        id: 'ticker_cache',
-        title: '4. 티커별 API 캐싱 (CRITICAL)',
-        description: '티커당 1회만 API 호출 → 모든 이벤트가 캐시 재사용',
-        note: '이 단계가 90% API 절감의 핵심! 티커당 ~6개 API 호출, 이벤트당 0개',
-        subPhases: [
-          {
-            id: 'base_financials',
-            title: '기본 재무 데이터',
-            apiId: 'fmp-income-statement',
-            note: 'income/balance/cash/historical-price/market-cap (5 APIs, period=quarter, limit=100)',
-            requiredKeys: ['date', 'revenue', 'grossProfit', 'operatingIncome', 'netIncome'],
-            configKey: 'backfill.income'
-          },
-          {
-            id: 'consensus',
-            title: '컨센서스 데이터',
-            apiId: 'fmp-price-target-consensus',
-            note: '1 API per ticker',
-            requiredKeys: ['targetHigh', 'targetLow', 'targetConsensus', 'targetMedian'],
-            configKey: 'backfill.consensus'
-          },
-          {
-            id: 'peer_list',
-            title: 'Peer 티커 목록',
-            apiId: 'fmp-stock-peers',
-            note: '1 API per ticker → 최대 10개 peer 반환',
-            requiredKeys: ['symbol', 'peersList'],
-            configKey: 'backfill.peers'
-          },
-          {
-            id: 'peer_financials',
-            title: 'Peer 재무 데이터 (BOTTLENECK)',
-            apiId: 'fmp-income-statement',
-            note: '⚠️ 40 APIs per ticker (4 APIs × 10 peers) → 전체의 85% 시간 소요! 티커 10개 = 400 API calls',
-            requiredKeys: ['date', 'revenue', 'netIncome', 'totalAssets', 'totalEquity', 'marketCap'],
-            configKey: 'backfill.peer_financials'
-          }
-        ]
+        id: 'load_quantitatives',
+        title: '4. Quantitative 데이터 로드 (DB 조회)',
+        description: 'config_lv3_quantitatives에서 티커별 재무 데이터 조회',
+        apiId: null,
+        note: '⚡ API 호출 없음! POST /getQuantitatives로 사전 수집된 데이터 사용. 티커당 1회 DB 조회'
+      },
+      {
+        id: 'load_consensus',
+        title: '5. Consensus 데이터 로드 (DB 조회)',
+        description: 'evt_consensus에서 컨센서스 데이터 조회',
+        apiId: null,
+        note: 'DB 쿼리 (API 아님)'
+      },
+      {
+        id: 'load_peers',
+        title: '6. Peer 데이터 로드 (DB 조회)',
+        description: 'config_lv3_targets와 config_lv3_quantitatives에서 peer 데이터 조회',
+        apiId: null,
+        note: '⚡ API 호출 없음! POST /getQuantitatives로 사전 수집된 peer 데이터 사용'
       },
       {
         id: 'event_processing',
-        title: '5. 이벤트 처리 (캐시 사용)',
-        description: '각 이벤트: 캐시된 데이터 필터링 → 메트릭 계산 (API 호출 없음!)',
+        title: '7. 이벤트 처리 (DB 캐시 사용)',
+        description: '각 이벤트: DB에서 로드한 데이터 필터링 → 메트릭 계산',
         apiId: null,
-        note: '100개 이벤트 처리해도 추가 API 호출 0개 (날짜 필터링만 수행)'
+        note: '100개 이벤트 처리해도 API 호출 0개 (DB 조회 데이터만 사용)'
       },
       {
         id: 'calc_quantitative',
-        title: '6. Quantitative 메트릭',
+        title: '8. Quantitative 메트릭 계산',
         description: 'PER, PBR, PSR, ROE 등 계산',
         apiId: null,
-        note: 'MetricCalculationEngine 사용 (캐시된 재무 데이터 기반)'
+        note: 'MetricCalculationEngine 사용 (DB에서 로드한 재무 데이터 기반)'
       },
       {
         id: 'calc_qualitative',
-        title: '7. Qualitative 메트릭',
+        title: '9. Qualitative 메트릭 계산',
         description: 'consensusSignal, targetSummary 계산',
         apiId: null,
-        note: 'evt_consensus 테이블 + 캐시된 컨센서스 데이터 사용'
+        note: 'evt_consensus 테이블 데이터 사용'
       },
       {
         id: 'calc_price_quantitative',
-        title: '8. priceQuantitative 계산',
+        title: '10. priceQuantitative 계산',
         description: 'Peer 평균 PER × 회사 EPS = 적정가',
         apiId: null,
-        note: '캐시된 sector_averages 사용 (단계 4에서 계산됨)'
+        note: 'DB에서 로드한 peer 데이터로 계산된 sector_averages 사용'
+      },
+      {
+        id: 'calc_position_disparity',
+        title: '11. Position & Disparity 계산',
+        description: 'position_quantitative, disparity_quantitative 계산',
+        apiId: null,
+        note: 'priceQuantitative와 currentPrice 비교하여 투자 포지션 결정'
       },
       {
         id: 'batch_update',
-        title: '9. 배치 업데이트',
+        title: '12. 배치 업데이트',
         description: 'txn_events 테이블 일괄 UPDATE (티커당 1회)',
         apiId: null,
         note: 'UNNEST 패턴으로 100개 이벤트를 단일 쿼리로 업데이트'
@@ -601,6 +657,27 @@ const ENDPOINT_FLOWS = {
         type: 'string',
         required: false,
         description: '티커 필터 (쉼표 구분, 예: "AAPL,MSFT"). 미지정 시 전체 티커'
+      },
+      {
+        name: 'max_workers',
+        type: 'number',
+        required: false,
+        default: '20',
+        min: 1,
+        max: 100,
+        description: '동시 실행 worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정',
+        examples: [
+          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
+          { value: '20', description: '기본값 (균형)' },
+          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
+        ]
+      },
+      {
+        name: 'verbose',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '상세 로그 출력. true면 티커별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       },
     ],
     usageExamples: [
@@ -811,6 +888,27 @@ const ENDPOINT_FLOWS = {
         required: false,
         default: 'false',
         description: 'true면 변경사항만 표시하고 실제 DB 수정 없음 (테스트용)'
+      },
+      {
+        name: 'max_workers',
+        type: 'number',
+        required: false,
+        default: '20',
+        min: 1,
+        max: 100,
+        description: '동시 실행 worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정',
+        examples: [
+          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
+          { value: '20', description: '기본값 (균형)' },
+          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
+        ]
+      },
+      {
+        name: 'verbose',
+        type: 'boolean',
+        required: false,
+        default: 'false',
+        description: '상세 로그 출력. true면 테이블별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       },
     ],
     usageExamples: [
@@ -1711,6 +1809,26 @@ export default function SetRequestsPage() {
             엔드포인트 흐름도 - 각 단계의 🔌 API 버튼을 클릭하여 변경할 수 있습니다
           </p>
         </header>
+
+        {/* 워크플로우 안내 */}
+        <div style={{
+          padding: 'var(--space-3)',
+          backgroundColor: '#fef3c7',
+          borderRadius: 'var(--rounded)',
+          border: '1px solid #fcd34d',
+          marginBottom: 'var(--space-4)'
+        }}>
+          <div style={{ fontWeight: 'var(--font-semibold)', color: '#92400e', marginBottom: '8px' }}>
+            ⚡ 엔드포인트 실행 순서 (권장)
+          </div>
+          <ol style={{ margin: 0, paddingLeft: '20px', fontSize: 'var(--text-sm)', color: '#78350f', lineHeight: '1.6' }}>
+            <li><strong>GET /sourceData</strong>: FMP API에서 외부 데이터 수집 (holiday, target, consensus, earning)</li>
+            <li><strong>POST /setEventsTable</strong>: evt_* 테이블을 txn_events로 통합</li>
+            <li><strong>POST /getQuantitatives</strong>: 티커별 재무/가격 데이터를 DB에 저장 (API 호출)</li>
+            <li><strong>POST /backfillEventsTable</strong>: txn_events의 valuation metrics 계산 (DB 조회만, API 호출 없음)</li>
+            <li><strong>POST /generatePriceTrends</strong>: 가격 추세 데이터 생성 (±14 trading days)</li>
+          </ol>
+        </div>
 
         {/* 안내 */}
         <div style={{

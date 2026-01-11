@@ -53,7 +53,8 @@ async def generate_price_trends_endpoint(
             from_date=params.from_date,
             to_date=params.to_date,
             tickers=ticker_list,
-            max_workers=params.max_workers
+            max_workers=params.max_workers,
+            verbose=params.verbose
         )
 
         return {

@@ -139,7 +139,15 @@
       "Bash(git checkout:*)",
       "Bash(rm:*)",
       "mcp__supabase__execute_sql",
-      "mcp__supabase__list_tables"
+      "mcp__supabase__list_tables",
+      "Bash(del /f \"C:\\\\dev\\\\1227\\\\alsign\\\\backend\\\\consensus_calculation.py\")",
+      "Bash(ls:*)",
+      "Bash(psql:*)",
+      "Bash(clip:*)",
+      "Bash(wmic process where \"name=''python.exe''\" delete)",
+      "Bash(wmic process where \"CommandLine like ''%uvicorn%''\" get ProcessId,CommandLine)",
+      "Bash(wmic process where \"name=''python.exe'' and CommandLine like ''%uvicorn%''\" get ProcessId,CommandLine)",
+      "Bash(wmic process:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

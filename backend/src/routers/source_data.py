@@ -68,7 +68,8 @@ async def get_source_data(
                 )
                 result = await source_data_service.get_holidays(
                     overwrite=params.overwrite,
-                    max_workers=params.max_workers
+                    max_workers=params.max_workers,
+                    verbose=params.verbose
                 )
                 results['holiday'] = result
                 total_success += result['counters'].success
@@ -90,7 +91,8 @@ async def get_source_data(
                 )
                 result = await source_data_service.get_targets(
                     overwrite=params.overwrite,
-                    max_workers=params.max_workers
+                    max_workers=params.max_workers,
+                    verbose=params.verbose
                 )
                 results['target'] = result
                 total_success += result['counters'].success
@@ -118,7 +120,8 @@ async def get_source_data(
                     from_date=params.from_date,
                     to_date=params.to_date,
                     partitions_param=params.partitions,
-                    max_workers=params.max_workers
+                    max_workers=params.max_workers,
+                    verbose=params.verbose
                 )
                 results['consensus'] = result
                 total_success += result['counters'].success
@@ -141,7 +144,8 @@ async def get_source_data(
                 result = await source_data_service.get_earning(
                     overwrite=params.overwrite,
                     past=params.past,
-                    max_workers=params.max_workers
+                    max_workers=params.max_workers,
+                    verbose=params.verbose
                 )
                 results['earning'] = result
                 total_success += result['counters'].success
