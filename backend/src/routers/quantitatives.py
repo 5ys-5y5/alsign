@@ -66,8 +66,7 @@ async def get_quantitatives_endpoint(
             overwrite=params.overwrite,
             apis=api_list,
             tickers=ticker_list,
-            max_workers=params.max_workers,
-            verbose=params.verbose
+            max_workers=params.max_workers
         )
 
         return {
@@ -174,8 +173,7 @@ async def stream_get_quantitatives(
                         overwrite=params.overwrite,
                         apis=api_list,
                         tickers=ticker_list,
-                        max_workers=params.max_workers,
-                        verbose=params.verbose
+                        max_workers=params.max_workers
                     )
 
                     total_elapsed_ms = int((time.time() - start_time) * 1000)

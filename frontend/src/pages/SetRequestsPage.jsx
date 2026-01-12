@@ -88,13 +88,6 @@ const ENDPOINT_FLOWS = {
           { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
         ]
       },
-      {
-        name: 'verbose',
-        type: 'boolean',
-        required: false,
-        default: 'false',
-        description: '상세 로그 출력. true면 모드별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
-      },
     ],
     usageExamples: [
       {
@@ -279,20 +272,6 @@ const ENDPOINT_FLOWS = {
         ]
       },
       {
-        name: 'verbose',
-        type: 'boolean',
-        required: false,
-        default: 'false',
-        description: '상세 로그 출력. true면 티커별, API별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
-      }
-    ],
-    usageExamples: [
-      {
-        title: '기본 실행 (모든 API)',
-        url: 'POST /getQuantitatives',
-        description: 'targets + peers 전체 티커 대상으로 모든 quantitatives API 수집'
-      },
-      {
         title: '선택적 API만 수집',
         url: 'POST /getQuantitatives?apis=ratios,key-metrics',
         description: 'Financial Ratios와 Key Metrics만 수집 (기존 데이터 유지)'
@@ -459,12 +438,12 @@ const ENDPOINT_FLOWS = {
         required: false,
         default: 'None',
         min: 100,
-        max: 50000,
-        description: '배치 처리 크기 (100-50000). 미지정 시 전체 이벤트를 한 번에 처리. 더 작은 배치(1000-5000)는 빠른 피드백과 진행 상황 추적 제공 (I-44)',
+        max: 10000,
+        description: '배치 처리: OFFSET/LIMIT를 사용해 이벤트를 청크 단위로 처리합니다. 예: 5000 = 5000개 이벤트 처리 후 다음 5000개, 모두 완료될 때까지 반복. 최댓값: 10,000 (Supabase 무료 플랜: 1GB RAM). 메모리 고갈 방지를 위해 1000-5000 사용 권장.',
         examples: [
-          { value: '1000', description: '빠른 피드백을 위한 작은 배치' },
-          { value: '5000', description: '균형잡힌 배치 크기 (권장)' },
-          { value: '10000', description: '대용량 처리를 위한 큰 배치' }
+          { value: '1000', description: '1000개씩 처리 (작은 청크, 빠른 피드백)' },
+          { value: '5000', description: '5000개씩 처리 (권장 배치 크기)' },
+          { value: '10000', description: '10000개씩 처리 (최대, Supabase 제한)' }
         ]
       },
       {
@@ -480,13 +459,6 @@ const ENDPOINT_FLOWS = {
           { value: '20', description: '기본값 (균형)' },
           { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
         ]
-      },
-      {
-        name: 'verbose',
-        type: 'boolean',
-        required: false,
-        default: 'false',
-        description: '상세 로그 출력. true면 이벤트별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       },
     ],
     behaviorMatrix: [
@@ -526,12 +498,7 @@ const ENDPOINT_FLOWS = {
       {
         title: '배치 처리 (점진적 피드백)',
         url: 'POST /backfillEventsTable?batch_size=5000',
-        description: '5,000개씩 배치 처리하여 빠른 진행 피드백 제공 (I-44)'
-      },
-      {
-        title: '상세 로그 활성화 (문제 디버깅)',
-        url: 'POST /backfillEventsTable?verbose=true',
-        description: '이벤트별, 티커별 상세 로그 출력으로 문제 원인 상세 파악'
+        description: '5,000개씩 배치 처리하여 빠른 진행 피드백 제공. 최대 10,000 (Supabase 무료 플랜 제한)'
       },
     ],
     phases: [
@@ -671,13 +638,6 @@ const ENDPOINT_FLOWS = {
           { value: '20', description: '기본값 (균형)' },
           { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
         ]
-      },
-      {
-        name: 'verbose',
-        type: 'boolean',
-        required: false,
-        default: 'false',
-        description: '상세 로그 출력. true면 티커별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
       },
     ],
     usageExamples: [
@@ -904,14 +864,24 @@ const ENDPOINT_FLOWS = {
         ]
       },
       {
-        name: 'verbose',
-        type: 'boolean',
+        name: 'cleanup_mode',
+        type: 'string',
         required: false,
-        default: 'false',
-        description: '상세 로그 출력. true면 테이블별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력하여 효율적인 문제 식별 가능'
+        description: 'config_lv3_targets에 없는 invalid ticker 정리 모드. preview=삭제 대상 조회 (변경 없음), archive=txn_events_archived로 이동 후 삭제 (복구 가능), delete=영구 삭제 (복구 불가)',
+        examples: [
+          { value: 'preview', description: '삭제 대상만 조회 (권장: 먼저 실행)' },
+          { value: 'archive', description: 'Archive 후 삭제 (안전, 권장)' },
+          { value: 'delete', description: '영구 삭제 (주의: 복구 불가!)' }
+        ]
       },
     ],
     usageExamples: [
+      {
+        title: '📌 기본 사용법',
+        url: '',
+        description: '일반적인 테이블 통합 작업',
+        isSection: true
+      },
       {
         title: '기본: 모든 evt_* 테이블 통합',
         url: 'POST /setEventsTable',
@@ -937,6 +907,33 @@ const ENDPOINT_FLOWS = {
         url: 'POST /setEventsTable?overwrite=true',
         description: 'NULL뿐만 아니라 불일치하는 sector/industry도 수정'
       },
+      {
+        title: '🧹 Cleanup 모드 (Invalid Ticker 정리)',
+        url: '',
+        description: 'config_lv3_targets에 없는 ticker를 정리하는 3단계 워크플로우',
+        isSection: true
+      },
+      {
+        title: '1️⃣ Preview - 삭제 대상 조회',
+        url: 'POST /setEventsTable?cleanup_mode=preview',
+        description: '🔍 삭제될 ticker와 이벤트 수 확인 (DB 변경 없음, 안전). 반드시 먼저 실행하여 영향 범위 파악'
+      },
+      {
+        title: '2️⃣ Archive - 안전한 삭제 (권장)',
+        url: 'POST /setEventsTable?cleanup_mode=archive',
+        description: '📦 txn_events_archived 테이블로 이동 후 txn_events에서 삭제. 나중에 복구 가능하므로 안전'
+      },
+      {
+        title: '3️⃣ Delete - 영구 삭제 (주의)',
+        url: 'POST /setEventsTable?cleanup_mode=delete',
+        description: '⚠️ txn_events에서 영구 삭제 (복구 불가!). 백업 없이는 사용 권장하지 않음'
+      },
+      {
+        title: '💡 Cleanup 워크플로우 예시',
+        url: '',
+        description: '① preview로 확인 → ② archive로 안전하게 정리 → ③ txn_events_archived에서 데이터 확인',
+        isSection: true
+      },
     ],
     phases: [
       {
@@ -955,6 +952,12 @@ const ENDPOINT_FLOWS = {
         id: 'upsert',
         title: '3. UPSERT',
         description: 'txn_events 테이블에 INSERT/UPDATE',
+        apiId: null
+      },
+      {
+        id: 'cleanup',
+        title: '4. Cleanup (선택)',
+        description: 'config_lv3_targets에 없는 invalid ticker 정리 (cleanup_mode 파라미터 필요)',
         apiId: null
       }
     ]
@@ -1281,38 +1284,73 @@ function EndpointFlowDiagram({ endpoint, onApiClick }) {
             💡 Usage Examples
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            {endpoint.usageExamples.map((example, idx) => (
-              <div
-                key={idx}
-                style={{
-                  padding: 'var(--space-2)',
-                  backgroundColor: '#eff6ff',
-                  border: '1px solid #bfdbfe',
-                  borderRadius: 'var(--rounded)',
-                }}
-              >
-                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: '#1e40af', marginBottom: '4px' }}>
-                  {idx + 1}. {example.title}
+            {endpoint.usageExamples.map((example, idx) => {
+              // 섹션 헤더 렌더링
+              if (example.isSection) {
+                return (
+                  <div
+                    key={idx}
+                    style={{
+                      marginTop: idx > 0 ? '12px' : '0',
+                      marginBottom: '4px',
+                      fontSize: 'var(--text-sm)',
+                      fontWeight: 'var(--font-bold)',
+                      color: '#1e40af',
+                      borderBottom: '2px solid #bfdbfe',
+                      paddingBottom: '4px'
+                    }}
+                  >
+                    {example.title}
+                    {example.description && (
+                      <div style={{
+                        fontSize: 'var(--text-xs)',
+                        fontWeight: 'normal',
+                        color: '#64748b',
+                        marginTop: '2px'
+                      }}>
+                        {example.description}
+                      </div>
+                    )}
+                  </div>
+                );
+              }
+
+              // 일반 예제 렌더링
+              return (
+                <div
+                  key={idx}
+                  style={{
+                    padding: 'var(--space-2)',
+                    backgroundColor: '#eff6ff',
+                    border: '1px solid #bfdbfe',
+                    borderRadius: 'var(--rounded)',
+                  }}
+                >
+                  <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: '#1e40af', marginBottom: '4px' }}>
+                    {example.title}
+                  </div>
+                  {example.url && (
+                    <code style={{
+                      display: 'block',
+                      padding: '6px 8px',
+                      backgroundColor: 'white',
+                      borderRadius: 'var(--rounded)',
+                      fontSize: 'var(--text-xs)',
+                      fontFamily: 'monospace',
+                      color: '#1e3a8a',
+                      marginBottom: '4px',
+                      overflowX: 'auto',
+                      whiteSpace: 'nowrap'
+                    }}>
+                      {example.url}
+                    </code>
+                  )}
+                  <div style={{ fontSize: 'var(--text-xs)', color: '#1e40af' }}>
+                    → {example.description}
+                  </div>
                 </div>
-                <code style={{
-                  display: 'block',
-                  padding: '6px 8px',
-                  backgroundColor: 'white',
-                  borderRadius: 'var(--rounded)',
-                  fontSize: 'var(--text-xs)',
-                  fontFamily: 'monospace',
-                  color: '#1e3a8a',
-                  marginBottom: '4px',
-                  overflowX: 'auto',
-                  whiteSpace: 'nowrap'
-                }}>
-                  {example.url}
-                </code>
-                <div style={{ fontSize: 'var(--text-xs)', color: '#1e40af' }}>
-                  → {example.description}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -1823,7 +1861,16 @@ export default function SetRequestsPage() {
           </div>
           <ol style={{ margin: 0, paddingLeft: '20px', fontSize: 'var(--text-sm)', color: '#78350f', lineHeight: '1.6' }}>
             <li><strong>GET /sourceData</strong>: FMP API에서 외부 데이터 수집 (holiday, target, consensus, earning)</li>
-            <li><strong>POST /setEventsTable</strong>: evt_* 테이블을 txn_events로 통합</li>
+            <li><strong>POST /setEventsTable</strong>: evt_* 테이블을 txn_events로 통합
+              <div style={{ marginTop: '4px', paddingLeft: '12px', fontSize: '0.9em', color: '#b45309' }}>
+                💡 <strong>cleanup_mode 옵션</strong>: config_lv3_targets에 없는 invalid ticker 정리
+                <ul style={{ margin: '4px 0', paddingLeft: '20px' }}>
+                  <li><code>?cleanup_mode=preview</code>: 삭제 대상만 조회 (권장: 먼저 실행)</li>
+                  <li><code>?cleanup_mode=archive</code>: txn_events_archived로 이동 후 삭제 (안전, 권장)</li>
+                  <li><code>?cleanup_mode=delete</code>: 영구 삭제 (주의: 복구 불가!)</li>
+                </ul>
+              </div>
+            </li>
             <li><strong>POST /getQuantitatives</strong>: 티커별 재무/가격 데이터를 DB에 저장 (API 호출)</li>
             <li><strong>POST /backfillEventsTable</strong>: txn_events의 valuation metrics 계산 (DB 조회만, API 호출 없음)</li>
             <li><strong>POST /generatePriceTrends</strong>: 가격 추세 데이터 생성 (±14 trading days)</li>

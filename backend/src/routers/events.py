@@ -32,8 +32,13 @@ async def set_events_table(
     Auto-discovers evt_* tables in specified schema, extracts events,
     inserts into txn_events, and enriches with sector/industry from config_lv3_targets.
 
+    Optional cleanup mode:
+    - preview: Show invalid tickers that would be deleted (no changes)
+    - archive: Move invalid ticker events to txn_events_archived then delete
+    - delete: Permanently delete invalid ticker events (WARNING: no recovery)
+
     Args:
-        params: Query parameters
+        params: Query parameters including cleanup_mode
 
     Returns:
         SetEventsTableResponse with summary and per-table results
@@ -55,8 +60,8 @@ async def set_events_table(
             dry_run=params.dryRun,
             schema=params.schema,
             table_filter=table_filter,
-            max_workers=params.max_workers,
-            verbose=params.verbose
+            cleanup_mode=params.cleanup_mode,
+            max_workers=params.max_workers
         )
 
         # Build response
@@ -121,8 +126,7 @@ async def backfill_events_table(
             tickers=ticker_list,
             metrics_list=metrics_list,
             batch_size=params.batch_size,
-            max_workers=params.max_workers,
-            verbose=params.verbose
+            max_workers=params.max_workers
         )
 
         # Determine HTTP status code

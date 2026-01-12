@@ -718,6 +718,193 @@ async def process_ticker_batch(
 # The sequential event processing loop has been replaced by parallel processing above
 # Git history contains the original implementation if needed for reference
 
+async def process_single_batch(
+    pool,
+    offset: int,
+    batch_size: Optional[int],
+    from_date: Optional[date],
+    to_date: Optional[date],
+    tickers: Optional[List[str]],
+    overwrite: bool,
+    metrics_list: Optional[List[str]],
+    metrics_by_domain: Dict[str, List[Dict[str, Any]]],
+    max_workers: int,
+    start_time: float,
+    batch_number: int,
+    cancel_event: Optional[asyncio.Event] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Process a single batch of events (Phase 2-4).
+
+    Args:
+        pool: Database connection pool
+        offset: Starting offset for this batch
+        batch_size: Number of events to process in this batch
+        from_date, to_date, tickers, overwrite, metrics_list: Filter parameters
+        metrics_by_domain: Pre-loaded metric definitions
+        max_workers: Concurrency limit
+        start_time: Overall start time for elapsed calculation
+        batch_number: Current batch number (for logging)
+
+    Returns:
+        Dict with batch results or None if no events to process
+    """
+    # Phase 2: Load events batch
+    phase2_start = time.time()
+    try:
+        events = await metrics.select_events_for_valuation(
+            pool,
+            limit=batch_size,
+            offset=offset,
+            from_date=from_date,
+            to_date=to_date,
+            tickers=tickers,
+            overwrite=overwrite,
+            metrics_list=metrics_list
+        )
+        phase2_elapsed = time.time() - phase2_start
+        if batch_size:
+            logger.info(f"[Batch {batch_number}] Phase 2: Loaded {len(events):,} events in {phase2_elapsed:.2f}s (offset={offset:,}, overwrite={overwrite})")
+        else:
+            logger.info(f"[Phase 2] Loaded {len(events):,} events in {phase2_elapsed:.2f}s (all events, overwrite={overwrite})")
+    except Exception as e:
+        logger.error(f"[Batch {batch_number}] Phase 2 FAILED: {e}")
+        raise
+
+    # Early return if no events to process
+    if len(events) == 0:
+        return None
+
+    # Phase 3: Group events by ticker
+    phase3_start = time.time()
+    ticker_groups = group_events_by_ticker(events)
+    phase3_elapsed = time.time() - phase3_start
+    logger.info(f"[Batch {batch_number}] Phase 3: Grouped {len(events):,} events into {len(ticker_groups):,} tickers ({phase3_elapsed:.2f}s)")
+
+    # Phase 3.5: Global Peer Collection (INDEPENDENT PER BATCH!)
+    global_peer_cache = {}
+    ticker_to_peers = {}
+
+    try:
+        # Step 1: Load peer mappings
+        peer_collect_start = time.time()
+        ticker_to_peers = await get_batch_peer_tickers_from_db(pool, list(ticker_groups.keys()))
+
+        # Limit to 10 peers per ticker
+        unique_peers = set()
+        for ticker, peer_list in ticker_to_peers.items():
+            if peer_list:
+                ticker_to_peers[ticker] = peer_list[:10]
+                unique_peers.update(peer_list[:10])
+
+        peer_collect_elapsed = time.time() - peer_collect_start
+
+        # Step 2: Load peer financials
+        if unique_peers:
+            peer_fetch_start = time.time()
+
+            transforms = await metrics.select_metric_transforms(pool)
+            engine = MetricCalculationEngine(metrics_by_domain, transforms)
+            required_apis = engine.get_required_apis()
+            required_apis_with_ratios = set(required_apis)
+            required_apis_with_ratios.add('fmp-ratios')
+
+            global_peer_cache = await get_batch_quantitative_data_from_db(
+                pool,
+                list(unique_peers),
+                list(required_apis_with_ratios)
+            )
+
+            peer_fetch_elapsed = time.time() - peer_fetch_start
+            logger.info(f"[Batch {batch_number}] Phase 3.5: Loaded {len(global_peer_cache):,} peers in {peer_fetch_elapsed:.2f}s")
+        else:
+            logger.warning(f"[Batch {batch_number}] Phase 3.5: No peer tickers found")
+            global_peer_cache = {}
+
+    except Exception as e:
+        logger.error(f"[Batch {batch_number}] Phase 3.5 Failed to build peer cache: {e}")
+        global_peer_cache = {}
+        ticker_to_peers = {}
+
+    # Phase 4: Process tickers in parallel
+    semaphore = asyncio.Semaphore(max_workers)
+
+    # Progress tracking
+    completed_tickers = 0
+    total_tickers = len(ticker_groups)
+    ticker_start_time = time.time()
+
+    total_events_count = len(events)
+    completed_events_count = {'count': 0}
+
+    async def process_ticker_with_semaphore(ticker: str, ticker_events: List[Dict[str, Any]]):
+        nonlocal completed_tickers
+
+        if cancel_event and cancel_event.is_set():
+            logger.warning(f"[Batch {batch_number}] Cancelled - skipping ticker {ticker}")
+            return {
+                'ticker': ticker,
+                'results': [],
+                'quant_success': 0,
+                'quant_fail': 0,
+                'qual_success': 0,
+                'qual_fail': 0
+            }
+
+        async with semaphore:
+            result = await process_ticker_batch(
+                pool, ticker, ticker_events, metrics_by_domain, overwrite,
+                total_events_count, completed_events_count,
+                metrics_list,
+                global_peer_cache,
+                ticker_to_peers
+            )
+
+            completed_tickers += 1
+            return result
+
+    logger.info(f"[Batch {batch_number}] Phase 4: Processing {total_tickers:,} tickers with concurrency={max_workers}")
+
+    # Create and execute tasks
+    tasks = [
+        process_ticker_with_semaphore(ticker, ticker_events)
+        for ticker, ticker_events in ticker_groups.items()
+    ]
+
+    ticker_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Aggregate results
+    results = []
+    quantitative_success = 0
+    quantitative_fail = 0
+    qualitative_success = 0
+    qualitative_fail = 0
+
+    for ticker_result in ticker_results:
+        if isinstance(ticker_result, Exception):
+            logger.error(f"[Batch {batch_number}] Ticker batch failed: {ticker_result}")
+            continue
+
+        results.extend(ticker_result['results'])
+        quantitative_success += ticker_result['quant_success']
+        quantitative_fail += ticker_result['quant_fail']
+        qualitative_success += ticker_result['qual_success']
+        qualitative_fail += ticker_result['qual_fail']
+
+    batch_elapsed = time.time() - phase2_start
+    logger.info(f"[Batch {batch_number}] Complete: {len(results):,} events, {len(ticker_groups):,} tickers, {len(global_peer_cache):,} peers in {batch_elapsed:.1f}s")
+
+    return {
+        'results': results,
+        'events_count': len(events),
+        'tickers_count': len(ticker_groups),
+        'unique_peer_count': len(global_peer_cache),
+        'quantitative_success': quantitative_success,
+        'quantitative_fail': quantitative_fail,
+        'qualitative_success': qualitative_success,
+        'qualitative_fail': qualitative_fail
+    }
+
 
 async def calculate_valuations(
     overwrite: bool = False,
@@ -784,27 +971,63 @@ async def calculate_valuations(
     if not metrics_by_domain:
         logger.warning("[Phase 1] No metrics found in config_lv2_metric")
 
-    # Phase 2: Load events to process
-    phase2_start = time.time()
-    try:
-        events = await metrics.select_events_for_valuation(
-            pool,
-            limit=batch_size,
+    # Phase 2-4: Batch processing loop
+    current_offset = 0
+    batch_number = 0
+    all_results = []
+    total_events_processed = 0
+    total_tickers_processed = 0
+    total_unique_peers = 0
+    all_quantitative_success = 0
+    all_quantitative_fail = 0
+    all_qualitative_success = 0
+    all_qualitative_fail = 0
+
+    while True:
+        batch_number += 1
+
+        # Process one batch
+        batch_result = await process_single_batch(
+            pool=pool,
+            offset=current_offset,
+            batch_size=batch_size,
             from_date=from_date,
             to_date=to_date,
             tickers=tickers,
             overwrite=overwrite,
-            metrics_list=metrics_list
+            metrics_list=metrics_list,
+            metrics_by_domain=metrics_by_domain,
+            max_workers=max_workers,
+            start_time=start_time,
+            batch_number=batch_number,
+            cancel_event=cancel_event
         )
-        phase2_elapsed = time.time() - phase2_start
-        logger.info(f"[Phase 2] Loaded {len(events)} events in {phase2_elapsed:.2f}s")
-    except Exception as e:
-        logger.error(f"[Phase 2] FAILED to load events: {e}")
-        raise
 
-    # Early return if no events to process
-    if len(events) == 0:
-        logger.info("[backfillEventsTable] No events to process")
+        # Break if no more events
+        if batch_result is None:
+            if batch_number == 1:
+                logger.info("[backfillEventsTable] No events to process")
+            break
+
+        # Accumulate results
+        all_results.extend(batch_result['results'])
+        total_events_processed += batch_result['events_count']
+        total_tickers_processed += batch_result['tickers_count']
+        total_unique_peers = max(total_unique_peers, batch_result['unique_peer_count'])  # Track max peers used in any batch
+        all_quantitative_success += batch_result['quantitative_success']
+        all_quantitative_fail += batch_result['quantitative_fail']
+        all_qualitative_success += batch_result['qualitative_success']
+        all_qualitative_fail += batch_result['qualitative_fail']
+
+        # If no batch_size, process all in one go
+        if not batch_size:
+            break
+
+        # Move to next batch
+        current_offset += batch_size
+
+    # Early return if no events processed
+    if len(all_results) == 0:
         summary = {
             'totalEventsProcessed': 0,
             'quantitativeSuccess': 0,
@@ -820,217 +1043,25 @@ async def calculate_valuations(
             'results': []
         }
 
-    # Phase 3: Group events by ticker
-    phase3_start = time.time()
-    ticker_groups = group_events_by_ticker(events)
-    phase3_elapsed = time.time() - phase3_start
-    logger.info(f"[Phase 3] Grouped {len(events)} events into {len(ticker_groups)} tickers ({phase3_elapsed:.2f}s)")
+    # Use aggregated results for final summary
+    events = all_results  # For compatibility with Phase 5
+    results = all_results
+    quantitative_success = all_quantitative_success
+    quantitative_fail = all_quantitative_fail
+    qualitative_success = all_qualitative_success
+    qualitative_fail = all_qualitative_fail
 
-    # Phase 3.5: Global Peer Collection
-    global_peer_cache = {}
-    ticker_to_peers = {}
-
-    try:
-        # Step 1: Load peer mappings
-        peer_collect_start = time.time()
-        ticker_to_peers = await get_batch_peer_tickers_from_db(pool, list(ticker_groups.keys()))
-
-        # Limit to 10 peers per ticker
-        unique_peers = set()
-        for ticker, peer_list in ticker_to_peers.items():
-            if peer_list:
-                ticker_to_peers[ticker] = peer_list[:10]
-                unique_peers.update(peer_list[:10])
-
-        peer_collect_elapsed = time.time() - peer_collect_start
-
-        # Step 2: Load peer financials
-        if unique_peers:
-            peer_fetch_start = time.time()
-
-            transforms = await metrics.select_metric_transforms(pool)
-            engine = MetricCalculationEngine(metrics_by_domain, transforms)
-            required_apis = engine.get_required_apis()
-            required_apis_with_ratios = set(required_apis)
-            required_apis_with_ratios.add('fmp-ratios')
-
-            global_peer_cache = await get_batch_quantitative_data_from_db(
-                pool,
-                list(unique_peers),
-                list(required_apis_with_ratios)
-            )
-
-            peer_fetch_elapsed = time.time() - peer_fetch_start
-            logger.info(f"[Phase 3.5] Loaded {len(global_peer_cache)} peers in {peer_fetch_elapsed:.2f}s")
-        else:
-            logger.warning("[Phase 3.5] No peer tickers found")
-            global_peer_cache = {}
-
-    except Exception as e:
-        logger.error(f"[Phase 3.5] Failed to build peer cache: {e}")
-        global_peer_cache = {}
-        ticker_to_peers = {}
-    
-    # Phase 4: Process tickers in parallel with concurrency control
-    # CRITICAL: DB CPU is the bottleneck, use user-configured max_workers
-    # This is DB/calculation work (not API calls), but JSONB operations are CPU-intensive
-    semaphore = asyncio.Semaphore(max_workers)
-    
-    # Progress tracking
-    completed_tickers = 0
-    total_tickers = len(ticker_groups)
-    ticker_start_time = time.time()
-    ticker_last_checkpoint_time = ticker_start_time
-    ticker_last_checkpoint_idx = 0
-    
-    # Global events progress tracking
-    total_events_count = len(events)
-    completed_events_count = {'count': 0}  # Mutable dict for sharing across async tasks
-    
-    async def process_ticker_with_semaphore(ticker: str, ticker_events: List[Dict[str, Any]]):
-        nonlocal completed_tickers
-        
-        # Check for cancellation
-        if cancel_event and cancel_event.is_set():
-            logger.warning(f"[backfillEventsTable] Cancelled - skipping ticker {ticker}")
-            return {
-                'ticker': ticker,
-                'quantitative': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
-                'qualitative': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
-                'priceTrend': {'success': 0, 'fail': 0, 'skip': len(ticker_events)},
-                'dbUpdate': {'success': 0, 'fail': 0}
-            }
-        
-        async with semaphore:
-            result = await process_ticker_batch(
-                pool, ticker, ticker_events, metrics_by_domain, overwrite,
-                total_events_count, completed_events_count,
-                metrics_list,  # I-41: Pass selective update parameters
-                global_peer_cache,  # PERF-OPT: Global peer cache
-                ticker_to_peers,  # PERF-OPT: Ticker to peers mapping
-                verbose  # Verbose logging flag
-            )
-            
-            # Update progress
-            completed_tickers += 1
-
-            # Calculate ETA for tickers
-            progress_pct = (completed_tickers / total_tickers) * 100
-            current_time = time.time()
-
-            # Log progress only at 20% intervals or final ticker
-            milestone_pct = int(progress_pct / 20) * 20
-            prev_milestone = int(((completed_tickers - 1) / total_tickers * 100) / 20) * 20
-            should_log = (milestone_pct > prev_milestone) or (completed_tickers == total_tickers)
-
-            if should_log:
-                # Calculate ETA
-                elapsed_total = current_time - ticker_start_time
-                avg_time_per_ticker = elapsed_total / completed_tickers if completed_tickers > 0 else 0
-
-                remaining_tickers = total_tickers - completed_tickers
-                eta_seconds = remaining_tickers * avg_time_per_ticker
-                eta_minutes = int(eta_seconds / 60)
-                eta_seconds_remainder = int(eta_seconds % 60)
-
-                # Format ETA
-                if eta_minutes > 60:
-                    eta_hours = eta_minutes // 60
-                    eta_minutes_remainder = eta_minutes % 60
-                    eta_str = f"{eta_hours}h {eta_minutes_remainder}min"
-                elif eta_minutes > 0:
-                    eta_str = f"{eta_minutes}min {eta_seconds_remainder}s"
-                else:
-                    eta_str = f"{eta_seconds_remainder}s"
-
-                # Current timestamp
-                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-                logger.info(
-                    f"[PROGRESS] {completed_tickers}/{total_tickers} ({progress_pct:.1f}%) | Latest: {ticker} | ETA: {eta_str} | {timestamp_str}"
-                )
-            
-            return result
-    
-    logger.info(f"[backfillEventsTable] Phase 4: Processing {total_tickers} tickers with concurrency={max_workers}")
-    
-    # Create tasks for all ticker groups
-    tasks = [
-        process_ticker_with_semaphore(ticker, ticker_events)
-        for ticker, ticker_events in ticker_groups.items()
-    ]
-    
-    # Execute all tasks concurrently
-    ticker_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Aggregate results
-    results = []
-    quantitative_success = 0
-    quantitative_fail = 0
-    qualitative_success = 0
-    qualitative_fail = 0
-    
-    for ticker_result in ticker_results:
-        if isinstance(ticker_result, Exception):
-            logger.error(f"[backfillEventsTable] Ticker batch failed: {ticker_result}")
-            continue
-        
-        # Aggregate from ticker batch
-        results.extend(ticker_result['results'])
-        quantitative_success += ticker_result['quant_success']
-        quantitative_fail += ticker_result['quant_fail']
-        qualitative_success += ticker_result['qual_success']
-        qualitative_fail += ticker_result['qual_fail']
-    
-    # Final progress - CELEBRATION!
-    final_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    total_elapsed = time.time() - ticker_start_time
-    total_elapsed_minutes = int(total_elapsed / 60)
-    total_elapsed_seconds = int(total_elapsed % 60)
-    
-    if total_elapsed_minutes > 60:
-        total_elapsed_hours = total_elapsed_minutes // 60
-        total_elapsed_minutes_remainder = total_elapsed_minutes % 60
-        elapsed_str = f"{total_elapsed_hours}h {total_elapsed_minutes_remainder}min"
-    elif total_elapsed_minutes > 0:
-        elapsed_str = f"{total_elapsed_minutes}min {total_elapsed_seconds}s"
-    else:
-        elapsed_str = f"{total_elapsed_seconds}s"
-    
+    # Log final batch summary
+    total_elapsed = time.time() - start_time
     logger.info(
-        f"\n\n{'='*90}\n"
-        f"{'='*90}\n"
-        f"[TICKER PROGRESS] {len(ticker_groups)}/{len(ticker_groups)} (100.0%) | ✅ ALL TICKERS COMPLETE!\n"
-        f"TIMESTAMP: {final_timestamp}\n"
-        f"TOTAL TIME: {elapsed_str}\n"
-        f"{'='*90}\n"
-        f"{'='*90}\n"
-        f"\n[📊 SUMMARY]\n"
-        f"  - Total Events: {len(results)}\n"
-        f"  - Quantitative: {quantitative_success}✓ / {quantitative_fail}✗\n"
-        f"  - Qualitative: {qualitative_success}✓ / {qualitative_fail}✗\n"
-        f"{'='*90}\n"
-    )
-    
-    logger.info(
-        f"Completed all ticker batches: {len(ticker_groups)} tickers, {len(results)} events",
-        extra={
-            'endpoint': 'POST /backfillEventsTable',
-            'phase': 'ticker_batches_complete',
-            'elapsed_ms': int((time.time() - start_time) * 1000),
-            'counters': {
-                'tickers': len(ticker_groups),
-                'events': len(results),
-                'quant_success': quantitative_success,
-                'quant_fail': quantitative_fail,
-                'qual_success': qualitative_success,
-                'qual_fail': qualitative_fail
-            },
-            'progress': {},
-            'rate': {},
-            'batch': {},
-            'warn': []
-        }
+        f"\n{'='*90}\n"
+        f"[BATCH PROCESSING COMPLETE] {batch_number} batches | "
+        f"{len(results):,} events | "
+        f"{total_tickers_processed:,} tickers | "
+        f"{total_unique_peers:,} max peers\n"
+        f"Time: {int(total_elapsed/60)}min {int(total_elapsed%60)}s | "
+        f"Success: {quantitative_success:,}✓ / {quantitative_fail:,}✗\n"
+        f"{'='*90}"
     )
 
     # Phase 5: Generate price trends
@@ -1051,17 +1082,24 @@ async def calculate_valuations(
 
     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
-    # Build summary
+    # Build summary with comprehensive stats
     summary = {
-        'totalEventsProcessed': len(events),
+        'totalBatches': batch_number,
+        'totalEventsProcessed': len(results),
+        'totalTickersProcessed': total_tickers_processed,
+        'totalUniquePeersUsed': total_unique_peers,
+        'batchSize': batch_size if batch_size else None,
         'quantitativeSuccess': quantitative_success,
         'quantitativeFail': quantitative_fail,
         'qualitativeSuccess': qualitative_success,
         'qualitativeFail': qualitative_fail,
-        'elapsedMs': total_elapsed_ms
+        'totalDbUpdates': quantitative_success + qualitative_success,
+        'elapsedMs': total_elapsed_ms,
+        'averagePerEventMs': int(total_elapsed_ms / max(1, len(results))),
+        'eventsPerSecond': int(len(results) / max(1, total_elapsed_ms / 1000))
     }
 
-    logger.info(f"[backfillEventsTable] COMPLETE - Processed: {len(events)}, Success: {quantitative_success}/{qualitative_success}, Fail: {quantitative_fail}/{qualitative_fail}, Elapsed: {total_elapsed_ms}ms")
+    logger.info(f"[backfillEventsTable] ✅ COMPLETE - Events: {len(results):,}, Tickers: {total_tickers_processed:,}, Peers: {total_unique_peers:,}, Success: {quantitative_success:,}✓/{quantitative_fail:,}✗")
 
     return {
         'summary': summary,

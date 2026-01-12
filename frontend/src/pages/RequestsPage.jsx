@@ -805,13 +805,6 @@ export default function RequestsPage() {
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
             },
-            {
-              key: 'verbose',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: '상세 로그 출력. true면 모드별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
-            },
             { ...TIMEOUT_FIELD },
           ]}
           onRequestStart={handleRequestStart}
@@ -857,13 +850,6 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 ticker worker 수 (1-100). DB CPU에 따라 조정. 기본값: 20',
-            },
-            {
-              key: 'verbose',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: '상세 로그 출력. true면 티커별, API별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}
@@ -916,11 +902,22 @@ export default function RequestsPage() {
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
             },
             {
-              key: 'verbose',
-              type: 'boolean',
-              control: 'checkbox',
+              key: 'cleanup_mode',
+              type: 'string',
+              control: 'select',
               required: false,
-              description: '상세 로그 출력. true면 테이블별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
+              options: ['preview', 'archive', 'delete'],
+              placeholder: '(선택 안 함)',
+              dynamicDescription: (params) => {
+                if (params.cleanup_mode === 'preview') {
+                  return '🔍 Preview: config_lv3_targets에 없는 invalid ticker 조회만 (DB 변경 없음, 권장: 먼저 실행)';
+                } else if (params.cleanup_mode === 'archive') {
+                  return '📦 Archive: Invalid ticker를 txn_events_archived로 이동 후 삭제 (복구 가능, 권장)';
+                } else if (params.cleanup_mode === 'delete') {
+                  return '⚠️ Delete: Invalid ticker 영구 삭제 (복구 불가, 주의!)';
+                }
+                return 'Invalid ticker 정리 모드. preview로 먼저 확인 후 archive 권장';
+              },
             },
             { ...TIMEOUT_FIELD },
           ]}
@@ -978,14 +975,14 @@ export default function RequestsPage() {
             },
             {
               key: 'batch_size',
-              label: 'Batch Size (100-50,000)',
+              label: 'Batch Size (100-10,000)',
               type: 'number',
               control: 'input',
               required: false,
               placeholder: '5000',
               min: 100,
-              max: 50000,
-              description: 'Number of events to process per batch. Use smaller values (1,000-5,000) for faster feedback (I-44)',
+              max: 10000,
+              description: 'BATCH PROCESSING: Processes events in chunks using OFFSET/LIMIT. Example: 5000 = process 5000 events, then next 5000, until all done. Maximum: 10,000 (Supabase free tier: 1GB RAM). Use 1000-5000 to prevent memory exhaustion.',
             },
             {
               key: 'max_workers',
@@ -996,13 +993,6 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
-            },
-            {
-              key: 'verbose',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: '상세 로그 출력. true면 이벤트별, 티커별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}
@@ -1065,13 +1055,6 @@ export default function RequestsPage() {
               max: 100,
               required: false,
               description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
-            },
-            {
-              key: 'verbose',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: '상세 로그 출력. true면 티커별, 이벤트별 상세 로그 출력. false(기본값)면 요약 로그만 출력',
             },
             { ...TIMEOUT_FIELD },
           ]}

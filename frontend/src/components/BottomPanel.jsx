@@ -15,7 +15,6 @@ import { useLog } from '../contexts/LogContext';
 export default function BottomPanel() {
   const {
     requests,
-    logs,
     panelOpen,
     panelPosition,
     panelSize,
@@ -28,10 +27,43 @@ export default function BottomPanel() {
 
   const [activeTab, setActiveTab] = useState('status');
   const [selectedRequestId, setSelectedRequestId] = useState(null);
+  const [highlightedVerboseIndex, setHighlightedVerboseIndex] = useState(null);
   const [isResizing, setIsResizing] = useState(false);
   const [headerHeight, setHeaderHeight] = useState(52);
-  const logEndRef = useRef(null);
+  const [logFilters, setLogFilters] = useState(() => {
+    // Load filters from localStorage
+    const saved = localStorage.getItem('logFilters');
+    return saved ? JSON.parse(saved) : {};
+  });
   const detailsEndRef = useRef(null);
+
+  // Save filters to localStorage whenever they change
+  React.useEffect(() => {
+    localStorage.setItem('logFilters', JSON.stringify(logFilters));
+  }, [logFilters]);
+
+  // Extract log patterns from logs
+  const extractLogPatterns = useCallback((logs) => {
+    const patterns = new Set();
+    logs.forEach((log) => {
+      const match = log.match(/^\[([^\]]+)\]/);
+      if (match) {
+        patterns.add(match[1]);
+      }
+    });
+    return Array.from(patterns).sort();
+  }, []);
+
+  // Apply filters to logs
+  const applyFilters = useCallback((logs) => {
+    if (Object.keys(logFilters).length === 0) return logs;
+    return logs.filter((log) => {
+      const match = log.match(/^\[([^\]]+)\]/);
+      if (!match) return true; // No pattern, always show
+      const pattern = match[1];
+      return logFilters[pattern] !== false; // Show if not explicitly hidden
+    });
+  }, [logFilters]);
 
   // Dynamically measure navigation height
   React.useEffect(() => {
@@ -49,7 +81,6 @@ export default function BottomPanel() {
 
   // Panel position styles
   const isRightPanel = panelPosition === 'right';
-  const headerHeightPx = `${headerHeight}px`;
 
   // Handle resize mouse events
   const handleMouseDown = useCallback((e) => {
@@ -164,16 +195,6 @@ export default function BottomPanel() {
         transition: 'all 0.2s ease-in-out',
       };
 
-  const scrollToBottom = useCallback(() => {
-    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, []);
-
-  React.useEffect(() => {
-    if (activeTab === 'logs') {
-      scrollToBottom();
-    }
-  }, [logs, activeTab, scrollToBottom]);
-
   const formatTime = (timestamp) => {
     const date = new Date(timestamp);
     return date.toLocaleTimeString('en-US', { hour12: false });
@@ -207,31 +228,161 @@ export default function BottomPanel() {
     );
   };
 
-  const getLogLevelBadge = (level) => {
-    const styles = {
-      info: { backgroundColor: '#dbeafe', color: '#1e40af' },
-      success: { backgroundColor: '#d1fae5', color: '#065f46' },
-      error: { backgroundColor: '#fee2e2', color: '#991b1b' },
-    };
-
-    return (
-      <span
-        style={{
-          ...styles[level],
-          padding: '2px var(--space-1)',
-          borderRadius: 'var(--rounded-lg)',
-          fontSize: 'var(--text-xs)',
-          fontWeight: 'var(--font-medium)',
-          textTransform: 'uppercase',
-          minWidth: '60px',
-          display: 'inline-block',
-          textAlign: 'center',
-        }}
-      >
-        {level}
-      </span>
-    );
+  const formatIndexedLog = (index, line) => {
+    const paddedIndex = String(index).padStart(4, '0');
+    return `${paddedIndex} | ${line}`;
   };
+
+  const extractPhase = (line) => {
+    if (typeof line !== 'string') return null;
+    const headerMatch = line.match(/^\[([^\]]+)\]/);
+    if (!headerMatch) return null;
+    const parts = headerMatch[1].split('|').map((part) => part.trim());
+    return parts[1] || null;
+  };
+
+  const buildSummaryLogs = (lines) => {
+    const summaryEntries = [];
+    const includedIndexes = new Set();
+    const seenPhases = new Set();
+    const lastProgressPctByPhase = new Map();
+
+    lines.forEach((line, idx) => {
+      if (typeof line !== 'string') return;
+
+      const index = idx + 1;
+      const phase = extractPhase(line);
+      const phaseKey = phase || 'global';
+
+      const isFirstLine = idx === 0;
+      const isLastLine = idx === lines.length - 1;
+
+      const progressMatch = line.match(/progress=(\d+)\/(\d+)\((\d+(?:\.\d+)?)%\)/);
+      const progressPct = progressMatch ? parseFloat(progressMatch[3]) : null;
+      const lastPct = lastProgressPctByPhase.get(phaseKey);
+
+      const isProgressMilestone =
+        progressPct !== null &&
+        (progressPct === 0 || progressPct >= 100 || lastPct === undefined || progressPct - lastPct >= 10);
+
+      if (isProgressMilestone) {
+        lastProgressPctByPhase.set(phaseKey, progressPct);
+      }
+
+      const warnPresent = line.includes('warn=[') && !line.includes('warn=[]');
+      const failMatch = line.match(/fail=(\d+)/);
+      const failCount = failMatch ? parseInt(failMatch[1], 10) : 0;
+      const isFailure = failCount > 0;
+      const isError = line.toLowerCase().includes('error');
+
+      const hasProgress = line.includes('progress=') || line.includes('ETA:') || line.includes('[PROGRESS]');
+
+      const isStageLine =
+        line.startsWith('[Phase ') ||
+        line.startsWith('[DB-Cache]') ||
+        line.startsWith('[select_events_for_valuation]') ||
+        line.startsWith('[backfillEventsTable]') ||
+        line.startsWith('[STREAM]') ||
+        line.includes('| request_start]') ||
+        line.includes('| request_complete]') ||
+        line.includes('| complete]') ||
+        line.includes(' START ') ||
+        line.includes(' starting') ||
+        line.includes(' completed');
+
+      const hasRowId =
+        line.includes('id:') ||
+        line.includes('txn_events.id=') ||
+        line.includes('[table:');
+
+      const isNoisyLine = line.startsWith('[MetricEngine]');
+
+      const phaseIsKey =
+        phase &&
+        (phase.includes('request_start') ||
+          phase.includes('request_complete') ||
+          phase.includes('complete') ||
+          phase.includes('cancelled'));
+
+      const isNewPhase = phase && !seenPhases.has(phase);
+
+      if (
+        isFirstLine ||
+        isLastLine ||
+        isProgressMilestone ||
+        warnPresent ||
+        isFailure ||
+        isError ||
+        hasProgress ||
+        isStageLine ||
+        hasRowId ||
+        phaseIsKey ||
+        isNewPhase
+      ) {
+        if (!includedIndexes.has(index) && !isNoisyLine) {
+          includedIndexes.add(index);
+          summaryEntries.push({ index, line });
+        }
+      }
+
+      if (phase && !seenPhases.has(phase)) {
+        seenPhases.add(phase);
+      }
+    });
+
+    return summaryEntries;
+  };
+
+  const getLatestProgress = (lines) => {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const log = lines[i];
+      if (typeof log !== 'string') continue;
+
+      const progressMatch =
+        log.match(/progress=(\d+)\/(\d+)\((\d+(?:\.\d+)?)%\)/) ||
+        log.match(/\[TICKER PROGRESS\]\s*(\d+)\/(\d+)\s*\((\d+(?:\.\d+)?)%\)/) ||
+        log.match(/(\d+)\/(\d+)\s*\((\d+(?:\.\d+)?)%\)/);
+      const etaMatch = log.match(/ETA:\s*([^\n|]+)/i) || log.match(/eta=(\d+)ms/);
+
+      if (progressMatch) {
+        return {
+          done: parseInt(progressMatch[1], 10),
+          total: parseInt(progressMatch[2], 10),
+          pct: parseFloat(progressMatch[3]),
+          eta: etaMatch ? etaMatch[1].trim() : null,
+        };
+      }
+    }
+    return null;
+  };
+
+  const selectedRequest = selectedRequestId
+    ? requests.find((req) => req.id === selectedRequestId)
+    : null;
+  const detailedLogs = selectedRequest?.detailedLogs || [];
+  const filteredDetailedLogs = React.useMemo(
+    () => applyFilters(detailedLogs),
+    [detailedLogs, applyFilters]
+  );
+  const summaryLogs = React.useMemo(() => buildSummaryLogs(filteredDetailedLogs), [filteredDetailedLogs]);
+  const progress = React.useMemo(() => getLatestProgress(filteredDetailedLogs), [filteredDetailedLogs]);
+  const verboseLogs = React.useMemo(
+    () => filteredDetailedLogs.map((line, index) => ({ index: index + 1, line })),
+    [filteredDetailedLogs]
+  );
+
+  React.useEffect(() => {
+    setHighlightedVerboseIndex(null);
+  }, [selectedRequestId]);
+
+  React.useEffect(() => {
+    if (activeTab !== 'verbose' || !highlightedVerboseIndex || !selectedRequestId) return;
+    const targetId = `verbose-log-${selectedRequestId}-${highlightedVerboseIndex}`;
+    const target = document.getElementById(targetId);
+    if (target) {
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [activeTab, highlightedVerboseIndex, selectedRequestId]);
 
   const onToggle = () => setPanelOpen(!panelOpen);
 
@@ -320,7 +471,7 @@ export default function BottomPanel() {
                   fontWeight: 'var(--font-medium)',
                 }}
               >
-                Logs
+                Details
               </span>
             </div>
           </div>
@@ -337,7 +488,7 @@ export default function BottomPanel() {
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
               <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)' }}>
-                Status & Logs
+                Status & Details
               </span>
               <span
                 style={{
@@ -349,7 +500,7 @@ export default function BottomPanel() {
                   fontWeight: 'var(--font-medium)',
                 }}
               >
-                {requests.length} requests, {logs.length} logs
+                {requests.length} requests
               </span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
@@ -403,12 +554,20 @@ export default function BottomPanel() {
           padding: 'var(--space-2) var(--space-3)',
           borderBottom: '1px solid var(--border)',
           display: 'flex',
-          alignItems: isRightPanel ? 'flex-start' : 'center',
-          justifyContent: 'space-between',
-          flexDirection: isRightPanel ? 'column' : 'row',
-          gap: isRightPanel ? 'var(--space-2)' : '0',
+          flexDirection: 'column',
+          gap: 'var(--space-2)',
         }}
       >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: isRightPanel ? 'flex-start' : 'center',
+            justifyContent: 'space-between',
+            flexDirection: isRightPanel ? 'column' : 'row',
+            gap: isRightPanel ? 'var(--space-2)' : '0',
+            width: '100%',
+          }}
+        >
         <div
           style={{
             display: 'flex',
@@ -424,16 +583,28 @@ export default function BottomPanel() {
             Status ({requests.length})
           </button>
           <button
-            onClick={() => setActiveTab('logs')}
-            className={activeTab === 'logs' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
-          >
-            Logs ({logs.length})
-          </button>
-          <button
             onClick={() => setActiveTab('details')}
             className={activeTab === 'details' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
           >
             Log Details
+            {selectedRequestId && (
+              <span style={{ marginLeft: 'var(--space-1)', opacity: 0.7 }}>(Selected)</span>
+            )}
+          </button>
+          <button
+            onClick={() => setActiveTab('verbose')}
+            className={activeTab === 'verbose' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
+          >
+            Log Details Verbose
+            {selectedRequestId && (
+              <span style={{ marginLeft: 'var(--space-1)', opacity: 0.7 }}>(Selected)</span>
+            )}
+          </button>
+          <button
+            onClick={() => setActiveTab('filter')}
+            className={activeTab === 'filter' ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline'}
+          >
+            Log Filter
             {selectedRequestId && (
               <span style={{ marginLeft: 'var(--space-1)', opacity: 0.7 }}>(Selected)</span>
             )}
@@ -464,6 +635,55 @@ export default function BottomPanel() {
             {isRightPanel ? '▶ Collapse' : '▼ Collapse'}
           </button>
         </div>
+        </div>
+        {selectedRequest && progress && (
+          <div
+            style={{
+              padding: 'var(--space-2)',
+              backgroundColor: 'var(--surface)',
+              borderRadius: 'var(--rounded-lg)',
+              border: '1px solid var(--border)',
+              boxShadow: '0 2px 8px rgba(0, 0, 0, 0.08)',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 'var(--space-1)',
+              }}
+            >
+              <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)' }}>
+                ?? Progress: {progress.done} / {progress.total} ({progress.pct.toFixed(1)}%)
+              </span>
+              {progress.eta && (
+                <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
+                  ?? ETA: {progress.eta}
+                </span>
+              )}
+            </div>
+            <div
+              style={{
+                width: '100%',
+                height: '8px',
+                backgroundColor: 'var(--border)',
+                borderRadius: 'var(--rounded-lg)',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  width: `${Math.min(progress.pct, 100)}%`,
+                  height: '100%',
+                  backgroundColor: progress.pct >= 100 ? '#10b981' : '#3b82f6',
+                  borderRadius: 'var(--rounded-lg)',
+                  transition: 'width 0.3s ease-in-out',
+                }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Content */}
@@ -491,7 +711,17 @@ export default function BottomPanel() {
                     </tr>
                   ) : (
                     requests.map((req) => (
-                      <tr key={req.id}>
+                      <tr
+                        key={req.id}
+                        onClick={() => {
+                          setSelectedRequestId(req.id);
+                          setActiveTab('details');
+                        }}
+                        style={{
+                          cursor: 'pointer',
+                          backgroundColor: selectedRequestId === req.id ? 'var(--surface)' : 'transparent',
+                        }}
+                      >
                         <td style={{ fontSize: 'var(--text-xs)', fontFamily: 'monospace' }}>
                           {formatTime(req.startTime)}
                         </td>
@@ -526,95 +756,17 @@ export default function BottomPanel() {
           </div>
         )}
 
-        {activeTab === 'logs' && (
-          <div style={{ fontFamily: 'monospace', fontSize: 'var(--text-xs)' }}>
-            {logs.length === 0 ? (
-              <div className="empty-state">No logs yet. Execute an API request to see logs here.</div>
-            ) : (
-              logs.map((log, index) => (
-                <div
-                  key={index}
-                  style={{
-                    padding: 'var(--space-1)',
-                    borderBottom: '1px solid var(--border)',
-                    display: 'flex',
-                    gap: 'var(--space-2)',
-                    alignItems: 'flex-start',
-                    cursor: log.requestId ? 'pointer' : 'default',
-                    backgroundColor:
-                      selectedRequestId === log.requestId ? 'var(--surface)' : 'transparent',
-                  }}
-                  onClick={() => {
-                    if (log.requestId) {
-                      setSelectedRequestId(log.requestId);
-                      setActiveTab('details');
-                    }
-                  }}
-                >
-                  <span style={{ color: 'var(--text-dim)', minWidth: '80px' }}>
-                    {formatTime(log.timestamp)}
-                  </span>
-                  {getLogLevelBadge(log.level)}
-                  <span style={{ flex: 1, color: 'var(--text)' }}>{log.message}</span>
-                  {log.requestId && (
-                    <span
-                      style={{
-                        color: 'var(--text-dim)',
-                        fontSize: '0.75em',
-                        padding: '2px 4px',
-                        backgroundColor: 'var(--surface)',
-                        borderRadius: 'var(--rounded-sm)',
-                      }}
-                    >
-                      Click for details →
-                    </span>
-                  )}
-                </div>
-              ))
-            )}
-            <div ref={logEndRef} />
-          </div>
-        )}
-
         {activeTab === 'details' && (
           <div style={{ fontFamily: 'monospace', fontSize: 'var(--text-xs)' }}>
             {!selectedRequestId ? (
               <div className="empty-state">
-                No request selected. Click on a log entry in the Logs tab to view detailed logs.
+                No request selected. Click a request in Status to view log details.
               </div>
             ) : (
               (() => {
-                const selectedRequest = requests.find((req) => req.id === selectedRequestId);
                 if (!selectedRequest) {
                   return <div className="empty-state">Selected request not found.</div>;
                 }
-
-                const detailedLogs = selectedRequest.detailedLogs || [];
-
-                const getLatestProgress = () => {
-                  for (let i = detailedLogs.length - 1; i >= 0; i--) {
-                    const log = detailedLogs[i];
-                    if (typeof log !== 'string') continue;
-
-                    const progressMatch =
-                      log.match(/progress=(\d+)\/(\d+)\((\d+(?:\.\d+)?)%\)/) ||
-                      log.match(/\[TICKER PROGRESS\]\s*(\d+)\/(\d+)\s*\((\d+(?:\.\d+)?)%\)/) ||
-                      log.match(/(\d+)\/(\d+)\s*\((\d+(?:\.\d+)?)%\)/);
-                    const etaMatch = log.match(/ETA:\s*([^\n|]+)/i) || log.match(/eta=(\d+)ms/);
-
-                    if (progressMatch) {
-                      return {
-                        done: parseInt(progressMatch[1]),
-                        total: parseInt(progressMatch[2]),
-                        pct: parseFloat(progressMatch[3]),
-                        eta: etaMatch ? etaMatch[1].trim() : null,
-                      };
-                    }
-                  }
-                  return null;
-                };
-
-                const progress = getLatestProgress();
 
                 return (
                   <div>
@@ -659,82 +811,8 @@ export default function BottomPanel() {
                       </div>
                     </div>
 
-                    {/* Progress Bar */}
-                    {progress && (
-                      <div
-                        style={{
-                          padding: 'var(--space-2)',
-                          backgroundColor: 'var(--surface)',
-                          borderRadius: 'var(--rounded-lg)',
-                          border: '1px solid var(--border)',
-                          marginBottom: 'var(--space-2)',
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            alignItems: 'center',
-                            marginBottom: 'var(--space-1)',
-                          }}
-                        >
-                          <span style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)' }}>
-                            📊 Progress: {progress.done} / {progress.total} ({progress.pct.toFixed(1)}%)
-                          </span>
-                          {progress.eta && (
-                            <span style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
-                              ⏱️ ETA: {progress.eta}
-                            </span>
-                          )}
-                        </div>
-                        <div
-                          style={{
-                            width: '100%',
-                            height: '8px',
-                            backgroundColor: 'var(--border)',
-                            borderRadius: 'var(--rounded-lg)',
-                            overflow: 'hidden',
-                          }}
-                        >
-                          <div
-                            style={{
-                              width: `${Math.min(progress.pct, 100)}%`,
-                              height: '100%',
-                              backgroundColor: progress.pct >= 100 ? '#10b981' : '#3b82f6',
-                              borderRadius: 'var(--rounded-lg)',
-                              transition: 'width 0.3s ease-in-out',
-                            }}
-                          />
-                        </div>
-                        {selectedRequest.status === 'pending' && (
-                          <div
-                            style={{
-                              fontSize: 'var(--text-xs)',
-                              color: 'var(--text-secondary)',
-                              marginTop: 'var(--space-1)',
-                              textAlign: 'center',
-                            }}
-                          >
-                            🔄 Processing...
-                          </div>
-                        )}
-                        {selectedRequest.status === 'success' && progress.pct >= 100 && (
-                          <div
-                            style={{
-                              fontSize: 'var(--text-xs)',
-                              color: '#10b981',
-                              marginTop: 'var(--space-1)',
-                              textAlign: 'center',
-                            }}
-                          >
-                            ✅ Completed!
-                          </div>
-                        )}
-                      </div>
-                    )}
-
                     {/* Detailed Logs */}
-                    {detailedLogs.length === 0 ? (
+                    {summaryLogs.length === 0 ? (
                       <div className="empty-state">
                         No detailed logs available for this request.
                         <br />
@@ -743,17 +821,22 @@ export default function BottomPanel() {
                         </span>
                       </div>
                     ) : (
-                      detailedLogs.map((logLine, index) => (
+                      summaryLogs.map((logEntry) => (
                         <div
-                          key={index}
+                          key={logEntry.index}
                           style={{
                             padding: 'var(--space-1) var(--space-2)',
                             fontFamily: 'monospace',
                             fontSize: 'var(--text-xs)',
                             color: 'var(--text)',
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => {
+                            setHighlightedVerboseIndex(logEntry.index);
+                            setActiveTab('verbose');
                           }}
                         >
-                          {logLine}
+                          {formatIndexedLog(logEntry.index, logEntry.line)}
                         </div>
                       ))
                     )}
@@ -761,6 +844,163 @@ export default function BottomPanel() {
                   </div>
                 );
               })()
+            )}
+          </div>
+        )}
+
+        {activeTab === 'verbose' && (
+          <div style={{ fontFamily: 'monospace', fontSize: 'var(--text-xs)' }}>
+            {!selectedRequestId ? (
+              <div className="empty-state">
+                No request selected. Click a request in Status to view verbose logs.
+              </div>
+            ) : !selectedRequest ? (
+              <div className="empty-state">Selected request not found.</div>
+            ) : (
+              <div>
+                
+                {verboseLogs.length === 0 ? (
+                  <div className="empty-state">No verbose logs available for this request.</div>
+                ) : (
+                  verboseLogs.map((logEntry) => (
+                    <div
+                      key={logEntry.index}
+                      id={`verbose-log-${selectedRequestId}-${logEntry.index}`}
+                      style={{
+                        padding: 'var(--space-1) var(--space-2)',
+                        fontFamily: 'monospace',
+                        fontSize: 'var(--text-xs)',
+                        color: 'var(--text)',
+                        backgroundColor:
+                          highlightedVerboseIndex === logEntry.index ? 'var(--surface)' : 'transparent',
+                      }}
+                    >
+                      {formatIndexedLog(logEntry.index, logEntry.line)}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'filter' && (
+          <div>
+            {!selectedRequestId ? (
+              <div className="empty-state">
+                No request selected. Click a request in Status to configure log filters.
+              </div>
+            ) : !selectedRequest ? (
+              <div className="empty-state">Selected request not found.</div>
+            ) : (
+              <div>
+                <div
+                  style={{
+                    padding: 'var(--space-2)',
+                    backgroundColor: 'var(--surface)',
+                    borderBottom: '2px solid var(--border)',
+                    marginBottom: 'var(--space-2)',
+                  }}
+                >
+                  <h4 style={{ marginBottom: 'var(--space-2)', fontWeight: 'var(--font-semibold)' }}>
+                    Log Pattern Filters
+                  </h4>
+                  <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-dim)', marginBottom: 'var(--space-2)' }}>
+                    Select log patterns to display in Log Details and Log Details Verbose tabs. Unchecked patterns will be hidden.
+                  </p>
+                  <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+                    <button
+                      onClick={() => {
+                        const logs = selectedRequest.detailedLogs || [];
+                        const patterns = extractLogPatterns(logs);
+                        const newFilters = {};
+                        patterns.forEach((p) => (newFilters[p] = true));
+                        setLogFilters(newFilters);
+                      }}
+                      className="btn btn-sm btn-outline"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      onClick={() => {
+                        const logs = selectedRequest.detailedLogs || [];
+                        const patterns = extractLogPatterns(logs);
+                        const newFilters = {};
+                        patterns.forEach((p) => (newFilters[p] = false));
+                        setLogFilters(newFilters);
+                      }}
+                      className="btn btn-sm btn-outline"
+                    >
+                      Deselect All
+                    </button>
+                    <button
+                      onClick={() => setLogFilters({})}
+                      className="btn btn-sm btn-outline"
+                    >
+                      Reset Filters
+                    </button>
+                  </div>
+                </div>
+
+                {(() => {
+                  const logs = selectedRequest.detailedLogs || [];
+                  const patterns = extractLogPatterns(logs);
+
+                  if (patterns.length === 0) {
+                    return <div className="empty-state">No log patterns found in this request.</div>;
+                  }
+
+                  // Count logs per pattern
+                  const patternCounts = {};
+                  logs.forEach((log) => {
+                    const match = log.match(/^\[([^\]]+)\]/);
+                    if (match) {
+                      const pattern = match[1];
+                      patternCounts[pattern] = (patternCounts[pattern] || 0) + 1;
+                    }
+                  });
+
+                  return (
+                    <div style={{ padding: 'var(--space-2)' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 'var(--space-2)' }}>
+                        {patterns.map((pattern) => (
+                          <label
+                            key={pattern}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 'var(--space-2)',
+                              padding: 'var(--space-2)',
+                              backgroundColor: 'var(--surface)',
+                              borderRadius: 'var(--rounded-lg)',
+                              cursor: 'pointer',
+                              border: '1px solid var(--border)',
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={logFilters[pattern] !== false}
+                              onChange={(e) => {
+                                setLogFilters((prev) => ({
+                                  ...prev,
+                                  [pattern]: e.target.checked,
+                                }));
+                              }}
+                              style={{ cursor: 'pointer' }}
+                            />
+                            <span style={{ flex: 1, fontSize: 'var(--text-sm)', fontFamily: 'monospace' }}>
+                              [{pattern}]
+                            </span>
+                            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
+                              ({patternCounts[pattern] || 0} logs)
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
             )}
           </div>
         )}

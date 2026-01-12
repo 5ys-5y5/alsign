@@ -309,3 +309,282 @@ async def update_sector_industry(
                 "updated_mismatch": 0,
                 "skipped_no_target": int(no_target or 0)
             }
+
+
+async def select_invalid_ticker_events(
+    pool: asyncpg.Pool
+) -> Dict[str, Any]:
+    """
+    Preview invalid ticker events (tickers not in config_lv3_targets).
+
+    Returns:
+        Dict with:
+        - total_count: Total number of invalid events
+        - ticker_counts: List of {ticker, count} for each invalid ticker
+        - sample_events: Sample of 10 events to be deleted
+    """
+    import logging
+    logger = logging.getLogger("alsign")
+
+    async with pool.acquire() as conn:
+        # Get invalid ticker counts
+        ticker_counts = await conn.fetch(
+            """
+            SELECT
+                e.ticker,
+                COUNT(*) as event_count
+            FROM txn_events e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+            )
+            GROUP BY e.ticker
+            ORDER BY event_count DESC
+            """
+        )
+
+        # Get sample events
+        sample_events = await conn.fetch(
+            """
+            SELECT
+                id, ticker, event_date, source, source_id
+            FROM txn_events e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+            )
+            LIMIT 10
+            """
+        )
+
+        total_count = sum(row['event_count'] for row in ticker_counts)
+
+        logger.info(f"[Preview] Found {total_count} invalid events across {len(ticker_counts)} tickers")
+
+        return {
+            'total_count': total_count,
+            'ticker_counts': [
+                {
+                    'ticker': row['ticker'],
+                    'count': int(row['event_count'])
+                }
+                for row in ticker_counts
+            ],
+            'sample_events': [
+                {
+                    'id': str(row['id']),
+                    'ticker': row['ticker'],
+                    'event_date': row['event_date'].isoformat() if row['event_date'] else None,
+                    'source': row['source'],
+                    'source_id': str(row['source_id'])
+                }
+                for row in sample_events
+            ]
+        }
+
+
+async def create_archived_table_if_not_exists(
+    pool: asyncpg.Pool
+) -> bool:
+    """
+    Create txn_events_archived table if it doesn't exist.
+
+    Table structure matches txn_events plus archived_at timestamp.
+
+    Returns:
+        True if table was created, False if it already existed
+    """
+    import logging
+    logger = logging.getLogger("alsign")
+
+    async with pool.acquire() as conn:
+        # Check if table exists
+        exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public'
+                AND table_name = 'txn_events_archived'
+            )
+            """
+        )
+
+        if exists:
+            logger.info("[Archive] txn_events_archived table already exists")
+            return False
+
+        # Create table with same structure as txn_events plus archived_at
+        await conn.execute(
+            """
+            CREATE TABLE txn_events_archived (
+                id UUID NOT NULL,
+                ticker TEXT NOT NULL,
+                event_date TIMESTAMPTZ NOT NULL,
+                sector TEXT,
+                industry TEXT,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                value_quantitative JSONB,
+                position_quantitative position,
+                disparity_quantitative NUMERIC,
+                value_qualitative JSONB,
+                position_qualitative position,
+                disparity_qualitative NUMERIC,
+                price_trend JSONB,
+                analyst_performance JSONB,
+                condition TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                price_quantitative NUMERIC,
+                peer_quantitative JSONB,
+                position position,
+                archived_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                archived_reason TEXT DEFAULT 'invalid_ticker_not_in_targets',
+                CONSTRAINT txn_events_archived_pkey PRIMARY KEY (id)
+            )
+            """
+        )
+
+        # Create indexes for performance
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archived_ticker ON txn_events_archived(ticker)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archived_date ON txn_events_archived(archived_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archived_reason ON txn_events_archived(archived_reason)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_archived_event_date ON txn_events_archived(event_date)"
+        )
+
+        logger.info("[Archive] Created txn_events_archived table with indexes")
+        return True
+
+
+async def archive_invalid_ticker_events(
+    pool: asyncpg.Pool
+) -> Dict[str, int]:
+    """
+    Archive invalid ticker events to txn_events_archived and delete from txn_events.
+
+    Uses transaction to ensure atomicity (both INSERT and DELETE succeed or both fail).
+
+    Returns:
+        Dict with archived and deleted counts
+    """
+    import logging
+    logger = logging.getLogger("alsign")
+
+    # Ensure archived table exists
+    await create_archived_table_if_not_exists(pool)
+
+    async with pool.acquire() as conn:
+        # Use transaction for atomicity
+        async with conn.transaction():
+            # First, check how many invalid events exist
+            invalid_count = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM txn_events e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+                )
+                """
+            )
+
+            logger.info(f"[Archive] Found {invalid_count} invalid ticker events to archive")
+
+            if invalid_count == 0:
+                logger.info("[Archive] No invalid ticker events found")
+                return {
+                    'archived': 0,
+                    'deleted': 0
+                }
+
+            # Copy invalid events to archived table
+            archived_rows = await conn.fetch(
+                """
+                WITH invalid_events AS (
+                    SELECT e.*
+                    FROM txn_events e
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+                    )
+                )
+                INSERT INTO txn_events_archived (
+                    id, ticker, event_date, sector, industry,
+                    source, source_id,
+                    value_quantitative, position_quantitative, disparity_quantitative,
+                    value_qualitative, position_qualitative, disparity_qualitative,
+                    price_trend, analyst_performance, condition,
+                    created_at,
+                    price_quantitative, peer_quantitative, position,
+                    archived_at, archived_reason
+                )
+                SELECT
+                    id, ticker, event_date, sector, industry,
+                    source, source_id,
+                    value_quantitative, position_quantitative, disparity_quantitative,
+                    value_qualitative, position_qualitative, disparity_qualitative,
+                    price_trend, analyst_performance, condition,
+                    created_at,
+                    price_quantitative, peer_quantitative, position,
+                    NOW(), 'invalid_ticker_not_in_targets'
+                FROM invalid_events
+                RETURNING id, ticker
+                """
+            )
+
+            archived_count = len(archived_rows)
+            logger.info(f"[Archive] Inserted {archived_count} rows into txn_events_archived")
+
+            # Delete from txn_events
+            deleted_count = await conn.fetchval(
+                """
+                DELETE FROM txn_events e
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+                )
+                """
+            )
+
+            deleted_count = int(deleted_count.split()[-1]) if isinstance(deleted_count, str) and "DELETE" in deleted_count else 0
+
+            logger.info(f"[Archive] Archived {archived_count} events, deleted {deleted_count} from txn_events")
+
+            return {
+                'archived': archived_count if archived_count else 0,
+                'deleted': deleted_count
+            }
+
+
+async def delete_invalid_ticker_events(
+    pool: asyncpg.Pool
+) -> int:
+    """
+    Permanently delete invalid ticker events from txn_events.
+
+    WARNING: This is a destructive operation with no recovery.
+
+    Returns:
+        Number of rows deleted
+    """
+    import logging
+    logger = logging.getLogger("alsign")
+
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM txn_events e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM config_lv3_targets t WHERE t.ticker = e.ticker
+            )
+            """
+        )
+
+        # Parse result to get row count
+        if "DELETE" in result:
+            count = int(result.split()[-1])
+            logger.info(f"[Delete] Permanently deleted {count} invalid ticker events")
+            return count
+
+        return 0

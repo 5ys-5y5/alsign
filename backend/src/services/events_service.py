@@ -17,6 +17,7 @@ async def consolidate_events(
     dry_run: bool = False,
     schema: str = "public",
     table_filter: List[str] = None,
+    cleanup_mode: str = None,
     max_workers: int = 20
 ) -> Dict[str, Any]:
     """
@@ -26,12 +27,14 @@ async def consolidate_events(
     Phase 2: Extract events from each table
     Phase 3: Insert into txn_events with ON CONFLICT DO NOTHING
     Phase 4: Enrich with sector/industry from config_lv3_targets
+    Phase 5 (optional): Cleanup invalid tickers based on cleanup_mode
 
     Args:
         overwrite: If False, update only NULL sector/industry. If True, update NULL + mismatched.
         dry_run: If True, return projected changes without modifying database
         schema: Target schema to search for evt_* tables
         table_filter: Optional list of specific table names to process
+        cleanup_mode: Cleanup mode for invalid tickers: 'preview', 'archive', 'delete'
         max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
                      Default: 20. Recommended: 10-30 depending on DB capacity.
 
@@ -41,6 +44,9 @@ async def consolidate_events(
     start_time = time.time()
 
     pool = await db_pool.get_pool()
+
+    # Log cleanup_mode parameter
+    logger.info(f"[consolidate_events] ENTRY - cleanup_mode={cleanup_mode}, dry_run={dry_run}, overwrite={overwrite}")
 
     # Validate schema exists
     schema_exists = await events.validate_schema_exists(pool, schema)
@@ -217,6 +223,76 @@ async def consolidate_events(
             }
         )
 
+    # Phase 5: Cleanup invalid tickers (optional)
+    cleanup_result = None
+
+    if cleanup_mode:
+        logger.info(
+            f"Cleanup mode: {cleanup_mode}",
+            extra={
+                'endpoint': 'POST /setEventsTable',
+                'phase': f'cleanup_{cleanup_mode}',
+                'elapsed_ms': 0,
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+
+        if cleanup_mode == 'preview':
+            # Preview: show what will be deleted
+            cleanup_result = await events.select_invalid_ticker_events(pool)
+            logger.info(
+                f"Cleanup preview: {cleanup_result['total_count']} invalid events found",
+                extra={
+                    'endpoint': 'POST /setEventsTable',
+                    'phase': 'cleanup_preview',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': {'invalid_events': cleanup_result['total_count']},
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': []
+                }
+            )
+
+        elif cleanup_mode == 'archive':
+            # Archive: move to txn_events_archived then delete
+            cleanup_result = await events.archive_invalid_ticker_events(pool)
+            logger.info(
+                f"Cleanup archive: {cleanup_result['archived']} events archived, {cleanup_result['deleted']} deleted",
+                extra={
+                    'endpoint': 'POST /setEventsTable',
+                    'phase': 'cleanup_archive',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': cleanup_result,
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': []
+                }
+            )
+
+        elif cleanup_mode == 'delete':
+            # Delete: permanently delete (WARNING!)
+            deleted_count = await events.delete_invalid_ticker_events(pool)
+            cleanup_result = {'deleted': deleted_count}
+            logger.warning(
+                f"Cleanup delete: {deleted_count} events PERMANENTLY deleted",
+                extra={
+                    'endpoint': 'POST /setEventsTable',
+                    'phase': 'cleanup_delete',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': cleanup_result,
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': ['PERMANENT_DELETION']
+                }
+            )
+
     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
     # Build summary
@@ -230,6 +306,7 @@ async def consolidate_events(
         'sectorIndustryUpdatedNull': enrichment_result['updated_null'],
         'sectorIndustryUpdatedMismatch': enrichment_result['updated_mismatch'],
         'sectorIndustrySkippedNoTarget': enrichment_result['skipped_no_target'],
+        'cleanup': cleanup_result,
         'elapsedMs': total_elapsed_ms
     }
 

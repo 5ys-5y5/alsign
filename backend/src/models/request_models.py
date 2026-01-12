@@ -4,6 +4,10 @@ from pydantic import BaseModel, Field, validator, ConfigDict
 from typing import Optional, List
 from datetime import date
 
+# Maximum batch size for backfillEventsTable to prevent memory exhaustion
+# Based on Supabase free tier limitations (1GB RAM, 60 connections)
+MAX_BACKFILL_BATCH_SIZE = 10000
+
 
 class SourceDataQueryParams(BaseModel):
     """
@@ -68,11 +72,6 @@ class SourceDataQueryParams(BaseModel):
         ge=1,
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
-    )
-
-    verbose: bool = Field(
-        default=False,
-        description="Enable verbose logging. If true, outputs detailed per-mode and per-ticker logs. If false (default), outputs only summary logs for efficient problem identification."
     )
 
     @validator('mode')
@@ -219,16 +218,16 @@ class SetEventsTableQueryParams(BaseModel):
         description="Comma-separated list of specific evt_* tables to process."
     )
 
+    cleanup_mode: Optional[str] = Field(
+        default=None,
+        description="Cleanup mode for invalid tickers (not in config_lv3_targets): 'preview' (show what will be deleted), 'archive' (move to txn_events_archived), 'delete' (permanent deletion). If not specified, no cleanup is performed."
+    )
+
     max_workers: int = Field(
         default=20,
         ge=1,
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
-    )
-
-    verbose: bool = Field(
-        default=False,
-        description="Enable verbose logging. If true, outputs detailed per-table and per-event logs. If false (default), outputs only summary logs for efficient problem identification."
     )
 
     @validator('table')
@@ -242,6 +241,15 @@ class SetEventsTableQueryParams(BaseModel):
             if not table.startswith('evt_'):
                 raise ValueError(f"Table '{table}' does not match required evt_* pattern")
 
+        return v
+
+    @validator('cleanup_mode')
+    def validate_cleanup_mode(cls, v):
+        """Validate cleanup_mode parameter."""
+        if v is not None:
+            allowed_modes = {'preview', 'archive', 'delete'}
+            if v not in allowed_modes:
+                raise ValueError(f"cleanup_mode must be one of: {', '.join(allowed_modes)}")
         return v
 
 
@@ -275,8 +283,8 @@ class BackfillEventsTableQueryParams(BaseModel):
     batch_size: Optional[int] = Field(
         default=None,
         ge=100,
-        le=50000,
-        description="Number of events to process per batch. If not specified, processes all events in one batch. Range: 100-50000. Use smaller batches (e.g., 1000-5000) for faster feedback and progress tracking. (PERFORMANCE)"
+        le=MAX_BACKFILL_BATCH_SIZE,
+        description=f"BATCH PROCESSING: Number of events to process per batch using OFFSET/LIMIT. If specified, processes events in chunks to prevent memory exhaustion. Range: 100-{MAX_BACKFILL_BATCH_SIZE}. Maximum enforced for Supabase free tier (1GB RAM). Example: batch_size=5000 processes 5000 events at a time, then next 5000, until all are done. Use 1000-5000 for optimal memory usage. (CRITICAL for large datasets)"
     )
 
     max_workers: int = Field(
@@ -284,11 +292,6 @@ class BackfillEventsTableQueryParams(BaseModel):
         ge=1,
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
-    )
-
-    verbose: bool = Field(
-        default=False,
-        description="Enable verbose logging. If true, outputs detailed per-event and per-ticker logs. If false (default), outputs only summary logs for efficient problem identification."
     )
 
     def get_ticker_list(self) -> Optional[List[str]]:
@@ -310,6 +313,14 @@ class BackfillEventsTableQueryParams(BaseModel):
         ticker_list = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
 
         return ticker_list if ticker_list else None
+
+    @validator('batch_size')
+    def validate_batch_size(cls, v):
+        """Enforce maximum batch size for Supabase free tier."""
+        if v is not None and v > MAX_BACKFILL_BATCH_SIZE:
+            # Automatically cap at maximum instead of raising error
+            return MAX_BACKFILL_BATCH_SIZE
+        return v
 
     def get_metrics_list(self) -> Optional[List[str]]:
         """
@@ -352,11 +363,6 @@ class FillAnalystQueryParams(BaseModel):
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
     )
 
-    verbose: bool = Field(
-        default=False,
-        description="Enable verbose logging. If true, outputs detailed per-analyst and per-group logs. If false (default), outputs only summary logs for efficient problem identification."
-    )
-
 
 class QuantitativesQueryParams(BaseModel):
     """Query parameters for POST /getQuantitatives endpoint."""
@@ -383,11 +389,6 @@ class QuantitativesQueryParams(BaseModel):
         ge=1,
         le=100,
         description="Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load. Default: 20. Recommended: 10-30."
-    )
-
-    verbose: bool = Field(
-        default=False,
-        description="Enable verbose logging. If true, outputs detailed per-ticker and per-API logs. If false (default), outputs only summary logs for efficient problem identification."
     )
 
     def get_api_list(self) -> Optional[List[str]]:

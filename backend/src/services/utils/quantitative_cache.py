@@ -65,7 +65,7 @@ async def get_peer_tickers_from_db(pool, ticker: str) -> List[str]:
             logger.warning(f"[DB-Cache] Unexpected peer format for {ticker}: {type(peers)}")
             return []
 
-        logger.info(f"[DB-Cache] Found {len(peer_list)} peers for {ticker} from DB")
+        logger.debug(f"[DB-Cache] Found {len(peer_list)} peers for {ticker} from DB")
         return peer_list
 
 
@@ -213,7 +213,7 @@ async def get_quantitative_data_from_db(
     for api_id in required_apis:
         column_name = API_COLUMN_MAP.get(api_id)
         if not column_name:
-            logger.warning(f"[DB-Cache] Unknown API ID: {api_id}")
+            logger.debug(f"[DB-Cache] Unknown API ID: {api_id}")
             continue
 
         column_data = ticker_row.get(column_name)
@@ -239,7 +239,7 @@ async def get_quantitative_data_from_db(
             f"Run POST /getQuantitatives to fetch missing data."
         )
 
-    logger.info(f"[DB-Cache] Loaded {len(api_cache) - len(missing_apis)}/{len(required_apis)} APIs for {ticker} from DB")
+    logger.debug(f"[DB-Cache] Loaded {len(api_cache) - len(missing_apis)}/{len(required_apis)} APIs for {ticker} from DB")
     return api_cache
 
 
@@ -587,5 +587,5 @@ async def calculate_sector_average_metrics_from_db(
             short_name = metric_name_map.get(metric_name, metric_name)
             sector_averages[short_name] = avg_value
 
-    logger.info(f"[DB-Cache] Calculated sector averages from {len(peer_tickers)} peers from DB: {list(sector_averages.keys())}")
+    logger.debug(f"[DB-Cache] Calculated sector averages from {len(peer_tickers)} peers from DB: {list(sector_averages.keys())}")
     return sector_averages

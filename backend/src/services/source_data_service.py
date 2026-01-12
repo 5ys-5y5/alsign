@@ -518,21 +518,34 @@ async def get_consensus(
             tasks = [fetch_ticker_consensus(fmp_client, ticker) for ticker in ticker_list]
             await asyncio.gather(*tasks)
 
+        # Filter consensus to only include tickers that exist in config_lv3_targets
+        # (ticker_list already contains only valid tickers from targets.get_all_tickers)
+        valid_tickers_set = set(t.upper() for t in ticker_list)
+        total_before_filter = len(all_consensus)
+        filtered_consensus = [
+            c for c in all_consensus
+            if (c.get('symbol') or c.get('ticker', '')).upper() in valid_tickers_set
+        ]
+        skipped_count = total_before_filter - len(filtered_consensus)
+
+        if skipped_count > 0:
+            logger.info(f"[Phase 1] Filtered consensus: {len(filtered_consensus)} kept, {skipped_count} skipped (not in targets)")
+
         # Upsert Phase 1
-        phase1_result, affected_partitions = await consensus.upsert_consensus_phase1(pool, all_consensus)
+        phase1_result, affected_partitions = await consensus.upsert_consensus_phase1(pool, filtered_consensus)
 
         phase1_elapsed = int((time.time() - phase1_start) * 1000)
         phase1_counters = Counters(
             success=phase1_result.get("insert", 0) + phase1_result.get("update", 0),
             fail=failed_tickers,
-            skip=0,
+            skip=skipped_count,
             update=phase1_result.get("update", 0),
             insert=phase1_result.get("insert", 0),
             conflict=0
         )
         
         logger.info(
-            f"[Phase 1] Complete: {len(all_consensus)} records from {completed_tickers} tickers in {phase1_elapsed}ms",
+            f"[Phase 1] Complete: {len(filtered_consensus)} records from {completed_tickers} tickers in {phase1_elapsed}ms ({skipped_count} skipped)",
             extra={
                 'endpoint': 'GET /sourceData',
                 'phase': 'consensus-phase1-complete',
@@ -1089,13 +1102,44 @@ async def get_earning(overwrite: bool = False, past: bool = False, max_workers: 
 
     # Filter earnings to only include tickers that exist in config_lv3_targets
     total_before_filter = len(all_earnings)
-    filtered_earnings = [
-        e for e in all_earnings
-        if (e.get('symbol') or e.get('ticker', '')).upper() in valid_tickers_set
-    ]
-    skipped_count = total_before_filter - len(filtered_earnings)
+    filtered_earnings = []
+    skipped_no_ticker = 0
+    skipped_not_in_targets = 0
+    skipped_tickers_sample = set()  # Track sample of skipped tickers for logging
 
-    logger.info(f"[get_earning] Filtered earnings: {len(filtered_earnings)} kept, {skipped_count} skipped (not in targets)")
+    for e in all_earnings:
+        # Extract ticker with proper fallback
+        ticker = (e.get('symbol') or e.get('ticker', '')).strip()
+
+        # Skip if no ticker or empty string
+        if not ticker:
+            skipped_no_ticker += 1
+            continue
+
+        # Check if ticker exists in config_lv3_targets
+        ticker_upper = ticker.upper()
+        if ticker_upper in valid_tickers_set:
+            filtered_earnings.append(e)
+        else:
+            skipped_not_in_targets += 1
+            # Collect sample of skipped tickers (max 20 for logging)
+            if len(skipped_tickers_sample) < 20:
+                skipped_tickers_sample.add(ticker_upper)
+
+    skipped_count = skipped_no_ticker + skipped_not_in_targets
+
+    logger.info(
+        f"[get_earning] Filtered earnings: {len(filtered_earnings)} kept, "
+        f"{skipped_count} skipped "
+        f"(no_ticker={skipped_no_ticker}, not_in_targets={skipped_not_in_targets})"
+    )
+
+    # Log sample of skipped tickers for debugging
+    if skipped_tickers_sample:
+        sample_list = sorted(list(skipped_tickers_sample))[:10]
+        logger.info(f"[get_earning] Sample of skipped tickers (not in config_lv3_targets): {', '.join(sample_list)}")
+        if skipped_not_in_targets > 10:
+            logger.info(f"[get_earning] ... and {skipped_not_in_targets - 10} more")
 
     # Insert to database
     result = await earning.insert_earning_events(pool, filtered_earnings)

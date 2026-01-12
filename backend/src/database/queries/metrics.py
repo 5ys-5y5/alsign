@@ -87,6 +87,7 @@ async def select_metric_definitions(
 async def select_events_for_valuation(
     pool: asyncpg.Pool,
     limit: int = None,
+    offset: int = None,
     from_date = None,
     to_date = None,
     tickers: List[str] = None,
@@ -98,7 +99,8 @@ async def select_events_for_valuation(
 
     Args:
         pool: Database connection pool
-        limit: Optional limit on number of events to process
+        limit: Optional limit on number of events to process (batch size)
+        offset: Optional offset for pagination (used with limit for batch processing)
         from_date: Optional start date for filtering events by event_date
         to_date: Optional end date for filtering events by event_date
         tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
@@ -112,7 +114,7 @@ async def select_events_for_valuation(
     """
     start_time = time.time()
     logger.info("=" * 80)
-    logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}, overwrite={overwrite}, metrics_list={metrics_list}")
+    logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}, offset={offset}, overwrite={overwrite}, metrics_list={metrics_list}")
 
     async with pool.acquire() as conn:
         logger.info(f"[select_events_for_valuation] Database connection acquired in {time.time() - start_time:.2f}s")
@@ -164,6 +166,9 @@ async def select_events_for_valuation(
 
         if limit:
             query += f" LIMIT {limit}"
+
+        if offset:
+            query += f" OFFSET {offset}"
 
         logger.info(f"[select_events_for_valuation] Query built in {time.time() - start_time:.2f}s")
         logger.info(f"[select_events_for_valuation] Query params: {params}")

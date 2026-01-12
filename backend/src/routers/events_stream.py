@@ -115,6 +115,7 @@ async def stream_set_events_table(
                         dry_run=params.dryRun,
                         schema=params.schema,
                         table_filter=table_filter,
+                        cleanup_mode=params.cleanup_mode,
                         max_workers=params.max_workers
                     )
 
