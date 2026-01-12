@@ -427,6 +427,12 @@ const ENDPOINT_FLOWS = {
         description: '티커 필터 (쉼표 구분, 예: "AAPL,MSFT"). 미지정 시 전체 티커'
       },
       {
+        name: 'startPoint',
+        type: 'string',
+        required: false,
+        description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: "MSFT"부터 처리'
+      },
+      {
         name: 'metrics',
         type: 'string',
         required: false,
@@ -494,6 +500,11 @@ const ENDPOINT_FLOWS = {
         title: '날짜 + 티커 + 메트릭 필터링',
         url: 'POST /backfillEventsTable?from=2024-01-01&to=2024-12-31&tickers=AAPL,MSFT&metrics=priceQuantitative&overwrite=true',
         description: '2024년, AAPL/MSFT만, priceQuantitative 강제 재계산'
+      },
+      {
+        title: '중단 지점부터 재개',
+        url: 'POST /backfillEventsTable?startPoint=MSFT&batch_size=500',
+        description: '알파벳 순으로 MSFT부터 재개 (batch_size 적용)'
       },
       {
         title: '배치 처리 (점진적 피드백)',

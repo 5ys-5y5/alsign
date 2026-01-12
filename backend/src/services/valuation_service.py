@@ -974,6 +974,7 @@ async def calculate_valuations(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     tickers: Optional[List[str]] = None,
+    start_point: Optional[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
     metrics_list: Optional[List[str]] = None,
     batch_size: Optional[int] = None,
@@ -1019,7 +1020,11 @@ async def calculate_valuations(
     
     from .utils.logging_utils import create_log_context
 
-    logger.info(f"[backfillEventsTable] START - overwrite={overwrite}, from={from_date}, to={to_date}, tickers={tickers}, batch={batch_size}")
+    logger.info(
+        "[backfillEventsTable] START - "
+        f"overwrite={overwrite}, from={from_date}, to={to_date}, "
+        f"tickers={tickers}, start_point={start_point}, batch={batch_size}"
+    )
 
     pool = await db_pool.get_pool()
 
@@ -1041,6 +1046,7 @@ async def calculate_valuations(
             from_date=from_date,
             to_date=to_date,
             tickers=tickers,
+            start_point=start_point,
             overwrite=overwrite,
             metrics_list=metrics_list
         )

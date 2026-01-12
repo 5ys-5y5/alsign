@@ -112,11 +112,16 @@ async def backfill_events_table(
 
     # Parse ticker list
     ticker_list = params.get_ticker_list()
+    start_point = params.get_start_point()
 
     # Parse metrics list (I-41)
     metrics_list = params.get_metrics_list()
 
-    logger.info(f"[POST /backfillEventsTable] reqId={req_id}, overwrite={params.overwrite}, from={params.from_date}, to={params.to_date}")
+    logger.info(
+        "[POST /backfillEventsTable] "
+        f"reqId={req_id}, overwrite={params.overwrite}, from={params.from_date}, "
+        f"to={params.to_date}, startPoint={start_point}"
+    )
 
     try:
         result = await valuation_service.calculate_valuations(
@@ -124,6 +129,7 @@ async def backfill_events_table(
             from_date=params.from_date,
             to_date=params.to_date,
             tickers=ticker_list,
+            start_point=start_point,
             metrics_list=metrics_list,
             batch_size=params.batch_size,
             max_workers=params.max_workers

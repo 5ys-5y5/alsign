@@ -151,6 +151,7 @@ export default function AppRouter() {
   const handleNavigate = (routeId) => {
     const route = ROUTES.find((r) => r.id === routeId);
     if (route) {
+      setCurrentRoute(route.id);
       window.location.hash = route.path;
     }
   };

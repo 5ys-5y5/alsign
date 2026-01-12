@@ -276,6 +276,11 @@ class BackfillEventsTableQueryParams(BaseModel):
         default=None,
         description="Comma-separated list of ticker symbols to process (e.g., 'AAPL,MSFT,GOOGL'). If not specified, processes all tickers."
     )
+    start_point: Optional[str] = Field(
+        default=None,
+        alias="startPoint",
+        description="Start ticker (alphabetical) to resume processing from this point. Applies to the ordered ticker list."
+    )
     metrics: Optional[str] = Field(
         default=None,
         description="Comma-separated list of metric IDs to recalculate (e.g., 'priceQuantitative,PER,PBR'). If not specified, all metrics are calculated. When specified with overwrite=true, overwrites existing values; with overwrite=false, updates only NULL values. (I-41)"
@@ -313,6 +318,19 @@ class BackfillEventsTableQueryParams(BaseModel):
         ticker_list = [t.strip().upper() for t in tickers_str.split(',') if t.strip()]
 
         return ticker_list if ticker_list else None
+
+    def get_start_point(self) -> Optional[str]:
+        """
+        Normalize startPoint parameter into a ticker symbol.
+
+        Returns:
+            Uppercased ticker string or None if not provided
+        """
+        if not self.start_point:
+            return None
+
+        start_point = self.start_point.strip().upper()
+        return start_point if start_point else None
 
     @validator('batch_size')
     def validate_batch_size(cls, v):

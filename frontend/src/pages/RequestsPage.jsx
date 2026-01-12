@@ -965,6 +965,15 @@ export default function RequestsPage() {
               placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
             },
             {
+              key: 'startPoint',
+              label: 'Start Point (ticker)',
+              type: 'text',
+              control: 'input',
+              required: false,
+              placeholder: 'MSFT',
+              description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: MSFT부터 처리',
+            },
+            {
               key: 'metrics',
               label: 'Metrics (comma-separated)',
               type: 'text',

@@ -216,6 +216,7 @@ async def select_unique_tickers_for_valuation(
     from_date = None,
     to_date = None,
     tickers: List[str] = None,
+    start_point: Optional[str] = None,
     overwrite: bool = False,
     metrics_list: Optional[List[str]] = None
 ) -> List[str]:
@@ -238,7 +239,7 @@ async def select_unique_tickers_for_valuation(
     start_time = time.time()
     logger.info(
         "[select_unique_tickers_for_valuation] ENTRY - "
-        f"from_date={from_date}, to_date={to_date}, tickers={tickers}, "
+        f"from_date={from_date}, to_date={to_date}, tickers={tickers}, start_point={start_point}, "
         f"overwrite={overwrite}, metrics_list={metrics_list}"
     )
 
@@ -268,6 +269,11 @@ async def select_unique_tickers_for_valuation(
         if tickers is not None and len(tickers) > 0:
             query += f" AND ticker = ANY(${param_idx})"
             params.append(tickers)
+            param_idx += 1
+
+        if start_point:
+            query += f" AND ticker >= ${param_idx}"
+            params.append(start_point)
             param_idx += 1
 
         if not overwrite:

@@ -245,6 +245,7 @@ async def stream_backfill_events_table(
 
     # Parse ticker list
     ticker_list = params.get_ticker_list()
+    start_point = params.get_start_point()
 
     # Create cancellation event
     cancel_event = asyncio.Event()
@@ -252,7 +253,11 @@ async def stream_backfill_events_table(
 
     logger.info("=" * 80)
     logger.info(f"[STREAM] POST /backfillEventsTable/stream RECEIVED - reqId={req_id}")
-    logger.info(f"[STREAM] Parameters: overwrite={params.overwrite}, from_date={params.from_date}, to_date={params.to_date}, tickers={ticker_list}")
+    logger.info(
+        "[STREAM] Parameters: "
+        f"overwrite={params.overwrite}, from_date={params.from_date}, "
+        f"to_date={params.to_date}, tickers={ticker_list}, startPoint={start_point}"
+    )
     logger.info("=" * 80)
 
     async def event_generator():
@@ -331,6 +336,7 @@ async def stream_backfill_events_table(
                         from_date=params.from_date,
                         to_date=params.to_date,
                         tickers=ticker_list,
+                        start_point=start_point,
                         cancel_event=cancel_event,
                         metrics_list=metrics_list,
                         batch_size=params.batch_size,
