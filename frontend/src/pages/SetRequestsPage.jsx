@@ -9,7 +9,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 
-const API_BASE_URL = '/api';
+import { API_BASE_URL } from '../services/api';
 
 /**
  * Endpoint Flow Definitions

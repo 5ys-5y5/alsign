@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect } from 'react';
 
-const API_BASE_URL = '/api';
+import { API_BASE_URL } from '../services/api';
 
 /**
  * APIServicePanel - Environment & API configuration panel.

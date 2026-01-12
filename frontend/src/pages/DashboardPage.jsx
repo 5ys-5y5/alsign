@@ -10,8 +10,7 @@ import KPICard from '../components/dashboard/KPICard';
 import EventsTable from '../components/dashboard/EventsTable';
 import TradesTable from '../components/dashboard/TradesTable';
 
-// API base URL
-const API_BASE_URL = '/api';
+import { API_BASE_URL } from '../services/api';
 
 /**
  * Format date string for display.

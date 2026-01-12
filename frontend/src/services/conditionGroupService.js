@@ -4,7 +4,7 @@
  * Provides methods for managing condition groups via the backend API.
  */
 
-const API_BASE_URL = '/api';
+import { API_BASE_URL } from './api';
 
 /**
  * Get list of allowed columns for condition groups

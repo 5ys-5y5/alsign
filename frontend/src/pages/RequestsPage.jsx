@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useLog } from '../contexts/LogContext';
 
-const API_BASE_URL = '/api';
+import { API_BASE_URL } from '../services/api';
 
 /**
  * Default timeout settings per endpoint (in milliseconds)
