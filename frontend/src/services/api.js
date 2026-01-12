@@ -2,7 +2,9 @@
  * Centralized API service for making requests to the AlSign backend
  */
 
-const API_BASE_URL = '/api';
+const rawBaseUrl = import.meta.env.VITE_API_BASE_URL || '';
+const normalizedBaseUrl = rawBaseUrl === '/' ? '' : rawBaseUrl.replace(/\/+$/, '');
+const API_BASE_URL = normalizedBaseUrl;
 
 /**
  * Base fetch wrapper with error handling
