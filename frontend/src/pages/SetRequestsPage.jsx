@@ -398,7 +398,7 @@ const ENDPOINT_FLOWS = {
   backfillEventsTable: {
     id: 'backfillEventsTable',
     title: 'POST /backfillEventsTable',
-    description: 'txn_events 테이블의 이벤트에 valuation metrics 계산 (Price Trend 제외). config_lv3_quantitatives 테이블에서 데이터 조회 (API 호출 없음)',
+    description: 'txn_events 테이블 이벤트의 valuation metrics 계산 (Price Trend 제외). config_lv3_quantitatives 테이블에서 데이터 조회 (API 호출 없음). batch_size는 unique ticker 기준 배치이며 배치 내 ticker는 max_workers 기준 병렬 처리',
     performanceNote: '100개 이벤트 (10개 티커) 처리 시: API 호출 0개, DB 조회만 수행. 사전에 POST /getQuantitatives로 quantitative 데이터가 준비되어 있어야 함',
     parameters: [
       {
@@ -437,13 +437,13 @@ const ENDPOINT_FLOWS = {
         type: 'number',
         required: false,
         default: 'None',
-        min: 100,
-        max: 10000,
-        description: '배치 처리: OFFSET/LIMIT를 사용해 이벤트를 청크 단위로 처리합니다. 예: 5000 = 5000개 이벤트 처리 후 다음 5000개, 모두 완료될 때까지 반복. 최댓값: 10,000 (Supabase 무료 플랜: 1GB RAM). 메모리 고갈 방지를 위해 1000-5000 사용 권장.',
+        min: 1,
+        max: 2000,
+        description: '배치 처리: unique ticker를 청크 단위로 처리합니다. 배치 내 ticker는 max_workers 기준 병렬 처리합니다. 예: 500 = 500개 ticker 처리 후 다음 500개, 모두 완료될 때까지 반복. 최댓값: 2,000 (Supabase 무료 플랜: 1GB RAM). 메모리 고갈 방지를 위해 200-1000 사용 권장.',
         examples: [
-          { value: '1000', description: '1000개씩 처리 (작은 청크, 빠른 피드백)' },
-          { value: '5000', description: '5000개씩 처리 (권장 배치 크기)' },
-          { value: '10000', description: '10000개씩 처리 (최대, Supabase 제한)' }
+          { value: '200', description: '200개 ticker씩 처리 (작은 청크, 빠른 피드백)' },
+          { value: '500', description: '500개 ticker씩 처리 (권장 배치 크기)' },
+          { value: '2000', description: '2000개 ticker씩 처리 (최대, Supabase 제한)' }
         ]
       },
       {
@@ -497,8 +497,8 @@ const ENDPOINT_FLOWS = {
       },
       {
         title: '배치 처리 (점진적 피드백)',
-        url: 'POST /backfillEventsTable?batch_size=5000',
-        description: '5,000개씩 배치 처리하여 빠른 진행 피드백 제공. 최대 10,000 (Supabase 무료 플랜 제한)'
+        url: 'POST /backfillEventsTable?batch_size=500',
+        description: '500개 ticker씩 배치 처리하여 빠른 진행 피드백 제공 (배치 내 ticker 병렬 처리). 최대 2,000 (Supabase 무료 플랜 제한)'
       },
     ],
     phases: [
@@ -512,7 +512,7 @@ const ENDPOINT_FLOWS = {
       {
         id: 'load_events',
         title: '2. 이벤트 로드',
-        description: 'txn_events에서 대상 이벤트 조회',
+        description: 'batch_size 기준 unique ticker를 고른 뒤 해당 ticker의 이벤트 조회',
         apiId: null,
         note: 'DB 쿼리 (API 아님)'
       },
@@ -528,7 +528,7 @@ const ENDPOINT_FLOWS = {
         title: '4. Quantitative 데이터 로드 (DB 조회)',
         description: 'config_lv3_quantitatives에서 티커별 재무 데이터 조회',
         apiId: null,
-        note: '⚡ API 호출 없음! POST /getQuantitatives로 사전 수집된 데이터 사용. 티커당 1회 DB 조회'
+        note: ' API 호출 없음! POST /getQuantitatives로 사전 수집된 데이터 사용. 티커당 1회 DB 조회'
       },
       {
         id: 'load_consensus',
@@ -542,7 +542,7 @@ const ENDPOINT_FLOWS = {
         title: '6. Peer 데이터 로드 (DB 조회)',
         description: 'config_lv3_targets와 config_lv3_quantitatives에서 peer 데이터 조회',
         apiId: null,
-        note: '⚡ API 호출 없음! POST /getQuantitatives로 사전 수집된 peer 데이터 사용'
+        note: ' API 호출 없음! POST /getQuantitatives로 사전 수집된 peer 데이터 사용'
       },
       {
         id: 'event_processing',
@@ -682,7 +682,7 @@ const ENDPOINT_FLOWS = {
         title: '3. Trading Days 전역 캐싱 (CRITICAL)',
         description: '전체 기간의 모든 거래일을 1회 DB 쿼리로 로드',
         apiId: null,
-        note: '⚡ 핵심 최적화: 100개 이벤트 처리 시 100회 쿼리 → 1회 쿼리로 단축! config_lv3_market_holidays 테이블 사용'
+        note: ' 핵심 최적화: 100개 이벤트 처리 시 100회 쿼리 → 1회 쿼리로 단축! config_lv3_market_holidays 테이블 사용'
       },
       {
         id: 'calc_ohlc_ranges',
@@ -929,7 +929,7 @@ const ENDPOINT_FLOWS = {
         description: '⚠️ txn_events에서 영구 삭제 (복구 불가!). 백업 없이는 사용 권장하지 않음'
       },
       {
-        title: '💡 Cleanup 워크플로우 예시',
+        title: ' Cleanup 워크플로우 예시',
         url: '',
         description: '① preview로 확인 → ② archive로 안전하게 정리 → ③ txn_events_archived에서 데이터 확인',
         isSection: true
@@ -1014,7 +1014,7 @@ function PhaseNode({ phase, onApiClick, isLast }) {
             }}
             title="클릭하여 API 변경"
           >
-            <span>🔌</span>
+            <span></span>
             <span>{phase.apiId}</span>
             <span style={{ opacity: 0.7 }}>✏️</span>
           </button>
@@ -1030,7 +1030,7 @@ function PhaseNode({ phase, onApiClick, isLast }) {
             fontSize: 'var(--text-xs)',
             color: '#92400e'
           }}>
-            ⚡ {phase.skipCondition}
+             {phase.skipCondition}
           </div>
         )}
         
@@ -1042,7 +1042,7 @@ function PhaseNode({ phase, onApiClick, isLast }) {
             color: 'var(--text-dim)',
             fontStyle: 'italic'
           }}>
-            💡 {phase.note}
+             {phase.note}
           </div>
         )}
       </div>
@@ -1281,7 +1281,7 @@ function EndpointFlowDiagram({ endpoint, onApiClick }) {
       {endpoint.usageExamples && (
         <div style={{ marginBottom: 'var(--space-4)' }}>
           <div style={{ fontSize: 'var(--text-sm)', fontWeight: 'var(--font-semibold)', color: 'var(--ink)', marginBottom: '8px' }}>
-            💡 Usage Examples
+             Usage Examples
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             {endpoint.usageExamples.map((example, idx) => {
@@ -1556,7 +1556,7 @@ function APIChangeModal({ phase, apiList, onClose, onSave }) {
         onClick={e => e.stopPropagation()}
       >
         <h3 style={{ marginTop: 0, color: 'var(--ink)' }}>
-          🔌 API 변경: {phase.title}
+           API 변경: {phase.title}
         </h3>
         <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-secondary)' }}>
           {phase.description}
@@ -1844,7 +1844,7 @@ export default function SetRequestsPage() {
         <header style={{ marginBottom: 'var(--space-4)' }}>
           <h1>Request Settings</h1>
           <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
-            엔드포인트 흐름도 - 각 단계의 🔌 API 버튼을 클릭하여 변경할 수 있습니다
+            엔드포인트 흐름도 - 각 단계의 API 버튼을 클릭하여 변경할 수 있습니다 (backfillEventsTable batch_size는 unique ticker 기준 배치)
           </p>
         </header>
 
@@ -1857,13 +1857,13 @@ export default function SetRequestsPage() {
           marginBottom: 'var(--space-4)'
         }}>
           <div style={{ fontWeight: 'var(--font-semibold)', color: '#92400e', marginBottom: '8px' }}>
-            ⚡ 엔드포인트 실행 순서 (권장)
+            엔드포인트 실행 순서 (권장)
           </div>
           <ol style={{ margin: 0, paddingLeft: '20px', fontSize: 'var(--text-sm)', color: '#78350f', lineHeight: '1.6' }}>
             <li><strong>GET /sourceData</strong>: FMP API에서 외부 데이터 수집 (holiday, target, consensus, earning)</li>
             <li><strong>POST /setEventsTable</strong>: evt_* 테이블을 txn_events로 통합
               <div style={{ marginTop: '4px', paddingLeft: '12px', fontSize: '0.9em', color: '#b45309' }}>
-                💡 <strong>cleanup_mode 옵션</strong>: config_lv3_targets에 없는 invalid ticker 정리
+                 <strong>cleanup_mode 옵션</strong>: config_lv3_targets에 없는 invalid ticker 정리
                 <ul style={{ margin: '4px 0', paddingLeft: '20px' }}>
                   <li><code>?cleanup_mode=preview</code>: 삭제 대상만 조회 (권장: 먼저 실행)</li>
                   <li><code>?cleanup_mode=archive</code>: txn_events_archived로 이동 후 삭제 (안전, 권장)</li>
@@ -1872,7 +1872,7 @@ export default function SetRequestsPage() {
               </div>
             </li>
             <li><strong>POST /getQuantitatives</strong>: 티커별 재무/가격 데이터를 DB에 저장 (API 호출)</li>
-            <li><strong>POST /backfillEventsTable</strong>: txn_events의 valuation metrics 계산 (DB 조회만, API 호출 없음)</li>
+            <li><strong>POST /backfillEventsTable</strong>: txn_events의 valuation metrics 계산 (DB 조회만, API 호출 없음, batch_size는 unique ticker 기준)</li>
             <li><strong>POST /generatePriceTrends</strong>: 가격 추세 데이터 생성 (±14 trading days)</li>
           </ol>
         </div>
@@ -1886,11 +1886,11 @@ export default function SetRequestsPage() {
           marginBottom: 'var(--space-4)'
         }}>
           <div style={{ fontWeight: 'var(--font-semibold)', color: '#1e40af', marginBottom: '4px' }}>
-            💡 사용 방법
+             사용 방법
           </div>
           <ol style={{ margin: 0, paddingLeft: '20px', fontSize: 'var(--text-sm)', color: '#1e3a8a' }}>
             <li>좌측 메뉴에서 엔드포인트 선택</li>
-            <li>파란색 <strong>🔌 API 버튼</strong>을 클릭하여 변경 모달 열기</li>
+            <li>파란색 <strong> API 버튼</strong>을 클릭하여 변경 모달 열기</li>
             <li>새 API 선택 → <strong>Schema 검증</strong> → 필수 키 존재 확인</li>
             <li>검증 성공 시 <strong>저장</strong> (API 호출 없이 즉시 검증)</li>
           </ol>

@@ -689,7 +689,7 @@ export default function RequestsPage() {
         <header style={{ marginBottom: 'var(--space-4)' }}>
           <h1>Requests</h1>
           <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)' }}>
-            Execute backend API requests
+            Execute backend API requests (backfill batch_size groups unique tickers)
           </p>
         </header>
 
@@ -975,14 +975,14 @@ export default function RequestsPage() {
             },
             {
               key: 'batch_size',
-              label: 'Batch Size (100-10,000)',
+              label: 'Batch Size (1-2,000)',
               type: 'number',
               control: 'input',
               required: false,
-              placeholder: '5000',
-              min: 100,
-              max: 10000,
-              description: 'BATCH PROCESSING: Processes events in chunks using OFFSET/LIMIT. Example: 5000 = process 5000 events, then next 5000, until all done. Maximum: 10,000 (Supabase free tier: 1GB RAM). Use 1000-5000 to prevent memory exhaustion.',
+              placeholder: '500',
+              min: 1,
+              max: 2000,
+              description: 'BATCH PROCESSING: Processes unique tickers in chunks. Example: 500 = process 500 tickers per batch (equivalent to calling with grouped tickers). Maximum: 2,000 (Supabase free tier: 1GB RAM). Use 200-1000 to prevent memory exhaustion.',
             },
             {
               key: 'max_workers',

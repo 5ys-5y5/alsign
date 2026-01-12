@@ -6,7 +6,7 @@ from datetime import date
 
 # Maximum batch size for backfillEventsTable to prevent memory exhaustion
 # Based on Supabase free tier limitations (1GB RAM, 60 connections)
-MAX_BACKFILL_BATCH_SIZE = 10000
+MAX_BACKFILL_BATCH_SIZE = 2000
 
 
 class SourceDataQueryParams(BaseModel):
@@ -282,9 +282,9 @@ class BackfillEventsTableQueryParams(BaseModel):
     )
     batch_size: Optional[int] = Field(
         default=None,
-        ge=100,
+        ge=1,
         le=MAX_BACKFILL_BATCH_SIZE,
-        description=f"BATCH PROCESSING: Number of events to process per batch using OFFSET/LIMIT. If specified, processes events in chunks to prevent memory exhaustion. Range: 100-{MAX_BACKFILL_BATCH_SIZE}. Maximum enforced for Supabase free tier (1GB RAM). Example: batch_size=5000 processes 5000 events at a time, then next 5000, until all are done. Use 1000-5000 for optimal memory usage. (CRITICAL for large datasets)"
+        description=f"BATCH PROCESSING: Number of unique tickers to process per batch. Each ticker in the batch is processed concurrently (up to max_workers), equivalent to running per-ticker requests in parallel. Range: 1-{MAX_BACKFILL_BATCH_SIZE}. Maximum enforced for Supabase free tier (1GB RAM). Example: batch_size=500 processes 500 tickers at a time until all are done. Use 200-1000 for optimal memory usage. (CRITICAL for large datasets)"
     )
 
     max_workers: int = Field(

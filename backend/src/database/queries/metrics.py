@@ -113,7 +113,6 @@ async def select_events_for_valuation(
         List of event dictionaries with ticker, event_date, source, source_id
     """
     start_time = time.time()
-    logger.info("=" * 80)
     logger.info(f"[select_events_for_valuation] ENTRY - from_date={from_date}, to_date={to_date}, tickers={tickers}, limit={limit}, offset={offset}, overwrite={overwrite}, metrics_list={metrics_list}")
 
     async with pool.acquire() as conn:
@@ -200,19 +199,125 @@ async def select_events_for_valuation(
 
             convert_elapsed = time.time() - convert_start
             logger.info(f"[select_events_for_valuation] ✓ Conversion completed in {convert_elapsed:.2f}s - total time: {total_elapsed:.2f}s")
-            logger.info("=" * 80)
             return result
         except asyncio.TimeoutError:
             elapsed = time.time() - start_time
-            logger.error("=" * 80)
             logger.error(f"[select_events_for_valuation] ✗ Query TIMEOUT after {elapsed:.2f}s (timeout={QUERY_TIMEOUT}s)")
             logger.error(f"[select_events_for_valuation] ⚠️ This query is taking too long.")
             logger.error(f"[select_events_for_valuation] 💡 Recommendations:")
             logger.error(f"[select_events_for_valuation]    1. Add date filters: ?from_date=2024-01-01&to_date=2024-12-31")
             logger.error(f"[select_events_for_valuation]    2. Add ticker filters: ?tickers=AAPL,MSFT,GOOGL")
             logger.error(f"[select_events_for_valuation]    3. Check database indexes on txn_events(ticker, event_date)")
-            logger.error("=" * 80)
             raise Exception(f"Database query timeout after {elapsed:.2f}s - the query is taking too long. Consider adding date/ticker filters or checking database performance.")
+
+
+async def select_unique_tickers_for_valuation(
+    pool: asyncpg.Pool,
+    from_date = None,
+    to_date = None,
+    tickers: List[str] = None,
+    overwrite: bool = False,
+    metrics_list: Optional[List[str]] = None
+) -> List[str]:
+    """
+    Select unique tickers from txn_events that need valuation processing.
+
+    Args:
+        pool: Database connection pool
+        from_date: Optional start date for filtering events by event_date
+        to_date: Optional end date for filtering events by event_date
+        tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
+        overwrite: If False, only select tickers with NULL value_quantitative events.
+                   If True, select tickers regardless of existing values.
+        metrics_list: Optional list of metric IDs. When specified with overwrite=False,
+                      selects tickers that have missing metrics (advanced filtering).
+
+    Returns:
+        List of unique ticker symbols
+    """
+    start_time = time.time()
+    logger.info(
+        "[select_unique_tickers_for_valuation] ENTRY - "
+        f"from_date={from_date}, to_date={to_date}, tickers={tickers}, "
+        f"overwrite={overwrite}, metrics_list={metrics_list}"
+    )
+
+    async with pool.acquire() as conn:
+        logger.info(f"[select_unique_tickers_for_valuation] Database connection acquired in {time.time() - start_time:.2f}s")
+
+        await conn.execute("SET statement_timeout = '300s'")
+
+        query = """
+            SELECT DISTINCT ticker
+            FROM txn_events
+            WHERE 1=1
+        """
+        params = []
+        param_idx = 1
+
+        if from_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date >= ${param_idx}"
+            params.append(from_date)
+            param_idx += 1
+
+        if to_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date <= ${param_idx}"
+            params.append(to_date)
+            param_idx += 1
+
+        if tickers is not None and len(tickers) > 0:
+            query += f" AND ticker = ANY(${param_idx})"
+            params.append(tickers)
+            param_idx += 1
+
+        if not overwrite:
+            logger.info("[select_unique_tickers_for_valuation] Pre-filter: Adding WHERE value_quantitative IS NULL (overwrite=False)")
+            if metrics_list is not None:
+                logger.info("[select_unique_tickers_for_valuation] Note: metrics_list specified but using simple NULL check (advanced filtering not yet implemented)")
+                query += " AND value_quantitative IS NULL"
+            else:
+                query += " AND value_quantitative IS NULL"
+        else:
+            logger.info("[select_unique_tickers_for_valuation] Processing all tickers (overwrite=True)")
+
+        query += " ORDER BY ticker"
+
+        logger.info(f"[select_unique_tickers_for_valuation] Query built in {time.time() - start_time:.2f}s")
+        logger.info(f"[select_unique_tickers_for_valuation] Query params: {params}")
+        logger.info("[select_unique_tickers_for_valuation] Executing database query (timeout=120s)...")
+
+        query_start = time.time()
+
+        try:
+            QUERY_TIMEOUT = 300.0
+            logger.info(f"[select_unique_tickers_for_valuation] Query timeout set to {QUERY_TIMEOUT}s")
+
+            rows = await asyncio.wait_for(
+                conn.fetch(query, *params),
+                timeout=QUERY_TIMEOUT
+            )
+            query_elapsed = time.time() - query_start
+            total_elapsed = time.time() - start_time
+            logger.info(f"[select_unique_tickers_for_valuation] ✓ Query executed in {query_elapsed:.2f}s - fetched {len(rows)} rows")
+
+            if query_elapsed > 60:
+                logger.warning(f"[select_unique_tickers_for_valuation] ⚠️ Slow query detected ({query_elapsed:.2f}s > 60s). Consider adding indexes or using filters.")
+
+            tickers_result = [row['ticker'] for row in rows]
+            logger.info(f"[select_unique_tickers_for_valuation] ✓ Conversion completed - total time: {total_elapsed:.2f}s")
+            return tickers_result
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            logger.error(f"[select_unique_tickers_for_valuation] ✗ Query TIMEOUT after {elapsed:.2f}s (timeout={QUERY_TIMEOUT}s)")
+            logger.error("[select_unique_tickers_for_valuation] ⚠️ This query is taking too long.")
+            logger.error("[select_unique_tickers_for_valuation] 💡 Recommendations:")
+            logger.error("[select_unique_tickers_for_valuation]    1. Add date filters: ?from_date=2024-01-01&to_date=2024-12-31")
+            logger.error("[select_unique_tickers_for_valuation]    2. Add ticker filters: ?tickers=AAPL,MSFT,GOOGL")
+            logger.error("[select_unique_tickers_for_valuation]    3. Check database indexes on txn_events(ticker, event_date)")
+            raise Exception(
+                f"Database query timeout after {elapsed:.2f}s - the query is taking too long. "
+                "Consider adding date/ticker filters or checking database performance."
+            )
 
 
 async def select_trades_for_price_trends(
@@ -414,12 +519,12 @@ async def batch_update_event_valuations(
         return 0
     
     async with pool.acquire() as conn:
-        # I-42 DEBUG: Log what we're storing
-        if updates and len(updates) > 0:
+        # I-42 DEBUG: Log what we're storing (debug-only)
+        if updates and len(updates) > 0 and logger.isEnabledFor(logging.DEBUG):
             first_upd = updates[0]
             val_quant = first_upd.get('value_quantitative')
             if val_quant and isinstance(val_quant, dict) and 'valuation' in val_quant:
-                logger.info(f"[I-42 DB DEBUG] Storing valuation keys: {list(val_quant['valuation'].keys())[:6]}")
+                logger.debug(f"[I-42 DB DEBUG] Storing valuation keys: {list(val_quant['valuation'].keys())[:6]}")
 
         # Prepare batch data
         records = [
@@ -566,7 +671,7 @@ async def batch_update_event_valuations(
         )
 
         # Log updated row IDs
-        if updated_rows:
+        if updated_rows and logger.isEnabledFor(logging.DEBUG):
             log_db_update(logger, "txn_events", len(updated_rows))
             for row in updated_rows:
                 log_row_update(

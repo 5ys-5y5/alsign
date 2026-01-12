@@ -200,6 +200,11 @@ Calculate quantitative and qualitative value metrics for events.
 
 Query Parameters:
 - `overwrite` (default: false): When false, partially update NULL values in value_* jsonb; when true, fully replace
+- `from` / `to` (optional): Filter by event_date range
+- `tickers` (optional): Comma-separated tickers to process
+- `metrics` (optional): Comma-separated metric IDs to recalculate
+- `batch_size` (optional): Number of unique tickers per batch (range: 1-2,000; equivalent to calling with grouped tickers)
+- `max_workers` (optional): Concurrency for ticker processing (tickers in a batch run in parallel)
 
 ### Analyst Performance
 

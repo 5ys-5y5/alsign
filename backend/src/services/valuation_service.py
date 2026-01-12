@@ -116,13 +116,18 @@ async def process_single_event_parallel(
 
     try:
         # I-41: Prepare custom_values for priceQuantitative metric
-        custom_values = {}
+        base_custom_values = {
+            '_row_context': row_context,
+            '_suppress_calc_fail_logs': True
+        }
+        custom_values = dict(base_custom_values)
         current_price_for_position = None
 
         if sector_averages:
             # First, calculate basic quantitative metrics (PER, PBR, etc.)
             temp_quant_result = await calculate_quantitative_metrics_fast(
-                ticker, event_date, ticker_api_cache, engine, target_domains
+                ticker, event_date, ticker_api_cache, engine, target_domains,
+                custom_values=base_custom_values
             )
 
             # Get current price for priceQuantitative calculation
@@ -157,7 +162,7 @@ async def process_single_event_parallel(
 
             if current_price and temp_quant_result.get('value'):
                 # calculate_fair_value_from_sector is imported at top of file
-                fair_value = calculate_fair_value_from_sector(
+                fair_value, fair_value_method = calculate_fair_value_from_sector_with_method(
                     temp_quant_result.get('value'),
                     sector_averages,
                     current_price
@@ -181,6 +186,11 @@ async def process_single_event_parallel(
         price_quant_value = None
         if value_quant and 'valuation' in value_quant:
             price_quant_value = value_quant['valuation'].get('priceQuantitative')
+            if price_quant_value is not None and fair_value_method:
+                # Record method only for priceQuantitative
+                value_quant['valuation']['priceQuantitative_meta'] = {
+                    'method': fair_value_method
+                }
 
         # ============================================================
         # I-45 Phase 4: Position & Disparity Calculation
@@ -249,10 +259,12 @@ async def process_single_event_parallel(
 
         # Build peer_quantitative JSONB
         peer_quant_col = None
-        if price_quant_col is not None and sector_averages:
+        fair_value_method = None
+        if sector_averages:
             peer_quant_col = {
                 'peerCount': peer_count,
-                'sectorAverages': sector_averages
+                'sectorAverages': sector_averages,
+                'fairValueMethod': fair_value_method
             }
 
         # Log at debug level only (remove per-event logs to prevent excessive output)
@@ -284,6 +296,8 @@ async def process_single_event_parallel(
         # Add metric_status for summary logging
         if 'metric_status' in quant_result:
             result['metric_status'] = quant_result['metric_status']
+        if qual_result.get('warnings'):
+            result['qual_warnings'] = qual_result['warnings']
 
         return result
 
@@ -412,7 +426,7 @@ async def batch_calculate_qualitative_parallel(
 
             # Call DB-driven calculation
             qual_result = await calculate_qualitative_metrics_fast(
-                pool, ticker, event_date, source, source_id, engine
+                pool, ticker, event_date, source, source_id, engine, suppress_logs=True
             )
 
             return event_key, qual_result
@@ -557,6 +571,15 @@ async def process_ticker_batch(
                     sector_averages = await calculate_sector_average_from_cache(
                         peer_tickers, global_peer_cache
                     )
+                    if not sector_averages and ticker_events:
+                        reference_date = ticker_events[0]['event_date']
+                        logger.warning(
+                            f"[PERF-OPT] Empty sector averages from global cache for {ticker}. "
+                            "Falling back to DB-based peer metrics."
+                        )
+                        sector_averages = await calculate_sector_average_metrics_from_db(
+                            pool, peer_tickers, reference_date, metrics_by_domain
+                        )
 
             else:
                 # FALLBACK: DB에서 peer 데이터 조회 (API 호출 대신!)
@@ -720,7 +743,6 @@ async def process_ticker_batch(
 
 async def process_single_batch(
     pool,
-    offset: int,
     batch_size: Optional[int],
     from_date: Optional[date],
     to_date: Optional[date],
@@ -738,8 +760,7 @@ async def process_single_batch(
 
     Args:
         pool: Database connection pool
-        offset: Starting offset for this batch
-        batch_size: Number of events to process in this batch
+        batch_size: Number of tickers to process in this batch
         from_date, to_date, tickers, overwrite, metrics_list: Filter parameters
         metrics_by_domain: Pre-loaded metric definitions
         max_workers: Concurrency limit
@@ -749,37 +770,15 @@ async def process_single_batch(
     Returns:
         Dict with batch results or None if no events to process
     """
-    # Phase 2: Load events batch
-    phase2_start = time.time()
-    try:
-        events = await metrics.select_events_for_valuation(
-            pool,
-            limit=batch_size,
-            offset=offset,
-            from_date=from_date,
-            to_date=to_date,
-            tickers=tickers,
-            overwrite=overwrite,
-            metrics_list=metrics_list
-        )
-        phase2_elapsed = time.time() - phase2_start
-        if batch_size:
-            logger.info(f"[Batch {batch_number}] Phase 2: Loaded {len(events):,} events in {phase2_elapsed:.2f}s (offset={offset:,}, overwrite={overwrite})")
-        else:
-            logger.info(f"[Phase 2] Loaded {len(events):,} events in {phase2_elapsed:.2f}s (all events, overwrite={overwrite})")
-    except Exception as e:
-        logger.error(f"[Batch {batch_number}] Phase 2 FAILED: {e}")
-        raise
-
-    # Early return if no events to process
-    if len(events) == 0:
+    if not tickers:
         return None
 
-    # Phase 3: Group events by ticker
-    phase3_start = time.time()
-    ticker_groups = group_events_by_ticker(events)
-    phase3_elapsed = time.time() - phase3_start
-    logger.info(f"[Batch {batch_number}] Phase 3: Grouped {len(events):,} events into {len(ticker_groups):,} tickers ({phase3_elapsed:.2f}s)")
+    # Phase 2: Prepare ticker batch
+    phase2_start = time.time()
+    if batch_size:
+        logger.info(f"[Batch {batch_number}] Phase 2: Prepared {len(tickers):,} tickers (overwrite={overwrite})")
+    else:
+        logger.info(f"[Phase 2] Prepared {len(tickers):,} tickers (overwrite={overwrite})")
 
     # Phase 3.5: Global Peer Collection (INDEPENDENT PER BATCH!)
     global_peer_cache = {}
@@ -788,7 +787,7 @@ async def process_single_batch(
     try:
         # Step 1: Load peer mappings
         peer_collect_start = time.time()
-        ticker_to_peers = await get_batch_peer_tickers_from_db(pool, list(ticker_groups.keys()))
+        ticker_to_peers = await get_batch_peer_tickers_from_db(pool, list(tickers))
 
         # Limit to 10 peers per ticker
         unique_peers = set()
@@ -831,13 +830,11 @@ async def process_single_batch(
 
     # Progress tracking
     completed_tickers = 0
-    total_tickers = len(ticker_groups)
-    ticker_start_time = time.time()
-
-    total_events_count = len(events)
+    total_tickers = len(tickers)
+    total_events_count = 0
     completed_events_count = {'count': 0}
 
-    async def process_ticker_with_semaphore(ticker: str, ticker_events: List[Dict[str, Any]]):
+    async def process_ticker_with_semaphore(ticker: str):
         nonlocal completed_tickers
 
         if cancel_event and cancel_event.is_set():
@@ -848,10 +845,45 @@ async def process_single_batch(
                 'quant_success': 0,
                 'quant_fail': 0,
                 'qual_success': 0,
-                'qual_fail': 0
+                'qual_fail': 0,
+                'events_count': 0
             }
 
         async with semaphore:
+            try:
+                ticker_events = await metrics.select_events_for_valuation(
+                    pool,
+                    from_date=from_date,
+                    to_date=to_date,
+                    tickers=[ticker],
+                    overwrite=overwrite,
+                    metrics_list=metrics_list
+                )
+            except Exception as e:
+                logger.error(f"[Batch {batch_number}] Phase 2 FAILED for ticker {ticker}: {e}")
+                return {
+                    'ticker': ticker,
+                    'results': [],
+                    'quant_success': 0,
+                    'quant_fail': 0,
+                    'qual_success': 0,
+                    'qual_fail': 0,
+                    'events_count': 0
+                }
+
+            if not ticker_events:
+                logger.info(f"[Batch {batch_number}] No events for ticker {ticker}")
+                completed_tickers += 1
+                return {
+                    'ticker': ticker,
+                    'results': [],
+                    'quant_success': 0,
+                    'quant_fail': 0,
+                    'qual_success': 0,
+                    'qual_fail': 0,
+                    'events_count': 0
+                }
+
             result = await process_ticker_batch(
                 pool, ticker, ticker_events, metrics_by_domain, overwrite,
                 total_events_count, completed_events_count,
@@ -861,15 +893,13 @@ async def process_single_batch(
             )
 
             completed_tickers += 1
+            result['events_count'] = len(ticker_events)
             return result
 
     logger.info(f"[Batch {batch_number}] Phase 4: Processing {total_tickers:,} tickers with concurrency={max_workers}")
 
     # Create and execute tasks
-    tasks = [
-        process_ticker_with_semaphore(ticker, ticker_events)
-        for ticker, ticker_events in ticker_groups.items()
-    ]
+    tasks = [process_ticker_with_semaphore(ticker) for ticker in tickers]
 
     ticker_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -879,25 +909,58 @@ async def process_single_batch(
     quantitative_fail = 0
     qualitative_success = 0
     qualitative_fail = 0
+    events_count = 0
+    tickers_with_events = 0
 
+    summary_updates = []
     for ticker_result in ticker_results:
         if isinstance(ticker_result, Exception):
             logger.error(f"[Batch {batch_number}] Ticker batch failed: {ticker_result}")
             continue
 
         results.extend(ticker_result['results'])
+        summary_updates.extend(ticker_result.get('updates', []))
         quantitative_success += ticker_result['quant_success']
         quantitative_fail += ticker_result['quant_fail']
         qualitative_success += ticker_result['qual_success']
         qualitative_fail += ticker_result['qual_fail']
+        events_count += ticker_result.get('events_count', 0)
+        if ticker_result.get('events_count', 0) > 0:
+            tickers_with_events += 1
+
+    calc_fail_tickers = set()
+    qual_fail_tickers = set()
+    summary_source = summary_updates if summary_updates else results
+    for result in summary_source:
+        if isinstance(result, dict):
+            ticker = result.get('ticker')
+            metric_status = result.get('metric_status', {})
+            qual_warnings = result.get('qual_warnings')
+            qual_status = result.get('qual_status')
+        else:
+            ticker = getattr(result, 'ticker', None)
+            metric_status = getattr(result, 'metric_status', None) or {}
+            qual_warnings = getattr(result, 'qual_warnings', None)
+            qual_status = getattr(result, 'qual_status', None)
+
+        if not ticker:
+            continue
+        if metric_status.get('priceQuantitative') is False:
+            calc_fail_tickers.add(ticker)
+        if qual_warnings or qual_status != 'success':
+            qual_fail_tickers.add(ticker)
 
     batch_elapsed = time.time() - phase2_start
-    logger.info(f"[Batch {batch_number}] Complete: {len(results):,} events, {len(ticker_groups):,} tickers, {len(global_peer_cache):,} peers in {batch_elapsed:.1f}s")
+    logger.info(f"[Batch {batch_number}] Complete: {len(results):,} events, {tickers_with_events:,} tickers, {len(global_peer_cache):,} peers in {batch_elapsed:.1f}s")
+    if calc_fail_tickers:
+        logger.warning(f"[BATCH {batch_number} SUMMARY] [CALC FAIL] {', '.join(sorted(calc_fail_tickers))}")
+    if qual_fail_tickers:
+        logger.warning(f"[BATCH {batch_number} SUMMARY] [QUALITATIVE FAIL] {', '.join(sorted(qual_fail_tickers))}")
 
     return {
         'results': results,
-        'events_count': len(events),
-        'tickers_count': len(ticker_groups),
+        'events_count': events_count,
+        'tickers_count': tickers_with_events,
         'unique_peer_count': len(global_peer_cache),
         'quantitative_success': quantitative_success,
         'quantitative_fail': quantitative_fail,
@@ -936,7 +999,7 @@ async def calculate_valuations(
         tickers: Optional list of ticker symbols to filter events. If None, processes all tickers.
         cancel_event: Optional asyncio.Event for cancellation.
         metrics_list: Optional list of metric IDs to recalculate (I-41). If specified, only these metrics are updated.
-        batch_size: Optional batch size for processing events. If None, processes all events in one batch.
+        batch_size: Optional batch size for processing tickers. If None, processes all tickers in one batch.
         max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
                      Default: 20. Recommended: 10-30 depending on DB capacity.
         verbose: Enable verbose logging. If True, outputs detailed per-event and per-ticker logs.
@@ -971,8 +1034,38 @@ async def calculate_valuations(
     if not metrics_by_domain:
         logger.warning("[Phase 1] No metrics found in config_lv2_metric")
 
-    # Phase 2-4: Batch processing loop
-    current_offset = 0
+    # Phase 2: Build ticker list
+    try:
+        tickers_to_process = await metrics.select_unique_tickers_for_valuation(
+            pool,
+            from_date=from_date,
+            to_date=to_date,
+            tickers=tickers,
+            overwrite=overwrite,
+            metrics_list=metrics_list
+        )
+        logger.info(f"[Phase 2] Loaded {len(tickers_to_process):,} unique tickers for processing")
+    except Exception as e:
+        logger.error(f"[Phase 2] FAILED to load tickers: {e}")
+        raise
+
+    if not tickers_to_process:
+        summary = {
+            'totalEventsProcessed': 0,
+            'quantitativeSuccess': 0,
+            'quantitativeFail': 0,
+            'qualitativeSuccess': 0,
+            'qualitativeFail': 0,
+            'priceTrendSuccess': 0,
+            'priceTrendFail': 0,
+            'elapsedMs': int((time.time() - start_time) * 1000)
+        }
+        return {
+            'summary': summary,
+            'results': []
+        }
+
+    # Phase 3-4: Batch processing loop
     batch_number = 0
     all_results = []
     total_events_processed = 0
@@ -983,17 +1076,29 @@ async def calculate_valuations(
     all_qualitative_success = 0
     all_qualitative_fail = 0
 
-    while True:
+    if batch_size:
+        ticker_batches = [
+            tickers_to_process[i:i + batch_size]
+            for i in range(0, len(tickers_to_process), batch_size)
+        ]
+    else:
+        ticker_batches = [tickers_to_process]
+
+    for ticker_batch in ticker_batches:
         batch_number += 1
+
+        tickers_preview = ", ".join(ticker_batch[:10])
+        if len(ticker_batch) > 10:
+            tickers_preview = f"{tickers_preview}, ..."
+        logger.info(f"[Batch {batch_number}] Ticker batch: {len(ticker_batch)} tickers ({tickers_preview})")
 
         # Process one batch
         batch_result = await process_single_batch(
             pool=pool,
-            offset=current_offset,
             batch_size=batch_size,
             from_date=from_date,
             to_date=to_date,
-            tickers=tickers,
+            tickers=ticker_batch,
             overwrite=overwrite,
             metrics_list=metrics_list,
             metrics_by_domain=metrics_by_domain,
@@ -1003,11 +1108,10 @@ async def calculate_valuations(
             cancel_event=cancel_event
         )
 
-        # Break if no more events
+        # Skip empty batch
         if batch_result is None:
-            if batch_number == 1:
-                logger.info("[backfillEventsTable] No events to process")
-            break
+            logger.info(f"[backfillEventsTable] Batch {batch_number} had no events to process")
+            continue
 
         # Accumulate results
         all_results.extend(batch_result['results'])
@@ -1018,13 +1122,6 @@ async def calculate_valuations(
         all_quantitative_fail += batch_result['quantitative_fail']
         all_qualitative_success += batch_result['qualitative_success']
         all_qualitative_fail += batch_result['qualitative_fail']
-
-        # If no batch_size, process all in one go
-        if not batch_size:
-            break
-
-        # Move to next batch
-        current_offset += batch_size
 
     # Early return if no events processed
     if len(all_results) == 0:
@@ -1492,7 +1589,8 @@ async def calculate_qualitative_metrics_fast(
     event_date,
     source: str,
     source_id: str,
-    engine: MetricCalculationEngine
+    engine: MetricCalculationEngine,
+    suppress_logs: bool = False
 ) -> Dict[str, Any]:
     """
     ULTRA-FAST qualitative metrics calculation (DB-driven).
@@ -1516,6 +1614,7 @@ async def calculate_qualitative_metrics_fast(
     Returns:
         Dict with status, value (qualitative metrics), currentPrice, message
     """
+    qual_warnings = []
     try:
         # Convert event_date to date object
         if isinstance(event_date, str):
@@ -1543,12 +1642,16 @@ async def calculate_qualitative_metrics_fast(
 
         # Only log if NO data found (error case)
         if len(price_target_data) == 0:
-            logger.warning(f"[QUALITATIVE FAIL] {ticker}: No consensus data. Run GET /sourceData?mode=consensus")
+            if suppress_logs:
+                qual_warnings.append('no_consensus_data')
+            else:
+                logger.warning(f"[QUALITATIVE FAIL] {ticker}: No consensus data. Run GET /sourceData?mode=consensus")
 
         # Pass priceTarget data and event_date to calculation code
         custom_values = {
             'priceTarget': price_target_data,  # Raw data for consensus calculation
-            'event_date': event_date_obj  # Used by consensus calculation to filter
+            'event_date': event_date_obj,  # Used by consensus calculation to filter
+            '_suppress_calc_fail_logs': True
         }
 
         # Calculate metrics using PRE-INITIALIZED engine (DB-driven)
@@ -1574,14 +1677,21 @@ async def calculate_qualitative_metrics_fast(
                     last_data = consensus_signal.get('last', {})
                     current_price = last_data.get('price_when_posted')
             else:
-                logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: consensus calculation returned invalid data")
+                if suppress_logs:
+                    qual_warnings.append('invalid_consensus_data')
+                else:
+                    logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: consensus calculation returned invalid data")
         else:
-            logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: valuation domain missing in engine result")
+            if suppress_logs:
+                qual_warnings.append('missing_valuation_domain')
+            else:
+                logger.warning(f"[QUALITATIVE FAIL] event_id={source_id}: valuation domain missing in engine result")
 
         return {
             'status': 'success',
             'value': consensus_data,  # Flat structure matching original format
             'currentPrice': current_price,
+            'warnings': qual_warnings,
             'message': 'Qualitative metrics calculated (DB-driven from evt_consensus)'
         }
 
@@ -2811,74 +2921,88 @@ async def calculate_sector_average_metrics(
     return sector_averages
 
 
+def calculate_fair_value_from_sector_with_method(
+    value_quantitative: Dict[str, Any],
+    sector_averages: Dict[str, float],
+    current_price: float
+) -> tuple[Optional[float], Optional[str]]:
+    """
+    업종 평균 멀티플 기반 적정가를 계산합니다.
+
+    우선순위:
+      1) PER
+      2) PBR
+      3) PSR
+
+    Returns:
+        (fair_value, method) where method in {'PER', 'PBR', 'PSR'} or None
+    """
+    if not value_quantitative or not sector_averages or not current_price:
+        return None, None
+
+    try:
+        qual_warnings = []
+        valuation = value_quantitative.get('valuation', {})
+        if isinstance(valuation, dict) and '_meta' in valuation:
+            valuation = {k: v for k, v in valuation.items() if k != '_meta'}
+
+        current_per = valuation.get('PER')
+        sector_avg_per = sector_averages.get('PER')
+
+        if current_per and sector_avg_per and current_per > 0 and sector_avg_per > 0:
+            eps = current_price / current_per
+            fair_value = sector_avg_per * eps
+            logger.debug(
+                f"[I-36] Fair value calculation: "
+                f"current_price={current_price:.2f}, current_PER={current_per:.2f}, "
+                f"sector_avg_PER={sector_avg_per:.2f}, EPS={eps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value, 'PER'
+
+        current_pbr = valuation.get('PBR')
+        sector_avg_pbr = sector_averages.get('PBR')
+
+        if current_pbr and sector_avg_pbr and current_pbr > 0 and sector_avg_pbr > 0:
+            bps = current_price / current_pbr
+            fair_value = sector_avg_pbr * bps
+            logger.debug(
+                f"[I-36] Fair value calculation (PBR): "
+                f"current_price={current_price:.2f}, current_PBR={current_pbr:.2f}, "
+                f"sector_avg_PBR={sector_avg_pbr:.2f}, BPS={bps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value, 'PBR'
+
+        current_psr = valuation.get('PSR')
+        sector_avg_psr = sector_averages.get('PSR')
+
+        if current_psr and sector_avg_psr and current_psr > 0 and sector_avg_psr > 0:
+            sps = current_price / current_psr
+            fair_value = sector_avg_psr * sps
+            logger.debug(
+                f"[I-36] Fair value calculation (PSR): "
+                f"current_price={current_price:.2f}, current_PSR={current_psr:.2f}, "
+                f"sector_avg_PSR={sector_avg_psr:.2f}, SPS={sps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value, 'PSR'
+
+        return None, None
+    except Exception as e:
+        logger.error(f"[I-36] Failed to calculate fair value: {e}")
+        return None, None
+
+
 def calculate_fair_value_from_sector(
     value_quantitative: Dict[str, Any],
     sector_averages: Dict[str, float],
     current_price: float
 ) -> Optional[float]:
     """
-    업종 평균 PER을 기반으로 적정가를 계산합니다.
-    
-    적정가 = (업종 평균 PER) × EPS
-    EPS = 현재 주가 / 현재 PER
-    
-    Args:
-        value_quantitative: Quantitative 메트릭 결과
-        sector_averages: 업종 평균 {'PER': 25.5, 'PBR': 3.2}
-        current_price: 현재 주가 (price_when_posted)
-    
-    Returns:
-        적정가 또는 None
+    업종 평균 멀티플 기반 적정가를 계산합니다.
     """
-    if not value_quantitative or not sector_averages or not current_price:
-        return None
-    
-    try:
-        valuation = value_quantitative.get('valuation', {})
-        if isinstance(valuation, dict) and '_meta' in valuation:
-            # _meta 제외한 실제 값 추출
-            valuation = {k: v for k, v in valuation.items() if k != '_meta'}
-        
-        current_per = valuation.get('PER')
-        sector_avg_per = sector_averages.get('PER')
-
-        # CRITICAL: Only use positive PER values (negative PER = loss-making company)
-        if current_per and sector_avg_per and current_per > 0 and sector_avg_per > 0:
-            # EPS = 현재 주가 / 현재 PER
-            eps = current_price / current_per
-            # 적정가 = 업종 평균 PER × EPS
-            fair_value = sector_avg_per * eps
-
-            logger.debug(
-                f"[I-36] Fair value calculation: "
-                f"current_price={current_price:.2f}, current_PER={current_per:.2f}, "
-                f"sector_avg_PER={sector_avg_per:.2f}, EPS={eps:.4f}, fair_value={fair_value:.2f}"
-            )
-            return fair_value
-
-        # PER이 음수이거나 없으면 PBR로 시도
-        current_pbr = valuation.get('PBR')
-        sector_avg_pbr = sector_averages.get('PBR')
-
-        # CRITICAL: Only use positive PBR values
-        if current_pbr and sector_avg_pbr and current_pbr > 0 and sector_avg_pbr > 0:
-            # BPS = 현재 주가 / 현재 PBR
-            bps = current_price / current_pbr
-            # 적정가 = 업종 평균 PBR × BPS
-            fair_value = sector_avg_pbr * bps
-
-            logger.debug(
-                f"[I-36] Fair value calculation (PBR): "
-                f"current_price={current_price:.2f}, current_PBR={current_pbr:.2f}, "
-                f"sector_avg_PBR={sector_avg_pbr:.2f}, BPS={bps:.4f}, fair_value={fair_value:.2f}"
-            )
-            return fair_value
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"[I-36] Failed to calculate fair value: {e}")
-        return None
+    fair_value, _ = calculate_fair_value_from_sector_with_method(
+        value_quantitative, sector_averages, current_price
+    )
+    return fair_value
 
 
 async def calculate_fair_value_for_ticker(

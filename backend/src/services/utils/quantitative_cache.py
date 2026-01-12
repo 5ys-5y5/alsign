@@ -523,6 +523,21 @@ def calculate_fair_value_from_sector(
             )
             return fair_value
 
+        # PBR이 음수이거나 없으면 PSR로 시도
+        current_psr = valuation.get('PSR')
+        sector_avg_psr = sector_averages.get('PSR')
+
+        if current_psr and sector_avg_psr and current_psr > 0 and sector_avg_psr > 0:
+            sps = current_price / current_psr
+            fair_value = sector_avg_psr * sps
+
+            logger.debug(
+                f"[I-36] Fair value calculation (PSR): "
+                f"current_price={current_price:.2f}, current_PSR={current_psr:.2f}, "
+                f"sector_avg_PSR={sector_avg_psr:.2f}, SPS={sps:.4f}, fair_value={fair_value:.2f}"
+            )
+            return fair_value
+
         return None
 
     except Exception as e:

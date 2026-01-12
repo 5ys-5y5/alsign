@@ -1290,7 +1290,10 @@ class MetricCalculationEngine:
             try:
                 exec(calculation_code, safe_globals, local_context)
             except Exception as calc_err:
-                logger.error(f"[CALC EXCEPTION] {metric_name}: {calc_err}")
+                event_context = calculated_values.get('_row_context') if calculated_values else None
+                config_context = f"[table: config_lv2_metric | id: {metric_name}]"
+                context = " ".join(part for part in [event_context, config_context] if part)
+                logger.error(f"[CALC EXCEPTION] {metric_name}: {calc_err} {context}".rstrip())
                 return None
 
             # The code should set a 'result' variable or return via last expression
@@ -1298,14 +1301,24 @@ class MetricCalculationEngine:
                 result = local_context['result']
 
                 # Only log if calculation failed (dataAvailable=False) or result is None
+                suppress_calc_fail_logs = bool(
+                    calculated_values.get('_suppress_calc_fail_logs')
+                    if calculated_values else False
+                )
                 if result is None:
-                    logger.warning(f"[CALC FAIL] {metric_name}: returned None")
+                    if not suppress_calc_fail_logs:
+                        logger.warning(f"[CALC FAIL] {metric_name}: returned None")
                 elif isinstance(result, dict) and result.get('_meta', {}).get('dataAvailable') == False:
                     logger.debug(f"[CALC NULL] {metric_name}: dataAvailable=False")
                 return result
             else:
                 # If no 'result' variable, return None
-                logger.warning(f"[CALC FAIL] {metric_name}: no 'result' variable set")
+                suppress_calc_fail_logs = bool(
+                    calculated_values.get('_suppress_calc_fail_logs')
+                    if calculated_values else False
+                )
+                if not suppress_calc_fail_logs:
+                    logger.warning(f"[CALC FAIL] {metric_name}: no 'result' variable set")
                 return None
 
         except Exception as e:
