@@ -1,11 +1,15 @@
 """FastAPI application entry point."""
 
 import logging
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
 from .database.connection import db_pool
@@ -52,6 +56,19 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+project_root = Path(__file__).resolve().parents[2]
+frontend_dist = project_root / "frontend" / "dist"
+index_file = frontend_dist / "index.html"
+
+if index_file.exists():
+    assets_dir = frontend_dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    async def serve_frontend_index():
+        return FileResponse(str(index_file))
 
 # Add CORS middleware
 # Allow all origins in development for flexible dev server configuration
