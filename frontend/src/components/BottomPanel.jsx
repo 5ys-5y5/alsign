@@ -228,9 +228,89 @@ export default function BottomPanel() {
     );
   };
 
+  const formatSummaryLine = (summaryText) => {
+    const getNumber = (key) => {
+      const match = summaryText.match(new RegExp(`['"]${key}['"]\\s*:\\s*(\\d+)`));
+      return match ? parseInt(match[1], 10) : null;
+    };
+
+    const extractFailTickers = () => {
+      const keyMatch = summaryText.match(/['"]fail_items['"]/);
+      if (!keyMatch || keyMatch.index === undefined) return [];
+
+      const listStart = summaryText.indexOf('[', keyMatch.index);
+      if (listStart === -1) return [];
+
+      let depth = 0;
+      let listEnd = -1;
+      for (let i = listStart; i < summaryText.length; i += 1) {
+        const ch = summaryText[i];
+        if (ch === '[') depth += 1;
+        if (ch === ']') {
+          depth -= 1;
+          if (depth === 0) {
+            listEnd = i;
+            break;
+          }
+        }
+      }
+      if (listEnd === -1) return [];
+
+      const listText = summaryText.slice(listStart + 1, listEnd);
+      const segments = listText.match(/\{[^{}]*\}/g) || [];
+      return segments
+        .map((segment) => {
+          const tickerMatch = segment.match(/['"]ticker['"]\s*:\s*['"]([^'"]+)['"]/);
+          const reasonMatch = segment.match(/['"]reason['"]\s*:\s*['"]([^'"]+)['"]/);
+          return {
+            ticker: tickerMatch ? tickerMatch[1] : null,
+            reason: reasonMatch ? reasonMatch[1] : '',
+          };
+        })
+        .filter((item) => item.ticker);
+    };
+
+    const total = getNumber('total');
+    const success = getNumber('success');
+
+    const failItems = extractFailTickers();
+    const existTickers = failItems
+      .filter((item) => item.reason.includes('이미 존재함'))
+      .map((item) => item.ticker);
+    const dupTickers = failItems
+      .filter((item) => item.reason.includes('중복'))
+      .map((item) => item.ticker);
+
+    const lines = [];
+    if (total !== null) lines.push(`[total]: ${total}`);
+    if (success !== null) lines.push(`[success]: ${success}`);
+    lines.push(`[fail:exist]: ${existTickers.length} (${existTickers.join(',') || '-'})`);
+    lines.push(`[fail:dup]: ${dupTickers.length} (${dupTickers.join(',') || '-'})`);
+
+    return lines.join('\n');
+  };
+
+  const formatLogLine = (line) => {
+    if (typeof line !== 'string') return line;
+    const marker = 'Summary:';
+    const idx = line.indexOf(marker);
+    if (idx === -1) return line;
+
+    const head = line.slice(0, idx + marker.length);
+    const body = line.slice(idx + marker.length).trim();
+    const formattedBody = formatSummaryLine(body);
+
+    return `${head}\n${formattedBody}`;
+  };
+
   const formatIndexedLog = (index, line) => {
     const paddedIndex = String(index).padStart(4, '0');
-    return `${paddedIndex} | ${line}`;
+    const prefix = `${paddedIndex} | `;
+    const formatted = formatLogLine(line);
+    const segments = String(formatted).split('\n');
+    return segments.length === 0
+      ? `${prefix}`
+      : `${prefix}${segments[0]}${segments.length > 1 ? `\n${segments.slice(1).join('\n')}` : ''}`;
   };
 
   const extractPhase = (line) => {
@@ -296,6 +376,7 @@ export default function BottomPanel() {
         line.includes('[table:');
 
       const isNoisyLine = line.startsWith('[MetricEngine]');
+      const isSummaryLine = line.includes('Summary:') || line.includes('summary=');
 
       const phaseIsKey =
         phase &&
@@ -315,6 +396,7 @@ export default function BottomPanel() {
         isError ||
         hasProgress ||
         isStageLine ||
+        isSummaryLine ||
         hasRowId ||
         phaseIsKey ||
         isNewPhase
@@ -830,6 +912,8 @@ export default function BottomPanel() {
                             fontSize: 'var(--text-xs)',
                             color: 'var(--text)',
                             cursor: 'pointer',
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
                           }}
                           onClick={() => {
                             setHighlightedVerboseIndex(logEntry.index);
@@ -873,6 +957,8 @@ export default function BottomPanel() {
                         color: 'var(--text)',
                         backgroundColor:
                           highlightedVerboseIndex === logEntry.index ? 'var(--surface)' : 'transparent',
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
                       }}
                     >
                       {formatIndexedLog(logEntry.index, logEntry.line)}

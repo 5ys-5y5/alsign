@@ -5,6 +5,7 @@ import time
 import logging
 import asyncio
 import json
+from datetime import date
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from typing import Dict
@@ -19,6 +20,12 @@ router = APIRouter(prefix="", tags=["Event Processing"])
 
 # Store active streaming requests for cancellation
 active_streams: Dict[str, asyncio.Event] = {}
+
+
+def normalize_date_range(from_date, to_date):
+    if from_date is None and to_date is not None:
+        return date(2000, 1, 1), to_date
+    return from_date, to_date
 
 
 @router.api_route("/setEventsTable/stream", methods=["GET", "POST"])
@@ -327,14 +334,19 @@ async def stream_backfill_events_table(
                     # Parse metrics list (I-41)
                     metrics_list = params.get_metrics_list()
 
+                    normalized_from, normalized_to = normalize_date_range(params.from_date, params.to_date)
+
                     logger.info(f"[STREAM] Calling valuation_service.calculate_valuations")
-                    logger.info(f"[STREAM] Parameters: metrics={metrics_list}, batch_size={params.batch_size}")
+                    logger.info(
+                        f"[STREAM] Parameters: metrics={metrics_list}, batch_size={params.batch_size}, "
+                        f"from_date={normalized_from}, to_date={normalized_to}"
+                    )
 
                     # Execute valuation calculation with cancel event
                     result = await valuation_service.calculate_valuations(
                         overwrite=params.overwrite,
-                        from_date=params.from_date,
-                        to_date=params.to_date,
+                        from_date=normalized_from,
+                        to_date=normalized_to,
                         tickers=ticker_list,
                         start_point=start_point,
                         cancel_event=cancel_event,

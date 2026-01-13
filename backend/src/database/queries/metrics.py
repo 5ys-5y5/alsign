@@ -211,6 +211,58 @@ async def select_events_for_valuation(
             raise Exception(f"Database query timeout after {elapsed:.2f}s - the query is taking too long. Consider adding date/ticker filters or checking database performance.")
 
 
+async def select_events_for_price_trends(
+    pool: asyncpg.Pool,
+    from_date=None,
+    to_date=None,
+    tickers: List[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Select events from txn_events for price trend processing.
+
+    This query does NOT filter on value_quantitative, so all events
+    matching date/ticker filters are eligible for price trend generation.
+
+    Args:
+        pool: Database connection pool
+        from_date: Optional start date for filtering events by event_date
+        to_date: Optional end date for filtering events by event_date
+        tickers: Optional list of ticker symbols to filter
+
+    Returns:
+        List of event dictionaries with ticker, event_date, source, source_id
+    """
+    async with pool.acquire() as conn:
+        query = """
+            SELECT id, ticker, event_date, source, source_id,
+                   sector, industry
+            FROM txn_events
+            WHERE 1=1
+        """
+        params = []
+        param_idx = 1
+
+        if from_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date >= ${param_idx}"
+            params.append(from_date)
+            param_idx += 1
+
+        if to_date is not None:
+            query += f" AND (event_date AT TIME ZONE 'UTC')::date <= ${param_idx}"
+            params.append(to_date)
+            param_idx += 1
+
+        if tickers is not None and len(tickers) > 0:
+            query += f" AND ticker = ANY(${param_idx})"
+            params.append(tickers)
+            param_idx += 1
+
+        query += " ORDER BY ticker, event_date"
+
+        rows = await conn.fetch(query, *params)
+        return [dict(row) for row in rows]
+
+
 async def select_unique_tickers_for_valuation(
     pool: asyncpg.Pool,
     from_date = None,

@@ -13,6 +13,7 @@ const ENDPOINT_TIMEOUTS = {
   '/setEventsTable': 3600000,          // 60 minutes
   '/backfillEventsTable': 0,           // No timeout (can run for hours)
   '/getQuantitatives': 0,              // No timeout (can run for hours)
+  '/generatePriceTrends': 0,          // No timeout (can run for hours)
 };
 
 /**
@@ -74,15 +75,228 @@ function parseLogLine(logLine) {
   }
 }
 
+
+const TRADE_CSV_HEADERS = {
+  tradedate: 'trade_date',
+  ticker: 'ticker',
+  position: 'position',
+  model: 'model',
+  notes: 'notes',
+  source: 'source',
+  entryprice: 'entry_price',
+  exitprice: 'exit_price',
+  quantity: 'quantity',
+};
+
+const UNDELIMITED_TRADE_HEADERS = ['trade_date', 'ticker', 'position', 'model', 'notes'];
+
+function normalizeHeader(header) {
+  return header.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function splitDelimitedLine(line, delimiter) {
+  if (delimiter) {
+    return line.split(delimiter).map((value) => value.trim());
+  }
+  return line.trim().split(/\s+/);
+}
+
+function normalizeTradeDate(value) {
+  if (!value) return value;
+  const match = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!match) return value;
+  const [, year, month, day] = match;
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
+function parseUndelimitedTradeLine(line, headers) {
+  if (headers.join(',') !== UNDELIMITED_TRADE_HEADERS.join(',')) {
+    throw new Error('Undelimited format supports headers: trade_date,ticker,position,model,notes');
+  }
+
+  const dateMatch = line.match(/^(\d{4}-\d{1,2}-\d{1,2})/);
+  if (!dateMatch) {
+    throw new Error(`Invalid trade_date: ${line}`);
+  }
+
+  const trade_date = normalizeTradeDate(dateMatch[1]);
+  const rest = line.slice(trade_date.length);
+  if (!rest) {
+    throw new Error(`Missing fields after trade_date: ${line}`);
+  }
+
+  const restLower = rest.toLowerCase();
+  const positions = ['long', 'short', 'neutral'];
+  let positionIndex = -1;
+  let positionValue = '';
+
+  positions.forEach((pos) => {
+    const idx = restLower.indexOf(pos);
+    if (idx !== -1 && (positionIndex === -1 || idx < positionIndex)) {
+      positionIndex = idx;
+      positionValue = pos;
+    }
+  });
+
+  if (positionIndex === -1) {
+    throw new Error(`Missing position (long/short/neutral): ${line}`);
+  }
+
+  const ticker = rest.slice(0, positionIndex).trim();
+  const modelNotes = rest.slice(positionIndex + positionValue.length).trim();
+
+  if (!ticker) {
+    throw new Error(`Missing ticker: ${line}`);
+  }
+  if (!modelNotes) {
+    throw new Error(`Missing model/notes: ${line}`);
+  }
+
+  let model = modelNotes;
+  let notes;
+  const urlIndex = modelNotes.search(/https?:\/\//i);
+  if (urlIndex !== -1) {
+    model = modelNotes.slice(0, urlIndex).trim();
+    notes = modelNotes.slice(urlIndex).trim();
+  }
+
+  if (!model) {
+    throw new Error(`Missing model: ${line}`);
+  }
+
+  return {
+    trade_date,
+    ticker,
+    position: positionValue,
+    model,
+    notes,
+  };
+}
+
+function parseDelimitedTrades(rawText) {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) {
+    throw new Error('CSV/TSV must include a header and at least one data row');
+  }
+
+  const headerLine = lines[0];
+  let delimiter = null;
+  let undelimited = false;
+  let rawHeaders = [];
+  if (headerLine.includes('	')) {
+    delimiter = '	';
+  } else if (headerLine.includes(',')) {
+    delimiter = ',';
+  }
+
+  if (delimiter) {
+    rawHeaders = splitDelimitedLine(headerLine, delimiter);
+  } else {
+    const normalizedHeaderLine = normalizeHeader(headerLine);
+    const expectedConcatenated = UNDELIMITED_TRADE_HEADERS.map((header) => header.replace('_', '')).join('');
+    if (normalizedHeaderLine === expectedConcatenated) {
+      undelimited = true;
+      rawHeaders = UNDELIMITED_TRADE_HEADERS;
+    } else {
+      rawHeaders = splitDelimitedLine(headerLine, delimiter);
+    }
+  }
+
+  if (!undelimited && rawHeaders.length < 2) {
+    throw new Error('Invalid CSV/TSV header');
+  }
+
+  const headers = undelimited ? rawHeaders : rawHeaders.map((header) => {
+    const normalized = normalizeHeader(header);
+    const key = TRADE_CSV_HEADERS[normalized];
+    if (!key) {
+      throw new Error(`Unsupported header: ${header}`);
+    }
+    return key;
+  });
+
+  const trades = [];
+  for (const line of lines.slice(1)) {
+    if (undelimited) {
+      trades.push(parseUndelimitedTradeLine(line, headers));
+      continue;
+    }
+
+    let parts = splitDelimitedLine(line, delimiter);
+    if (parts.length < headers.length) {
+      throw new Error(`Row has fewer columns than header: ${line}`);
+    }
+
+    if (parts.length > headers.length) {
+      const joiner = delimiter || ' ';
+      parts = parts
+        .slice(0, headers.length - 1)
+        .concat(parts.slice(headers.length - 1).join(joiner));
+    }
+
+    const trade = {};
+    headers.forEach((key, index) => {
+      const value = parts[index];
+      if (value === undefined || value === '') {
+        return;
+      }
+      trade[key] = value;
+    });
+
+    if (!trade.trade_date || !trade.ticker) {
+      throw new Error('trade_date and ticker are required');
+    }
+
+    trade.trade_date = normalizeTradeDate(trade.trade_date);
+
+    if (trade.position) {
+      trade.position = trade.position.toLowerCase();
+    }
+    if (trade.source) {
+      trade.source = trade.source.toLowerCase();
+    }
+    if (trade.entry_price) {
+      const parsed = parseFloat(trade.entry_price);
+      if (Number.isNaN(parsed)) {
+        throw new Error(`Invalid entry_price: ${trade.entry_price}`);
+      }
+      trade.entry_price = parsed;
+    }
+    if (trade.exit_price) {
+      const parsed = parseFloat(trade.exit_price);
+      if (Number.isNaN(parsed)) {
+        throw new Error(`Invalid exit_price: ${trade.exit_price}`);
+      }
+      trade.exit_price = parsed;
+    }
+    if (trade.quantity) {
+      const parsed = parseInt(trade.quantity, 10);
+      if (Number.isNaN(parsed)) {
+        throw new Error(`Invalid quantity: ${trade.quantity}`);
+      }
+      trade.quantity = parsed;
+    }
+
+    trades.push(trade);
+  }
+
+  return { trades };
+}
+
 /**
  * RequestForm - Generic request form component.
  */
-function RequestForm({ title, method, path, queryFields, bodyFields, onRequestStart, onRequestComplete, onLog }) {
+function RequestForm({ title, method, path, queryFields, bodyFields, bodyExample, bodyExampleCsv, onRequestStart, onRequestComplete, onLog }) {
   const [queryParams, setQueryParams] = useState({});
-  const [bodyData, setBodyData] = useState('{}');
+  const [bodyData, setBodyData] = useState(bodyFields?.[0]?.default ?? '{}');
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState(null);
   const [error, setError] = useState(null);
+  const [copyStatus, setCopyStatus] = useState({});
 
   const handleQueryChange = (key, value) => {
     setQueryParams((prev) => ({ ...prev, [key]: value }));
@@ -124,6 +338,73 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
     setBodyData(value);
   };
 
+  const handleCopyExample = async (key, text) => {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyStatus((prev) => ({ ...prev, [key]: 'copied' }));
+      setTimeout(() => {
+        setCopyStatus((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+      }, 2000);
+    } catch (err) {
+      setCopyStatus((prev) => ({ ...prev, [key]: 'failed' }));
+      setTimeout(() => {
+        setCopyStatus((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+      }, 2000);
+    }
+  };
+
+  const renderExampleBox = (label, example, key) => {
+    if (!example) return null;
+    const status = copyStatus[key];
+    const buttonLabel = status === 'copied' ? 'Copied' : status === 'failed' ? 'Copy failed' : 'Copy';
+
+    return (
+      <div
+        key={key}
+        style={{
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--rounded-md)',
+          backgroundColor: 'var(--surface)',
+          padding: 'var(--space-2)',
+          marginBottom: 'var(--space-2)',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>
+            {label}
+          </div>
+          <button
+            type="button"
+            onClick={() => handleCopyExample(key, example)}
+            className="btn btn-xs btn-secondary"
+          >
+            {buttonLabel}
+          </button>
+        </div>
+        <pre
+          style={{
+            margin: 'var(--space-1) 0 0 0',
+            fontFamily: 'monospace',
+            fontSize: 'var(--text-xs)',
+            whiteSpace: 'pre-wrap',
+          }}
+        >
+          {example}
+        </pre>
+      </div>
+    );
+  };
+
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -143,7 +424,8 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
       (path === '/sourceData' && method === 'GET') ||
       (path === '/setEventsTable' && method === 'POST') ||
       (path === '/backfillEventsTable' && method === 'POST') ||
-      (path === '/getQuantitatives' && method === 'POST');
+      (path === '/getQuantitatives' && method === 'POST') ||
+      (path === '/generatePriceTrends' && method === 'POST');
 
     if (isStreaming) {
       // Use SSE for real-time streaming
@@ -156,6 +438,8 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
         streamUrl = `${API_BASE_URL}/backfillEventsTable/stream${queryString ? '?' + queryString : ''}`;
       } else if (path === '/getQuantitatives' && method === 'POST') {
         streamUrl = `${API_BASE_URL}/getQuantitatives/stream${queryString ? '?' + queryString : ''}`;
+      } else if (path === '/generatePriceTrends' && method === 'POST') {
+        streamUrl = `${API_BASE_URL}/generatePriceTrends/stream${queryString ? '?' + queryString : ''}`;
       }
       const eventSource = new EventSource(streamUrl);
       let requestId = null;
@@ -323,13 +607,19 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
 
         if (method !== 'GET' && bodyFields) {
           options.headers['Content-Type'] = 'application/json';
-          // Parse body or use empty object
+          let parsedBody;
+
           try {
-            const parsedBody = JSON.parse(bodyData);
-            options.body = JSON.stringify(parsedBody);
+            parsedBody = JSON.parse(bodyData);
           } catch (err) {
-            throw new Error('Invalid JSON in request body');
+            if (path === '/trades') {
+              parsedBody = parseDelimitedTrades(bodyData);
+            } else {
+              throw new Error('Invalid JSON in request body');
+            }
           }
+
+          options.body = JSON.stringify(parsedBody);
         }
 
         // Log request start
@@ -526,6 +816,19 @@ function RequestForm({ title, method, path, queryFields, bodyFields, onRequestSt
             >
               Request Body (JSON)
             </h4>
+            {path === '/trades' && (
+              <div
+                style={{
+                  fontSize: 'var(--text-xs)',
+                  color: 'var(--text-secondary)',
+                  marginBottom: 'var(--space-2)',
+                }}
+              >
+                CSV/TSV input supported (headers: trade_date, ticker, position, model, notes; optional source, entry_price, exit_price, quantity). Undelimited header/data supported for trade_date,ticker,position,model,notes.
+              </div>
+            )}
+            {renderExampleBox('JSON Example', bodyExample, 'json')}
+            {renderExampleBox('CSV/TSV Example', bodyExampleCsv, 'csv')}
             <textarea
               value={bodyData}
               onChange={(e) => handleBodyChange(e.target.value)}
@@ -609,6 +912,28 @@ export default function RequestsPage() {
     { id: 'trades', title: 'POST /trades' },
     { id: 'fillAnalyst', title: 'POST /fillAnalyst' }
   ];
+
+  const tradesBodyExampleCsv = [
+    'trade_date,ticker,position,model,notes',
+    '2026-01-13,PRGS,long,MODEL-0,https://chatgpt.com/g/g-68cb99af63a081918e0f7d0c3e38a3e3-tuja-model-0/c/6965f399-15d8-8328-b27b-1b6f848e4251',
+    '2026-01-13,FAST,long,MODEL-0,https://chatgpt.com/g/g-68cb99af63a081918e0f7d0c3e38a3e3-tuja-model-0/c/6965f399-15d8-8328-b27b-1b6f848e4251',
+  ].join('\n');
+
+  const tradesBodyExample = JSON.stringify({
+    trades: [
+      {
+        ticker: 'AAPL',
+        trade_date: '2024-01-15',
+        model: 'default',
+        source: 'consensus',
+        position: 'long',
+        entry_price: 185.5,
+        exit_price: null,
+        quantity: 100,
+        notes: 'Entry based on consensus signal',
+      },
+    ],
+  }, null, 2);
 
   // Dynamically measure navigation height
   useEffect(() => {
@@ -1056,6 +1381,35 @@ export default function RequestsPage() {
               placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
             },
             {
+              key: 'table',
+              label: 'Table (comma-separated)',
+              type: 'text',
+              control: 'input',
+              required: false,
+              placeholder: 'txn_events,txn_trades',
+              description: '처리할 테이블 선택: txn_events, txn_trades. 미지정 시 둘 다 처리',
+            },
+            {
+              key: 'startPoint',
+              label: 'Start Point (ticker)',
+              type: 'text',
+              control: 'input',
+              required: false,
+              placeholder: 'MSFT',
+              description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: MSFT부터 처리',
+            },
+            {
+              key: 'batch_size',
+              label: 'Batch Size (1-2,000)',
+              type: 'number',
+              control: 'input',
+              required: false,
+              placeholder: '500',
+              min: 1,
+              max: 2000,
+              description: 'BATCH PROCESSING: Processes unique tickers in chunks. Example: 500 = process 500 tickers per batch. Maximum: 2,000 (Supabase free tier: 1GB RAM).',
+            },
+            {
               key: 'max_workers',
               type: 'number',
               control: 'input',
@@ -1086,26 +1440,14 @@ export default function RequestsPage() {
           method="POST"
           path="/trades"
           queryFields={[{ ...TIMEOUT_FIELD }]}
+          bodyExample={tradesBodyExample}
+          bodyExampleCsv={tradesBodyExampleCsv}
           bodyFields={[
             {
               key: '__body__',
               label: 'Request Body (JSON)',
               type: 'json',
-              default: JSON.stringify({
-                "trades": [
-                  {
-                    "ticker": "AAPL",
-                    "trade_date": "2024-01-15",
-                    "model": "default",
-                    "source": "consensus",
-                    "position": "long",
-                    "entry_price": 185.50,
-                    "exit_price": null,
-                    "quantity": 100,
-                    "notes": "Entry based on consensus signal"
-                  }
-                ]
-              }, null, 2),
+              default: '',
             }
           ]}
           onRequestStart={handleRequestStart}

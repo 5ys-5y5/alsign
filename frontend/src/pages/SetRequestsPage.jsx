@@ -608,7 +608,7 @@ const ENDPOINT_FLOWS = {
   generatePriceTrends: {
     id: 'generatePriceTrends',
     title: 'POST /generatePriceTrends',
-    description: 'txn_price_trend 테이블에 ±14 trading days OHLC 가격 추세 데이터 생성 (backfillEventsTable과 독립 실행). txn_events 이벤트 + txn_trades 거래 모두 처리',
+    description: 'txn_price_trend 테이블에 ±14 trading days OHLC 가격 추세 데이터 생성 (backfillEventsTable과 독립 실행). txn_events/txn_trades 소스에 따라 type=event|trade로 저장 (table 파라미터로 선택 가능)',
     performanceNote: '100개 레코드 (10개 티커) 처리 시: ~10 API calls (OHLC만), ~5초 소요. Trading days는 전역 캐싱으로 DB 쿼리 1회만. txn_trades에서 txn_events에 없는 거래도 자동 처리',
     parameters: [
       {
@@ -635,6 +635,12 @@ const ENDPOINT_FLOWS = {
         type: 'string',
         required: false,
         description: '티커 필터 (쉼표 구분, 예: "AAPL,MSFT"). 미지정 시 전체 티커'
+      },
+      {
+        name: 'table',
+        type: 'string',
+        required: false,
+        description: '소스 테이블 필터 (쉼표 구분: "txn_events,txn_trades"). 미지정 시 둘 다 처리'
       },
       {
         name: 'max_workers',
@@ -671,6 +677,11 @@ const ENDPOINT_FLOWS = {
         title: '여러 티커 + 날짜 필터링',
         url: 'POST /generatePriceTrends?tickers=AAPL,MSFT&from=2024-01-01',
         description: '2024년 이후 AAPL/MSFT 이벤트만 계산'
+      },
+      {
+        title: '거래 테이블만 생성',
+        url: 'POST /generatePriceTrends?table=txn_trades',
+        description: 'txn_trades의 거래만 price trend 계산 (type=trade)'
       },
     ],
     phases: [
@@ -762,6 +773,7 @@ const ENDPOINT_FLOWS = {
       }
     ],
     outputs: [
+      'type (event|trade)',
       'd_neg_14 ~ d_neg_1 (14 JSONB columns)',
       'd_0 (JSONB column)',
       'd_pos_1 ~ d_pos_14 (14 JSONB columns)',

@@ -2,6 +2,7 @@
 
 import uuid
 import logging
+from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from ..models.request_models import SetEventsTableQueryParams, BackfillEventsTableQueryParams
@@ -12,6 +13,12 @@ from ..utils.logging_utils import log_error
 logger = logging.getLogger("alsign")
 
 router = APIRouter(prefix="", tags=["Event Processing"])
+
+
+def normalize_date_range(from_date, to_date):
+    if from_date is None and to_date is not None:
+        return date(2000, 1, 1), to_date
+    return from_date, to_date
 
 
 @router.post("/test-post")
@@ -117,17 +124,19 @@ async def backfill_events_table(
     # Parse metrics list (I-41)
     metrics_list = params.get_metrics_list()
 
+    normalized_from, normalized_to = normalize_date_range(params.from_date, params.to_date)
+
     logger.info(
         "[POST /backfillEventsTable] "
-        f"reqId={req_id}, overwrite={params.overwrite}, from={params.from_date}, "
-        f"to={params.to_date}, startPoint={start_point}"
+        f"reqId={req_id}, overwrite={params.overwrite}, from={normalized_from}, "
+        f"to={normalized_to}, startPoint={start_point}"
     )
 
     try:
         result = await valuation_service.calculate_valuations(
             overwrite=params.overwrite,
-            from_date=params.from_date,
-            to_date=params.to_date,
+            from_date=normalized_from,
+            to_date=normalized_to,
             tickers=ticker_list,
             start_point=start_point,
             metrics_list=metrics_list,

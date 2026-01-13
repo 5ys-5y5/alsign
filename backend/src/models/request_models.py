@@ -276,6 +276,10 @@ class BackfillEventsTableQueryParams(BaseModel):
         default=None,
         description="Comma-separated list of ticker symbols to process (e.g., 'AAPL,MSFT,GOOGL'). If not specified, processes all tickers."
     )
+    table: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of source tables for price trends. Allowed: txn_events, txn_trades. If not specified, both tables are processed."
+    )
     start_point: Optional[str] = Field(
         default=None,
         alias="startPoint",
@@ -319,6 +323,19 @@ class BackfillEventsTableQueryParams(BaseModel):
 
         return ticker_list if ticker_list else None
 
+    def get_table_list(self) -> Optional[List[str]]:
+        """
+        Parse table parameter into a list of source table names.
+
+        Returns:
+            List of table names (lowercase), or None if not provided
+        """
+        if self.table is None:
+            return None
+
+        tables = [t.strip().lower() for t in self.table.split(',') if t.strip()]
+        return tables if tables else None
+
     def get_start_point(self) -> Optional[str]:
         """
         Normalize startPoint parameter into a ticker symbol.
@@ -331,6 +348,21 @@ class BackfillEventsTableQueryParams(BaseModel):
 
         start_point = self.start_point.strip().upper()
         return start_point if start_point else None
+
+    @validator('table')
+    def validate_price_trend_table(cls, v):
+        """Validate table parameter for price trend source tables."""
+        if v is None:
+            return v
+
+        allowed = {'txn_events', 'txn_trades'}
+        tables = [t.strip().lower() for t in v.split(',') if t.strip()]
+
+        for table in tables:
+            if table not in allowed:
+                raise ValueError(f"table must be one of: {', '.join(sorted(allowed))}")
+
+        return ",".join(tables)
 
     @validator('batch_size')
     def validate_batch_size(cls, v):

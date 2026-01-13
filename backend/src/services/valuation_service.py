@@ -5,7 +5,7 @@ import time
 import json
 import asyncio
 from typing import Dict, Any, List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import defaultdict
 
 from ..database.connection import db_pool
@@ -1910,6 +1910,9 @@ async def generate_price_trends(
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
     tickers: Optional[List[str]] = None,
+    tables: Optional[List[str]] = None,
+    start_point: Optional[str] = None,
+    batch_size: Optional[int] = None,
     max_workers: int = 20
 ) -> Dict[str, Any]:
     """
@@ -1924,6 +1927,9 @@ async def generate_price_trends(
         from_date: Optional start date for filtering by event_date/trade_date
         to_date: Optional end date for filtering by event_date/trade_date
         tickers: Optional list of ticker symbols to filter. If None, processes all tickers.
+        tables: Optional list of source tables to process ("txn_events", "txn_trades").
+        start_point: Optional start ticker (alphabetical) to resume processing from this point.
+        batch_size: Optional batch size for processing tickers. If None, processes all tickers in one batch.
         max_workers: Maximum number of concurrent workers (1-100). Lower values reduce DB CPU load.
                      Default: 20. Recommended: 10-30 depending on DB capacity.
 
@@ -1968,21 +1974,33 @@ async def generate_price_trends(
             'errorCode': 'POLICY_NOT_FOUND'
         }
 
+    tables_set = {"txn_events", "txn_trades"}
+    if tables:
+        tables_set = {table.lower() for table in tables}
+
     # Load events to process
-    events = await metrics.select_events_for_valuation(
-        pool,
-        from_date=from_date,
-        to_date=to_date,
-        tickers=tickers
-    )
+    events = []
+    if "txn_events" in tables_set:
+        events = await metrics.select_events_for_price_trends(
+            pool,
+            from_date=from_date,
+            to_date=to_date,
+            tickers=tickers
+        )
+        for event in events:
+            event['record_type'] = 'event'
 
     # Load trades from txn_trades that are NOT in txn_events
-    trades = await metrics.select_trades_for_price_trends(
-        pool,
-        from_date=from_date,
-        to_date=to_date,
-        tickers=tickers
-    )
+    trades = []
+    if "txn_trades" in tables_set:
+        trades = await metrics.select_trades_for_price_trends(
+            pool,
+            from_date=from_date,
+            to_date=to_date,
+            tickers=tickers
+        )
+        for trade in trades:
+            trade['record_type'] = 'trade'
 
     # Merge events and trades for processing
     all_records = events + trades
@@ -2008,57 +2026,6 @@ async def generate_price_trends(
         if ticker not in events_by_ticker:
             events_by_ticker[ticker] = []
         events_by_ticker[ticker].append(record)
-
-    # Calculate OHLC fetch ranges per ticker
-    # Guideline line 986-987: fromDate = min_event_date + countStart, toDate = max_event_date + countEnd
-    from datetime import timedelta
-    ohlc_ranges = {}
-    for ticker, ticker_events in events_by_ticker.items():
-        event_dates = [e['event_date'].date() if hasattr(e['event_date'], 'date') else e['event_date'] for e in ticker_events]
-        min_date = min(event_dates)
-        max_date = max(event_dates)
-
-        # Apply priceEodOHLC_dateRange policy (countStart/countEnd are calendar day offsets)
-        # I-43: Add extra buffer to ensure we have data for all dayOffset values (-14 to +14 trading days)
-        # Trading days -14/+14 require approximately -25/+25 calendar days (accounting for weekends + holidays)
-        extra_buffer_days = 15  # Additional buffer on each side
-        fetch_start = min_date + timedelta(days=ohlc_count_start - extra_buffer_days)
-        fetch_end = max_date + timedelta(days=ohlc_count_end + extra_buffer_days)
-
-        ohlc_ranges[ticker] = (fetch_start, fetch_end)
-
-    # Fetch OHLC data for all tickers
-    ohlc_cache = {}
-    async with FMPAPIClient() as fmp_client:
-        for ticker, (fetch_start, fetch_end) in ohlc_ranges.items():
-            logger.info(
-                f"Fetching OHLC for {ticker} from {fetch_start} to {fetch_end}",
-                extra={
-                    'endpoint': 'POST /generatePriceTrends',
-                    'phase': 'fetch_ohlc',
-                    'elapsed_ms': int((time.time() - start_time) * 1000),
-                    'counters': {},
-                    'progress': {},
-                    'rate': {},
-                    'batch': {},
-                    'warn': []
-                }
-            )
-
-            ohlc_data = await fmp_client.get_historical_price_eod(
-                ticker,
-                fetch_start.isoformat(),
-                fetch_end.isoformat()
-            )
-
-            # Index by date for fast lookup
-            ohlc_by_date = {}
-            for record in ohlc_data:
-                record_date = record.get('date')
-                if record_date:
-                    ohlc_by_date[record_date] = record
-
-            ohlc_cache[ticker] = ohlc_by_date
 
     # ========================================
     # OPTIMIZATION: Pre-cache trading days for entire date range
@@ -2089,20 +2056,26 @@ async def generate_price_trends(
     # ========================================
     # Deduplicate events by (ticker, event_date) since txn_price_trend is indexed by this combination
     unique_ticker_dates = {}
-    for event in events:
-        ticker = event['ticker']
-        event_date = event['event_date'].date() if hasattr(event['event_date'], 'date') else event['event_date']
-        key = (ticker, event_date)
-        if key not in unique_ticker_dates:
-            unique_ticker_dates[key] = event
+    for record in all_records:
+        ticker = record['ticker']
+        event_date = record['event_date'].date() if hasattr(record['event_date'], 'date') else record['event_date']
+        if ticker not in unique_ticker_dates:
+            unique_ticker_dates[ticker] = {}
+        if event_date not in unique_ticker_dates[ticker]:
+            unique_ticker_dates[ticker][event_date] = record
 
     logger.info(
-        f"Deduplicated {len(all_records)} records into {len(unique_ticker_dates)} unique (ticker, event_date) pairs",
+        f"Deduplicated {len(all_records)} records into {sum(len(dates) for dates in unique_ticker_dates.values())} unique (ticker, event_date) pairs",
         extra={
             'endpoint': 'POST /generatePriceTrends',
             'phase': 'deduplicate_events',
             'elapsed_ms': int((time.time() - start_time) * 1000),
-            'counters': {'records': len(all_records), 'events': len(events), 'trades': len(trades), 'unique_pairs': len(unique_ticker_dates)},
+            'counters': {
+                'records': len(all_records),
+                'events': len(events),
+                'trades': len(trades),
+                'unique_pairs': sum(len(dates) for dates in unique_ticker_dates.values())
+            },
             'progress': {},
             'rate': {},
             'batch': {},
@@ -2110,16 +2083,47 @@ async def generate_price_trends(
         }
     )
 
+    tickers_to_process = sorted(unique_ticker_dates.keys())
+    if start_point:
+        tickers_to_process = [ticker for ticker in tickers_to_process if ticker >= start_point]
+
+    if not tickers_to_process:
+        logger.info(
+            "No tickers to process after applying startPoint",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'no_tickers',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        return {
+            'success': 0,
+            'fail': 0
+        }
+
     # ========================================
     # Helper function for individual price trend upserts
     # ========================================
-    async def _upsert_single_price_trend(ticker: str, event_date: date, jsonb_columns: dict, wts_long: int, wts_short: int):
+    async def _upsert_single_price_trend(
+        ticker: str,
+        event_date: date,
+        record_type: str,
+        jsonb_columns: dict,
+        wts_long: int,
+        wts_short: int
+    ):
         """
         Upsert a single price trend record to txn_price_trend table.
 
         Args:
             ticker: Stock ticker symbol
             event_date: Event date
+            record_type: Source record type ("event" or "trade")
             jsonb_columns: Dict with d_neg14 through d_pos14 JSONB data
             wts_long: Long position winning time shift
             wts_short: Short position winning time shift
@@ -2138,7 +2142,7 @@ async def generate_price_trends(
             await conn.execute(
                 """
                 INSERT INTO txn_price_trend (
-                    ticker, event_date,
+                    ticker, event_date, type,
                     d_neg14, d_neg13, d_neg12, d_neg11, d_neg10,
                     d_neg9, d_neg8, d_neg7, d_neg6, d_neg5,
                     d_neg4, d_neg3, d_neg2, d_neg1,
@@ -2148,18 +2152,19 @@ async def generate_price_trends(
                     d_pos11, d_pos12, d_pos13, d_pos14,
                     wts_long, wts_short
                 ) VALUES (
-                    $1, $2,
-                    $3::jsonb, $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb,
-                    $8::jsonb, $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb,
-                    $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb,
-                    $17::jsonb,
-                    $18::jsonb, $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb,
-                    $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27::jsonb,
-                    $28::jsonb, $29::jsonb, $30::jsonb, $31::jsonb,
-                    $32, $33
+                    $1, $2, $3,
+                    $4::jsonb, $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb,
+                    $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb,
+                    $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb,
+                    $18::jsonb,
+                    $19::jsonb, $20::jsonb, $21::jsonb, $22::jsonb, $23::jsonb,
+                    $24::jsonb, $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb,
+                    $29::jsonb, $30::jsonb, $31::jsonb, $32::jsonb,
+                    $33, $34
                 )
                 ON CONFLICT (ticker, event_date) DO UPDATE
                 SET
+                    type = EXCLUDED.type,
                     d_neg14 = EXCLUDED.d_neg14,
                     d_neg13 = EXCLUDED.d_neg13,
                     d_neg12 = EXCLUDED.d_neg12,
@@ -2195,6 +2200,7 @@ async def generate_price_trends(
                 """,
                 ticker,
                 event_date,
+                record_type,
                 # 29 day offset JSONB columns
                 jsonb_or_null(jsonb_columns.get('d_neg14')),
                 jsonb_or_null(jsonb_columns.get('d_neg13')),
@@ -2235,214 +2241,313 @@ async def generate_price_trends(
     # ========================================
     success_count = 0
     fail_count = 0
+    processed_pairs = 0
+    progress_lock = asyncio.Lock()
 
-    for idx, ((ticker, event_date), event) in enumerate(unique_ticker_dates.items()):
-        try:
-            # OPTIMIZED: Use cached trading days (NO DB CALL per event!)
-            dayoffset_dates = calculate_dayOffset_dates_cached(
-                event_date,
-                count_start,
-                count_end,
-                trading_days_set
-            )
+    total_unique_pairs = sum(len(dates) for dates in unique_ticker_dates.values() if dates)
+    if total_unique_pairs == 0:
+        logger.info(
+            "No unique (ticker, event_date) pairs to process",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'no_pairs',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        return {
+            'success': 0,
+            'fail': 0
+        }
 
+    def _normalize_historical_prices(raw_prices: Any) -> List[Dict[str, Any]]:
+        if raw_prices is None:
+            return []
+        if isinstance(raw_prices, list):
+            return raw_prices
+        if isinstance(raw_prices, dict):
+            historical = raw_prices.get('historical')
+            if isinstance(historical, list):
+                return historical
+        return []
 
-            # Build dayOffset OHLC map with target_date
-            dayoffset_ohlc = {}
-            dayoffset_target_dates = {}  # Store target dates separately
-
-            for dayoffset, target_date in dayoffset_dates:
-                date_str = target_date.isoformat()
-                dayoffset_target_dates[dayoffset] = date_str
-                ohlc = ohlc_cache.get(ticker, {}).get(date_str)
-
-                if ohlc:
-                    dayoffset_ohlc[dayoffset] = {
-                        'open': float(ohlc.get('open')) if ohlc.get('open') else None,
-                        'high': float(ohlc.get('high')) if ohlc.get('high') else None,
-                        'low': float(ohlc.get('low')) if ohlc.get('low') else None,
-                        'close': float(ohlc.get('close')) if ohlc.get('close') else None
-                    }
-                else:
-                    # Missing data - will fill later
-                    dayoffset_ohlc[dayoffset] = None
-
-            # Fill missing data with forward/backward fill
-            # For negative offsets: use previous trading day (backward fill)
-            # For positive offsets: use next trading day (forward fill)
-            for offset in range(-14, 15):
-                if dayoffset_ohlc.get(offset) is None:
-                    if offset < 0:
-                        # Backward fill: use earlier trading day
-                        for prev_offset in range(offset - 1, -15, -1):
-                            if dayoffset_ohlc.get(prev_offset) is not None:
-                                dayoffset_ohlc[offset] = dayoffset_ohlc[prev_offset].copy()
-                                break
-                    else:
-                        # Forward fill: use later trading day
-                        for next_offset in range(offset + 1, 15):
-                            if dayoffset_ohlc.get(next_offset) is not None:
-                                dayoffset_ohlc[offset] = dayoffset_ohlc[next_offset].copy()
-                                break
-
-            # Get D0 close as base_close for performance calculation
-            # If D0 close is None, set base_close to None but continue (record with null values)
-            d0_data = dayoffset_ohlc.get(0)
-            base_close = d0_data['close'] if d0_data and d0_data.get('close') is not None else None
-
-
-            if base_close is None:
-                logger.warning(f"No D0 close for {ticker} on {event_date}, recording with null values")
-                # Continue processing but all will be null
-
-            # Build JSONB columns for each dayOffset (-14 to 14)
-            jsonb_columns = {}
-            day_performances = {}  # For WTS calculation
-
-            for offset in range(-14, 15):  # -14 to 14 inclusive
-                ohlc = dayoffset_ohlc.get(offset)
-                target_date = dayoffset_target_dates.get(offset)
-
-                if ohlc and ohlc.get('close') is not None and base_close is not None:
-                    # Has data and base_close available
-                    close_price = ohlc['close']
-                    performance = (close_price - base_close) / base_close if base_close != 0 else 0
-                    day_performances[offset] = performance
-
-                    jsonb_data = {
-                        'targetDate': target_date,
-                        'price_trend': {
-                            'low': ohlc['low'],
-                            'high': ohlc['high'],
-                            'open': ohlc['open'],
-                            'close': ohlc['close']
-                        },
-                        'dayOffset0': {
-                            'close': base_close
-                        },
-                        'performance': {
-                            'close': performance
-                        }
-                    }
-                elif ohlc and ohlc.get('close') is not None and base_close is None:
-                    # Has data but no base_close - record price without performance
-                    day_performances[offset] = None
-
-                    jsonb_data = {
-                        'targetDate': target_date,
-                        'price_trend': {
-                            'low': ohlc['low'],
-                            'high': ohlc['high'],
-                            'open': ohlc['open'],
-                            'close': ohlc['close']
-                        },
-                        'dayOffset0': {
-                            'close': None
-                        },
-                        'performance': {
-                            'close': None
-                        }
-                    }
-                else:
-                    # No data - record with targetDate only
-                    jsonb_data = {
-                        'targetDate': target_date,
-                        'price_trend': None,
-                        'dayOffset0': {
-                            'close': base_close
-                        },
-                        'performance': {
-                            'close': None
-                        }
-                    } if target_date else None
-                    day_performances[offset] = None
-
-                # Map offset to column name
-                if offset < 0:
-                    col_name = f'd_neg{abs(offset)}'
-                elif offset == 0:
-                    col_name = 'd_0'
-                else:
-                    col_name = f'd_pos{offset}'
-
-                # Convert to JSON string for UNNEST (asyncpg requires str for array parameters)
-                jsonb_columns[col_name] = json.dumps(jsonb_data) if jsonb_data else None
-
-            # Calculate WTS (Which Trading day to Sell)
-            # wts_long: best dayOffset for long position (max performance)
-            # wts_short: best dayOffset for short position (max negative performance = min performance)
-            wts_long = None
-            wts_short = None
-            max_performance = None
-            min_performance = None
-
-            for offset, perf in day_performances.items():
-                if perf is not None:
-                    # Long position: maximize performance
-                    if max_performance is None or perf > max_performance:
-                        max_performance = perf
-                        wts_long = offset
-
-                    # Short position: maximize negative performance (minimize performance)
-                    if min_performance is None or perf < min_performance:
-                        min_performance = perf
-                        wts_short = offset
-
-
-            # Immediately save to database (incremental save)
+    def _build_ohlc_cache_for_ticker(
+        historical_prices: List[Dict[str, Any]],
+        fetch_start: date,
+        fetch_end: date
+    ) -> Dict[str, Dict[str, Any]]:
+        ohlc_by_date = {}
+        for record in historical_prices:
+            record_date = record.get('date')
+            if not record_date:
+                continue
             try:
-                await _upsert_single_price_trend(ticker, event_date, jsonb_columns, wts_long, wts_short)
-                success_count += 1
-                logger.debug(
-                    f"Saved price trend: {ticker} @ {event_date}",
-                    extra={
-                        'endpoint': 'POST /generatePriceTrends',
-                        'phase': 'save_price_trend',
-                        'counters': {'success': 1}
-                    }
+                record_date_obj = datetime.fromisoformat(record_date.replace('Z', '+00:00')).date()
+            except ValueError:
+                continue
+            if fetch_start <= record_date_obj <= fetch_end:
+                ohlc_by_date[record_date_obj.isoformat()] = record
+        return ohlc_by_date
+
+    async def _process_ticker(ticker: str, ohlc_by_date: Dict[str, Dict[str, Any]]):
+        nonlocal success_count, fail_count, processed_pairs
+
+        ticker_dates = unique_ticker_dates.get(ticker, {})
+        for event_date, record in ticker_dates.items():
+            record_type = record.get('record_type', 'event')
+            try:
+                # OPTIMIZED: Use cached trading days (NO DB CALL per event!)
+                dayoffset_dates = calculate_dayOffset_dates_cached(
+                    event_date,
+                    count_start,
+                    count_end,
+                    trading_days_set
                 )
-            except Exception as db_error:
-                fail_count += 1
-                logger.error(
-                    f"Failed to save price trend: {ticker} @ {event_date}: {db_error}",
-                    exc_info=True
+
+                # Build dayOffset OHLC map with target_date
+                dayoffset_ohlc = {}
+                dayoffset_target_dates = {}
+
+                for dayoffset, target_date in dayoffset_dates:
+                    date_str = target_date.isoformat()
+                    dayoffset_target_dates[dayoffset] = date_str
+                    ohlc = ohlc_by_date.get(date_str)
+
+                    if ohlc:
+                        dayoffset_ohlc[dayoffset] = {
+                            'open': float(ohlc.get('open')) if ohlc.get('open') else None,
+                            'high': float(ohlc.get('high')) if ohlc.get('high') else None,
+                            'low': float(ohlc.get('low')) if ohlc.get('low') else None,
+                            'close': float(ohlc.get('close')) if ohlc.get('close') else None
+                        }
+                    else:
+                        dayoffset_ohlc[dayoffset] = None
+
+                # Fill missing data with forward/backward fill
+                for offset in range(-14, 15):
+                    if dayoffset_ohlc.get(offset) is None:
+                        if offset < 0:
+                            for prev_offset in range(offset - 1, -15, -1):
+                                if dayoffset_ohlc.get(prev_offset) is not None:
+                                    dayoffset_ohlc[offset] = dayoffset_ohlc[prev_offset].copy()
+                                    break
+                        else:
+                            for next_offset in range(offset + 1, 15):
+                                if dayoffset_ohlc.get(next_offset) is not None:
+                                    dayoffset_ohlc[offset] = dayoffset_ohlc[next_offset].copy()
+                                    break
+
+                d0_data = dayoffset_ohlc.get(0)
+                base_close = d0_data['close'] if d0_data and d0_data.get('close') is not None else None
+
+                if base_close is None:
+                    logger.warning(f"No D0 close for {ticker} on {event_date}, recording with null values")
+
+                jsonb_columns = {}
+                day_performances = {}
+
+                for offset in range(-14, 15):
+                    ohlc = dayoffset_ohlc.get(offset)
+                    target_date = dayoffset_target_dates.get(offset)
+
+                    if ohlc and ohlc.get('close') is not None and base_close is not None:
+                        close_price = ohlc['close']
+                        performance = (close_price - base_close) / base_close if base_close != 0 else 0
+                        day_performances[offset] = performance
+
+                        jsonb_data = {
+                            'targetDate': target_date,
+                            'price_trend': {
+                                'low': ohlc['low'],
+                                'high': ohlc['high'],
+                                'open': ohlc['open'],
+                                'close': ohlc['close']
+                            },
+                            'dayOffset0': {
+                                'close': base_close
+                            },
+                            'performance': {
+                                'close': performance
+                            }
+                        }
+                    elif ohlc and ohlc.get('close') is not None and base_close is None:
+                        day_performances[offset] = None
+                        jsonb_data = {
+                            'targetDate': target_date,
+                            'price_trend': {
+                                'low': ohlc['low'],
+                                'high': ohlc['high'],
+                                'open': ohlc['open'],
+                                'close': ohlc['close']
+                            },
+                            'dayOffset0': {
+                                'close': None
+                            },
+                            'performance': {
+                                'close': None
+                            }
+                        }
+                    else:
+                        jsonb_data = {
+                            'targetDate': target_date,
+                            'price_trend': None,
+                            'dayOffset0': {
+                                'close': base_close
+                            },
+                            'performance': {
+                                'close': None
+                            }
+                        } if target_date else None
+                        day_performances[offset] = None
+
+                    if offset < 0:
+                        col_name = f'd_neg{abs(offset)}'
+                    elif offset == 0:
+                        col_name = 'd_0'
+                    else:
+                        col_name = f'd_pos{offset}'
+
+                    jsonb_columns[col_name] = json.dumps(jsonb_data) if jsonb_data else None
+
+                wts_long = None
+                wts_short = None
+                max_performance = None
+                min_performance = None
+
+                for offset, perf in day_performances.items():
+                    if perf is not None:
+                        if max_performance is None or perf > max_performance:
+                            max_performance = perf
+                            wts_long = offset
+                        if min_performance is None or perf < min_performance:
+                            min_performance = perf
+                            wts_short = offset
+
+                await _upsert_single_price_trend(
+                    ticker,
+                    event_date,
+                    record_type,
+                    jsonb_columns,
+                    wts_long,
+                    wts_short
                 )
-                # Continue processing other records
+                ticker_success = True
+            except Exception as e:
+                ticker_success = False
+                logger.error(f"Failed to generate price trend for {ticker} {event_date}: {e}", exc_info=True)
 
-        except Exception as e:
-            logger.error(f"Failed to generate price trend for {ticker} {event_date}: {e}")
-            fail_count += 1
-            continue
+            async with progress_lock:
+                processed_pairs += 1
+                if ticker_success:
+                    success_count += 1
+                else:
+                    fail_count += 1
 
-        # Log progress every 50 pairs
-        if (idx + 1) % 50 == 0 or (idx + 1) == len(unique_ticker_dates):
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            eta_ms = calculate_eta(len(unique_ticker_dates), idx + 1, elapsed_ms)
-            eta = format_eta_ms(eta_ms)
+                if processed_pairs % 50 == 0 or processed_pairs == total_unique_pairs:
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    eta_ms = calculate_eta(total_unique_pairs, processed_pairs, elapsed_ms)
+                    eta = format_eta_ms(eta_ms)
 
-            logger.info(
-                f"Processed {idx + 1}/{len(unique_ticker_dates)} unique pairs",
-                extra={
-                    'endpoint': 'POST /generatePriceTrends',
-                    'phase': 'process_price_trends',
-                    'elapsed_ms': elapsed_ms,
-                    'counters': {
-                        'processed': idx + 1,
-                        'total': len(unique_ticker_dates),
-                        'success': success_count,
-                        'fail': fail_count
-                    },
-                    'progress': {
-                        'done': idx + 1,
-                        'total': len(unique_ticker_dates),
-                        'pct': round((idx + 1) / len(unique_ticker_dates) * 100, 1)
-                    },
-                    'eta': eta,
-                    'rate': {},
-                    'batch': {},
-                    'warn': []
-                }
+                    logger.info(
+                        f"Processed {processed_pairs}/{total_unique_pairs} unique pairs",
+                        extra={
+                            'endpoint': 'POST /generatePriceTrends',
+                            'phase': 'process_price_trends',
+                            'elapsed_ms': elapsed_ms,
+                            'counters': {
+                                'processed': processed_pairs,
+                                'total': total_unique_pairs,
+                                'success': success_count,
+                                'fail': fail_count
+                            },
+                            'progress': {
+                                'done': processed_pairs,
+                                'total': total_unique_pairs,
+                                'pct': round((processed_pairs / total_unique_pairs) * 100, 1)
+                            },
+                            'eta': eta,
+                            'rate': {},
+                            'batch': {},
+                            'warn': []
+                        }
+                    )
+
+    if batch_size:
+        ticker_batches = [
+            tickers_to_process[i:i + batch_size]
+            for i in range(0, len(tickers_to_process), batch_size)
+        ]
+    else:
+        ticker_batches = [tickers_to_process]
+
+    batch_number = 0
+    for ticker_batch in ticker_batches:
+        batch_number += 1
+        tickers_preview = ", ".join(ticker_batch[:10])
+        if len(ticker_batch) > 10:
+            tickers_preview = f"{tickers_preview}, ..."
+
+        logger.info(
+            f"[Batch {batch_number}] Ticker batch: {len(ticker_batch)} tickers ({tickers_preview})",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'batch_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {'size': len(ticker_batch), 'mode': 'ticker'},
+                'warn': []
+            }
+        )
+
+        batch_cache = await get_batch_quantitative_data_from_db(
+            pool,
+            ticker_batch,
+            ['fmp-historical-price-eod-full']
+        )
+
+        ticker_ohlc_cache = {}
+        for ticker in ticker_batch:
+            ticker_events = unique_ticker_dates.get(ticker, {})
+            event_dates = list(ticker_events.keys())
+            if not event_dates:
+                ticker_ohlc_cache[ticker] = {}
+                continue
+
+            min_date = min(event_dates)
+            max_date = max(event_dates)
+
+            extra_buffer_days = 15
+            fetch_start = min_date + timedelta(days=ohlc_count_start - extra_buffer_days)
+            fetch_end = max_date + timedelta(days=ohlc_count_end + extra_buffer_days)
+
+            raw_prices = batch_cache.get(ticker, {}).get('fmp-historical-price-eod-full')
+            historical_prices = _normalize_historical_prices(raw_prices)
+
+            if not historical_prices:
+                logger.warning(f"[DB-Cache] Missing historical_price for {ticker} in config_lv3_quantitatives")
+                ticker_ohlc_cache[ticker] = {}
+                continue
+
+            ticker_ohlc_cache[ticker] = _build_ohlc_cache_for_ticker(
+                historical_prices,
+                fetch_start,
+                fetch_end
             )
+
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def _semaphore_wrapper(ticker: str):
+            async with semaphore:
+                await _process_ticker(ticker, ticker_ohlc_cache.get(ticker, {}))
+
+        tasks = [_semaphore_wrapper(ticker) for ticker in ticker_batch]
+        await asyncio.gather(*tasks)
 
     # All records saved incrementally - no batch operation needed
     total_elapsed_ms = int((time.time() - start_time) * 1000)

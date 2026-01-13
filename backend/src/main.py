@@ -82,22 +82,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add logging middleware
-# TEMPORARILY DISABLED FOR DEBUGGING
-# app.add_middleware(LoggingMiddleware)
-
-# Add request logging for debugging
-@app.middleware("http")
-async def log_requests(request, call_next):
-    """Simple request logger for debugging."""
-    logger.info(f">>>>>> REQUEST: {request.method} {request.url.path}")
-    try:
-        response = await call_next(request)
-        logger.info(f"<<<<<< RESPONSE: {request.method} {request.url.path} - {response.status_code}")
-        return response
-    except Exception as e:
-        logger.error(f"<<<<<< ERROR: {request.method} {request.url.path} - {e}")
-        raise
+# Add logging middleware (injects detailedLogs into JSON responses)
+app.add_middleware(LoggingMiddleware)
 
 # Register exception handlers
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
