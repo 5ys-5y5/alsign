@@ -1913,7 +1913,8 @@ async def generate_price_trends(
     tables: Optional[List[str]] = None,
     start_point: Optional[str] = None,
     batch_size: Optional[int] = None,
-    max_workers: int = 20
+    max_workers: int = 20,
+    overwrite: bool = False
 ) -> Dict[str, Any]:
     """
     Generate price_trend arrays for events in txn_events and trades in txn_trades.
@@ -1937,6 +1938,27 @@ async def generate_price_trends(
         Dict with summary and statistics including events and trades counts
     """
     start_time = time.time()
+    logger.info(
+        "[temp.debug] enter generate_price_trends",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'temp.debug.entry',
+            'elapsed_ms': 0,
+            'counters': {
+                'from_date': str(from_date) if from_date else None,
+                'to_date': str(to_date) if to_date else None,
+                'tickers': len(tickers) if tickers else 0,
+                'tables': len(tables) if tables else 0,
+                'batch_size': batch_size,
+                'max_workers': max_workers,
+                'overwrite': overwrite
+            },
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
 
     pool = await db_pool.get_pool()
 
@@ -1957,6 +1979,19 @@ async def generate_price_trends(
 
     try:
         # Load fillPriceTrend_dateRange policy (for price trend dayOffset calculations)
+        logger.info(
+            "[temp.debug] loading policies",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.policy_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
         range_policy = await policies.get_price_trend_range_policy(pool)
         count_start = range_policy['countStart']
         count_end = range_policy['countEnd']
@@ -1965,6 +2000,24 @@ async def generate_price_trends(
         ohlc_policy = await policies.get_ohlc_date_range_policy(pool)
         ohlc_count_start = ohlc_policy['countStart']
         ohlc_count_end = ohlc_policy['countEnd']
+        logger.info(
+            "[temp.debug] policies loaded",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.policy_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {
+                    'count_start': count_start,
+                    'count_end': count_end,
+                    'ohlc_count_start': ohlc_count_start,
+                    'ohlc_count_end': ohlc_count_end
+                },
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
     except ValueError as e:
         logger.error(f"Failed to load price trend policy: {e}")
         return {
@@ -1981,6 +2034,19 @@ async def generate_price_trends(
     # Load events to process
     events = []
     if "txn_events" in tables_set:
+        logger.info(
+            "[temp.debug] selecting events",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.select_events_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
         events = await metrics.select_events_for_price_trends(
             pool,
             from_date=from_date,
@@ -1989,10 +2055,36 @@ async def generate_price_trends(
         )
         for event in events:
             event['record_type'] = 'event'
+        logger.info(
+            "[temp.debug] selected events",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.select_events_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'events': len(events)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
 
     # Load trades from txn_trades that are NOT in txn_events
     trades = []
     if "txn_trades" in tables_set:
+        logger.info(
+            "[temp.debug] selecting trades",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.select_trades_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
         trades = await metrics.select_trades_for_price_trends(
             pool,
             from_date=from_date,
@@ -2001,6 +2093,19 @@ async def generate_price_trends(
         )
         for trade in trades:
             trade['record_type'] = 'trade'
+        logger.info(
+            "[temp.debug] selected trades",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.select_trades_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'trades': len(trades)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
 
     # Merge events and trades for processing
     all_records = events + trades
@@ -2019,42 +2124,34 @@ async def generate_price_trends(
         }
     )
 
-    # Group all records (events + trades) by ticker for efficient OHLC fetching
-    events_by_ticker = {}
-    for record in all_records:
-        ticker = record['ticker']
-        if ticker not in events_by_ticker:
-            events_by_ticker[ticker] = []
-        events_by_ticker[ticker].append(record)
+    def _normalize_historical_prices(raw_prices: Any) -> List[Dict[str, Any]]:
+        if raw_prices is None:
+            return []
+        if isinstance(raw_prices, list):
+            return raw_prices
+        if isinstance(raw_prices, dict):
+            historical = raw_prices.get('historical')
+            if isinstance(historical, list):
+                return historical
+        return []
 
-    # ========================================
-    # OPTIMIZATION: Pre-cache trading days for entire date range
-    # ========================================
-    # Calculate the full range of dates we need trading days for
-    all_event_dates = []
-    for ticker_events in events_by_ticker.values():
-        for e in ticker_events:
-            ed = e['event_date'].date() if hasattr(e['event_date'], 'date') else e['event_date']
-            all_event_dates.append(ed)
-    
-    if all_event_dates:
-        # Expand range to cover dayOffset calculations
-        # count_start is negative (e.g., -14), count_end is positive (e.g., +14)
-        # Need extra buffer for trading day calculations (~2x the offset in calendar days)
-        calendar_buffer = max(abs(count_start), abs(count_end)) * 2 + 30
-        trading_range_start = min(all_event_dates) - timedelta(days=calendar_buffer)
-        trading_range_end = max(all_event_dates) + timedelta(days=calendar_buffer)
-        
-        logger.info(f"[PriceTrends] Pre-caching trading days from {trading_range_start} to {trading_range_end}")
-        trading_days_set = await get_trading_days_in_range(trading_range_start, trading_range_end, 'NASDAQ', pool)
-        logger.info(f"[PriceTrends] Cached {len(trading_days_set)} trading days")
-    else:
-        trading_days_set = set()
-    
     # ========================================
     # I-43: Group events by (ticker, event_date) for txn_price_trend
     # ========================================
     # Deduplicate events by (ticker, event_date) since txn_price_trend is indexed by this combination
+    logger.info(
+        "[temp.debug] start deduplicate",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'temp.debug.dedupe_start',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {'records': len(all_records)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
     unique_ticker_dates = {}
     for record in all_records:
         ticker = record['ticker']
@@ -2083,9 +2180,365 @@ async def generate_price_trends(
         }
     )
 
+    existing_rows = {}
+    tickers_filter = sorted(unique_ticker_dates.keys())
+    logger.info(
+        "[temp.debug] load existing rows",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'temp.debug.existing_rows_start',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {'tickers': len(tickers_filter)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+    async with pool.acquire() as conn:
+        query = """
+            SELECT
+                ticker,
+                event_date,
+                (
+                    d_neg14 IS NOT NULL AND d_neg13 IS NOT NULL AND d_neg12 IS NOT NULL AND d_neg11 IS NOT NULL AND d_neg10 IS NOT NULL
+                    AND d_neg9 IS NOT NULL AND d_neg8 IS NOT NULL AND d_neg7 IS NOT NULL AND d_neg6 IS NOT NULL AND d_neg5 IS NOT NULL
+                    AND d_neg4 IS NOT NULL AND d_neg3 IS NOT NULL AND d_neg2 IS NOT NULL AND d_neg1 IS NOT NULL AND d_0 IS NOT NULL
+                    AND d_pos1 IS NOT NULL AND d_pos2 IS NOT NULL AND d_pos3 IS NOT NULL AND d_pos4 IS NOT NULL AND d_pos5 IS NOT NULL
+                    AND d_pos6 IS NOT NULL AND d_pos7 IS NOT NULL AND d_pos8 IS NOT NULL AND d_pos9 IS NOT NULL AND d_pos10 IS NOT NULL
+                    AND d_pos11 IS NOT NULL AND d_pos12 IS NOT NULL AND d_pos13 IS NOT NULL AND d_pos14 IS NOT NULL
+                ) AS is_complete,
+                (d_neg14 ? 'dayOffset0') AS has_dayoffset0
+            FROM txn_price_trend
+            WHERE 1=1
+        """
+        params = []
+        param_idx = 1
+
+        if from_date is not None:
+            query += f" AND event_date >= ${param_idx}"
+            params.append(from_date)
+            param_idx += 1
+
+        if to_date is not None:
+            query += f" AND event_date <= ${param_idx}"
+            params.append(to_date)
+            param_idx += 1
+
+        if tickers_filter:
+            query += f" AND ticker = ANY(${param_idx})"
+            params.append(tickers_filter)
+            param_idx += 1
+
+        rows = await conn.fetch(query, *params)
+        for row in rows:
+            existing_rows[(row['ticker'], row['event_date'])] = {
+                'is_complete': row['is_complete'],
+                'has_dayoffset0': row['has_dayoffset0']
+            }
+    logger.info(
+        "[temp.debug] loaded existing rows",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'temp.debug.existing_rows_done',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {'rows': len(existing_rows)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
+    create_count = 0
+    update_count = 0
+    skip_count = 0
+    filtered_unique = {}
+
+    for ticker, dates in unique_ticker_dates.items():
+        for event_date, record in dates.items():
+            existing = existing_rows.get((ticker, event_date))
+            if existing is None:
+                create_count += 1
+            elif overwrite:
+                update_count += 1
+            elif existing['is_complete'] and not existing['has_dayoffset0']:
+                skip_count += 1
+                continue
+            else:
+                update_count += 1
+
+            if ticker not in filtered_unique:
+                filtered_unique[ticker] = {}
+            filtered_unique[ticker][event_date] = record
+
+    unique_ticker_dates = filtered_unique
+
+    logger.info(
+        f"Preflight price trends: create={create_count} update={update_count} skip={skip_count}",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'preflight',
+            'elapsed_ms': int((time.time() - start_time) * 1000),
+            'counters': {
+                'create': create_count,
+                'update': update_count,
+                'skip': skip_count
+            },
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+
+    if create_count + update_count == 0:
+        logger.info(
+            "No price trend updates required",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'no_updates',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        logger.info(
+            "[temp.debug] summary",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.summary',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {
+                    'status': 'no_updates',
+                    'success': 0,
+                    'fail': 0,
+                    'create': create_count,
+                    'update': update_count,
+                    'skip': skip_count
+                },
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        return {
+            'success': 0,
+            'fail': 0
+        }
+
+    tickers_to_check = sorted(unique_ticker_dates.keys())
+    if tickers_to_check:
+        logger.info(
+            "[temp.debug] preflight quantitative cache start",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.preflight_cache_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'tickers': len(tickers_to_check)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        logger.info(
+            "[temp.debug] preflight quantitative cache request",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.preflight_cache_request',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {
+                    'tickers': len(tickers_to_check),
+                    'api': 'fmp-historical-price-eod-full'
+                },
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        cache = {}
+        preflight_batch_size = 500
+        try:
+            for idx in range(0, len(tickers_to_check), preflight_batch_size):
+                chunk = tickers_to_check[idx:idx + preflight_batch_size]
+                logger.info(
+                    "[temp.debug] preflight cache chunk",
+                    extra={
+                        'endpoint': 'POST /generatePriceTrends',
+                        'phase': 'temp.debug.preflight_cache_chunk',
+                        'elapsed_ms': int((time.time() - start_time) * 1000),
+                        'counters': {
+                            'chunk_index': idx // preflight_batch_size + 1,
+                            'chunk_size': len(chunk),
+                            'total': len(tickers_to_check)
+                        },
+                        'progress': {},
+                        'rate': {},
+                        'batch': {},
+                        'warn': []
+                    }
+                )
+                chunk_cache = await get_batch_quantitative_data_from_db(
+                    pool,
+                    chunk,
+                    ['fmp-historical-price-eod-full']
+                )
+                cache.update(chunk_cache)
+        except Exception as e:
+            logger.error(
+                f"[temp.debug] preflight cache fetch failed: {type(e).__name__}: {e!r}",
+                extra={
+                    'endpoint': 'POST /generatePriceTrends',
+                    'phase': 'temp.debug.preflight_cache_error',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': {'tickers': len(tickers_to_check)},
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': []
+                },
+                exc_info=True
+            )
+            raise
+        logger.info(
+            "[temp.debug] preflight quantitative cache done",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.preflight_cache_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'tickers': len(cache)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        missing_tickers = []
+        for ticker in tickers_to_check:
+            raw_prices = cache.get(ticker, {}).get('fmp-historical-price-eod-full')
+            if not _normalize_historical_prices(raw_prices):
+                missing_tickers.append(ticker)
+
+        if missing_tickers:
+            missing_preview = ", ".join(missing_tickers[:50])
+            logger.info(
+                "[temp.debug] preflight missing cache detected",
+                extra={
+                    'endpoint': 'POST /generatePriceTrends',
+                    'phase': 'temp.debug.preflight_missing_cache',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': {
+                        'missing_count': len(missing_tickers),
+                        'missing_preview': missing_tickers[:10]
+                    },
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': missing_tickers[:10]
+                }
+            )
+            message = (
+                "Missing historical_price in config_lv3_quantitatives for "
+                f"{len(missing_tickers)} tickers. Missing: {missing_preview}. "
+                "Skipping missing tickers. Run POST /getQuantitatives to backfill."
+            )
+            logger.info(
+                f"[temp.debug] preflight summary | missing_count={len(missing_tickers)} "
+                f"missing_tickers={missing_preview}",
+                extra={
+                    'endpoint': 'POST /generatePriceTrends',
+                    'phase': 'temp.debug.preflight_summary',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': {
+                        'status': 'partial',
+                        'reason': 'missing_quantitatives',
+                        'missing_count': len(missing_tickers),
+                        'missing_tickers': missing_tickers[:50]
+                    },
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': missing_tickers[:10]
+                }
+            )
+            logger.warning(
+                message,
+                extra={
+                    'endpoint': 'POST /generatePriceTrends',
+                    'phase': 'preflight_missing_quantitatives',
+                    'elapsed_ms': int((time.time() - start_time) * 1000),
+                    'counters': {'missing': len(missing_tickers)},
+                    'progress': {},
+                    'rate': {},
+                    'batch': {},
+                    'warn': missing_tickers[:10]
+                }
+            )
+
+            # Remove missing tickers from processing to allow remaining tickers to proceed
+            for missing_ticker in missing_tickers:
+                if missing_ticker in unique_ticker_dates:
+                    del unique_ticker_dates[missing_ticker]
+
     tickers_to_process = sorted(unique_ticker_dates.keys())
     if start_point:
         tickers_to_process = [ticker for ticker in tickers_to_process if ticker >= start_point]
+
+    # ========================================
+    # OPTIMIZATION: Pre-cache trading days for entire date range
+    # ========================================
+    # Calculate the full range of dates we need trading days for
+    all_event_dates = []
+    for ticker_events in unique_ticker_dates.values():
+        for record in ticker_events.values():
+            ed = record['event_date'].date() if hasattr(record['event_date'], 'date') else record['event_date']
+            all_event_dates.append(ed)
+
+    if all_event_dates:
+        logger.info(
+            "[temp.debug] trading days cache start",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.trading_days_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'events': len(all_event_dates)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        # Expand range to cover dayOffset calculations
+        # count_start is negative (e.g., -14), count_end is positive (e.g., +14)
+        # Need extra buffer for trading day calculations (~2x the offset in calendar days)
+        calendar_buffer = max(abs(count_start), abs(count_end)) * 2 + 30
+        trading_range_start = min(all_event_dates) - timedelta(days=calendar_buffer)
+        trading_range_end = max(all_event_dates) + timedelta(days=calendar_buffer)
+
+        logger.info(f"[PriceTrends] Pre-caching trading days from {trading_range_start} to {trading_range_end}")
+        trading_days_set = await get_trading_days_in_range(trading_range_start, trading_range_end, 'NASDAQ', pool)
+        logger.info(
+            "[temp.debug] trading days cache done",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.trading_days_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'trading_days': len(trading_days_set)},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        logger.info(f"[PriceTrends] Cached {len(trading_days_set)} trading days")
+    else:
+        trading_days_set = set()
 
     if not tickers_to_process:
         logger.info(
@@ -2095,6 +2548,23 @@ async def generate_price_trends(
                 'phase': 'no_tickers',
                 'elapsed_ms': int((time.time() - start_time) * 1000),
                 'counters': {},
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
+        logger.info(
+            "[temp.debug] summary",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.summary',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {
+                    'status': 'no_tickers',
+                    'success': 0,
+                    'fail': 0
+                },
                 'progress': {},
                 'rate': {},
                 'batch': {},
@@ -2115,7 +2585,8 @@ async def generate_price_trends(
         record_type: str,
         jsonb_columns: dict,
         wts_long: int,
-        wts_short: int
+        wts_short: int,
+        overwrite_row: bool
     ):
         """
         Upsert a single price trend record to txn_price_trend table.
@@ -2164,38 +2635,38 @@ async def generate_price_trends(
                 )
                 ON CONFLICT (ticker, event_date) DO UPDATE
                 SET
-                    type = EXCLUDED.type,
-                    d_neg14 = EXCLUDED.d_neg14,
-                    d_neg13 = EXCLUDED.d_neg13,
-                    d_neg12 = EXCLUDED.d_neg12,
-                    d_neg11 = EXCLUDED.d_neg11,
-                    d_neg10 = EXCLUDED.d_neg10,
-                    d_neg9 = EXCLUDED.d_neg9,
-                    d_neg8 = EXCLUDED.d_neg8,
-                    d_neg7 = EXCLUDED.d_neg7,
-                    d_neg6 = EXCLUDED.d_neg6,
-                    d_neg5 = EXCLUDED.d_neg5,
-                    d_neg4 = EXCLUDED.d_neg4,
-                    d_neg3 = EXCLUDED.d_neg3,
-                    d_neg2 = EXCLUDED.d_neg2,
-                    d_neg1 = EXCLUDED.d_neg1,
-                    d_0 = EXCLUDED.d_0,
-                    d_pos1 = EXCLUDED.d_pos1,
-                    d_pos2 = EXCLUDED.d_pos2,
-                    d_pos3 = EXCLUDED.d_pos3,
-                    d_pos4 = EXCLUDED.d_pos4,
-                    d_pos5 = EXCLUDED.d_pos5,
-                    d_pos6 = EXCLUDED.d_pos6,
-                    d_pos7 = EXCLUDED.d_pos7,
-                    d_pos8 = EXCLUDED.d_pos8,
-                    d_pos9 = EXCLUDED.d_pos9,
-                    d_pos10 = EXCLUDED.d_pos10,
-                    d_pos11 = EXCLUDED.d_pos11,
-                    d_pos12 = EXCLUDED.d_pos12,
-                    d_pos13 = EXCLUDED.d_pos13,
-                    d_pos14 = EXCLUDED.d_pos14,
-                    wts_long = EXCLUDED.wts_long,
-                    wts_short = EXCLUDED.wts_short,
+                    type = CASE WHEN $35 THEN EXCLUDED.type ELSE COALESCE(txn_price_trend.type, EXCLUDED.type) END,
+                    d_neg14 = CASE WHEN $35 THEN EXCLUDED.d_neg14 ELSE COALESCE(txn_price_trend.d_neg14, EXCLUDED.d_neg14) END,
+                    d_neg13 = CASE WHEN $35 THEN EXCLUDED.d_neg13 ELSE COALESCE(txn_price_trend.d_neg13, EXCLUDED.d_neg13) END,
+                    d_neg12 = CASE WHEN $35 THEN EXCLUDED.d_neg12 ELSE COALESCE(txn_price_trend.d_neg12, EXCLUDED.d_neg12) END,
+                    d_neg11 = CASE WHEN $35 THEN EXCLUDED.d_neg11 ELSE COALESCE(txn_price_trend.d_neg11, EXCLUDED.d_neg11) END,
+                    d_neg10 = CASE WHEN $35 THEN EXCLUDED.d_neg10 ELSE COALESCE(txn_price_trend.d_neg10, EXCLUDED.d_neg10) END,
+                    d_neg9 = CASE WHEN $35 THEN EXCLUDED.d_neg9 ELSE COALESCE(txn_price_trend.d_neg9, EXCLUDED.d_neg9) END,
+                    d_neg8 = CASE WHEN $35 THEN EXCLUDED.d_neg8 ELSE COALESCE(txn_price_trend.d_neg8, EXCLUDED.d_neg8) END,
+                    d_neg7 = CASE WHEN $35 THEN EXCLUDED.d_neg7 ELSE COALESCE(txn_price_trend.d_neg7, EXCLUDED.d_neg7) END,
+                    d_neg6 = CASE WHEN $35 THEN EXCLUDED.d_neg6 ELSE COALESCE(txn_price_trend.d_neg6, EXCLUDED.d_neg6) END,
+                    d_neg5 = CASE WHEN $35 THEN EXCLUDED.d_neg5 ELSE COALESCE(txn_price_trend.d_neg5, EXCLUDED.d_neg5) END,
+                    d_neg4 = CASE WHEN $35 THEN EXCLUDED.d_neg4 ELSE COALESCE(txn_price_trend.d_neg4, EXCLUDED.d_neg4) END,
+                    d_neg3 = CASE WHEN $35 THEN EXCLUDED.d_neg3 ELSE COALESCE(txn_price_trend.d_neg3, EXCLUDED.d_neg3) END,
+                    d_neg2 = CASE WHEN $35 THEN EXCLUDED.d_neg2 ELSE COALESCE(txn_price_trend.d_neg2, EXCLUDED.d_neg2) END,
+                    d_neg1 = CASE WHEN $35 THEN EXCLUDED.d_neg1 ELSE COALESCE(txn_price_trend.d_neg1, EXCLUDED.d_neg1) END,
+                    d_0 = CASE WHEN $35 THEN EXCLUDED.d_0 ELSE COALESCE(txn_price_trend.d_0, EXCLUDED.d_0) END,
+                    d_pos1 = CASE WHEN $35 THEN EXCLUDED.d_pos1 ELSE COALESCE(txn_price_trend.d_pos1, EXCLUDED.d_pos1) END,
+                    d_pos2 = CASE WHEN $35 THEN EXCLUDED.d_pos2 ELSE COALESCE(txn_price_trend.d_pos2, EXCLUDED.d_pos2) END,
+                    d_pos3 = CASE WHEN $35 THEN EXCLUDED.d_pos3 ELSE COALESCE(txn_price_trend.d_pos3, EXCLUDED.d_pos3) END,
+                    d_pos4 = CASE WHEN $35 THEN EXCLUDED.d_pos4 ELSE COALESCE(txn_price_trend.d_pos4, EXCLUDED.d_pos4) END,
+                    d_pos5 = CASE WHEN $35 THEN EXCLUDED.d_pos5 ELSE COALESCE(txn_price_trend.d_pos5, EXCLUDED.d_pos5) END,
+                    d_pos6 = CASE WHEN $35 THEN EXCLUDED.d_pos6 ELSE COALESCE(txn_price_trend.d_pos6, EXCLUDED.d_pos6) END,
+                    d_pos7 = CASE WHEN $35 THEN EXCLUDED.d_pos7 ELSE COALESCE(txn_price_trend.d_pos7, EXCLUDED.d_pos7) END,
+                    d_pos8 = CASE WHEN $35 THEN EXCLUDED.d_pos8 ELSE COALESCE(txn_price_trend.d_pos8, EXCLUDED.d_pos8) END,
+                    d_pos9 = CASE WHEN $35 THEN EXCLUDED.d_pos9 ELSE COALESCE(txn_price_trend.d_pos9, EXCLUDED.d_pos9) END,
+                    d_pos10 = CASE WHEN $35 THEN EXCLUDED.d_pos10 ELSE COALESCE(txn_price_trend.d_pos10, EXCLUDED.d_pos10) END,
+                    d_pos11 = CASE WHEN $35 THEN EXCLUDED.d_pos11 ELSE COALESCE(txn_price_trend.d_pos11, EXCLUDED.d_pos11) END,
+                    d_pos12 = CASE WHEN $35 THEN EXCLUDED.d_pos12 ELSE COALESCE(txn_price_trend.d_pos12, EXCLUDED.d_pos12) END,
+                    d_pos13 = CASE WHEN $35 THEN EXCLUDED.d_pos13 ELSE COALESCE(txn_price_trend.d_pos13, EXCLUDED.d_pos13) END,
+                    d_pos14 = CASE WHEN $35 THEN EXCLUDED.d_pos14 ELSE COALESCE(txn_price_trend.d_pos14, EXCLUDED.d_pos14) END,
+                    wts_long = CASE WHEN $35 THEN EXCLUDED.wts_long ELSE COALESCE(txn_price_trend.wts_long, EXCLUDED.wts_long) END,
+                    wts_short = CASE WHEN $35 THEN EXCLUDED.wts_short ELSE COALESCE(txn_price_trend.wts_short, EXCLUDED.wts_short) END,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 ticker,
@@ -2233,7 +2704,8 @@ async def generate_price_trends(
                 jsonb_or_null(jsonb_columns.get('d_pos14')),
                 # wts_long and wts_short (integers)
                 wts_long,
-                wts_short
+                wts_short,
+                overwrite_row
             )
 
     # ========================================
@@ -2242,6 +2714,7 @@ async def generate_price_trends(
     success_count = 0
     fail_count = 0
     processed_pairs = 0
+    missing_base_close_count = 0
     progress_lock = asyncio.Lock()
 
     total_unique_pairs = sum(len(dates) for dates in unique_ticker_dates.values() if dates)
@@ -2259,21 +2732,27 @@ async def generate_price_trends(
                 'warn': []
             }
         )
+        logger.info(
+            "[temp.debug] summary",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.summary',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {
+                    'status': 'no_pairs',
+                    'success': 0,
+                    'fail': 0
+                },
+                'progress': {},
+                'rate': {},
+                'batch': {},
+                'warn': []
+            }
+        )
         return {
             'success': 0,
             'fail': 0
         }
-
-    def _normalize_historical_prices(raw_prices: Any) -> List[Dict[str, Any]]:
-        if raw_prices is None:
-            return []
-        if isinstance(raw_prices, list):
-            return raw_prices
-        if isinstance(raw_prices, dict):
-            historical = raw_prices.get('historical')
-            if isinstance(historical, list):
-                return historical
-        return []
 
     def _build_ohlc_cache_for_ticker(
         historical_prices: List[Dict[str, Any]],
@@ -2294,7 +2773,7 @@ async def generate_price_trends(
         return ohlc_by_date
 
     async def _process_ticker(ticker: str, ohlc_by_date: Dict[str, Dict[str, Any]]):
-        nonlocal success_count, fail_count, processed_pairs
+        nonlocal success_count, fail_count, processed_pairs, missing_base_close_count
 
         ticker_dates = unique_ticker_dates.get(ticker, {})
         for event_date, record in ticker_dates.items():
@@ -2341,11 +2820,20 @@ async def generate_price_trends(
                                     dayoffset_ohlc[offset] = dayoffset_ohlc[next_offset].copy()
                                     break
 
-                d0_data = dayoffset_ohlc.get(0)
-                base_close = d0_data['close'] if d0_data and d0_data.get('close') is not None else None
+                base_offset = -14
+                base_data = dayoffset_ohlc.get(base_offset)
+                base_close = base_data['close'] if base_data and base_data.get('close') is not None else None
 
                 if base_close is None:
-                    logger.warning(f"No D0 close for {ticker} on {event_date}, recording with null values")
+                    missing_base_close_count += 1
+                    if missing_base_close_count <= 5:
+                        logger.warning(
+                            f"No D-14 close for {ticker} on {event_date}, recording with null values"
+                        )
+                    elif missing_base_close_count == 6:
+                        logger.warning(
+                            "No D-14 close warnings suppressed (too many occurrences)"
+                        )
 
                 jsonb_columns = {}
                 day_performances = {}
@@ -2367,7 +2855,7 @@ async def generate_price_trends(
                                 'open': ohlc['open'],
                                 'close': ohlc['close']
                             },
-                            'dayOffset0': {
+                            'dayOffsetNeg14': {
                                 'close': base_close
                             },
                             'performance': {
@@ -2384,7 +2872,7 @@ async def generate_price_trends(
                                 'open': ohlc['open'],
                                 'close': ohlc['close']
                             },
-                            'dayOffset0': {
+                            'dayOffsetNeg14': {
                                 'close': None
                             },
                             'performance': {
@@ -2395,7 +2883,7 @@ async def generate_price_trends(
                         jsonb_data = {
                             'targetDate': target_date,
                             'price_trend': None,
-                            'dayOffset0': {
+                            'dayOffsetNeg14': {
                                 'close': base_close
                             },
                             'performance': {
@@ -2433,7 +2921,8 @@ async def generate_price_trends(
                     record_type,
                     jsonb_columns,
                     wts_long,
-                    wts_short
+                    wts_short,
+                    overwrite
                 )
                 ticker_success = True
             except Exception as e:
@@ -2487,6 +2976,19 @@ async def generate_price_trends(
     batch_number = 0
     for ticker_batch in ticker_batches:
         batch_number += 1
+        logger.info(
+            "[temp.debug] batch start",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.batch_start',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'batch_number': batch_number, 'batch_size': len(ticker_batch)},
+                'progress': {},
+                'rate': {},
+                'batch': {'size': len(ticker_batch), 'mode': 'ticker'},
+                'warn': []
+            }
+        )
         tickers_preview = ", ".join(ticker_batch[:10])
         if len(ticker_batch) > 10:
             tickers_preview = f"{tickers_preview}, ..."
@@ -2509,6 +3011,19 @@ async def generate_price_trends(
             pool,
             ticker_batch,
             ['fmp-historical-price-eod-full']
+        )
+        logger.info(
+            "[temp.debug] batch cache ready",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.batch_cache_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'tickers': len(batch_cache)},
+                'progress': {},
+                'rate': {},
+                'batch': {'size': len(ticker_batch), 'mode': 'ticker'},
+                'warn': []
+            }
         )
 
         ticker_ohlc_cache = {}
@@ -2547,7 +3062,33 @@ async def generate_price_trends(
                 await _process_ticker(ticker, ticker_ohlc_cache.get(ticker, {}))
 
         tasks = [_semaphore_wrapper(ticker) for ticker in ticker_batch]
+        logger.info(
+            "[temp.debug] batch tasks created",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.batch_tasks_created',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'tasks': len(tasks)},
+                'progress': {},
+                'rate': {},
+                'batch': {'size': len(ticker_batch), 'mode': 'ticker'},
+                'warn': []
+            }
+        )
         await asyncio.gather(*tasks)
+        logger.info(
+            "[temp.debug] batch tasks completed",
+            extra={
+                'endpoint': 'POST /generatePriceTrends',
+                'phase': 'temp.debug.batch_tasks_done',
+                'elapsed_ms': int((time.time() - start_time) * 1000),
+                'counters': {'batch_number': batch_number},
+                'progress': {},
+                'rate': {},
+                'batch': {'size': len(ticker_batch), 'mode': 'ticker'},
+                'warn': []
+            }
+        )
 
     # All records saved incrementally - no batch operation needed
     total_elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2559,6 +3100,25 @@ async def generate_price_trends(
             'phase': 'complete_price_trends',
             'elapsed_ms': total_elapsed_ms,
             'counters': {'success': success_count, 'fail': fail_count, 'events': len(events), 'trades': len(trades)},
+            'progress': {},
+            'rate': {},
+            'batch': {},
+            'warn': []
+        }
+    )
+    logger.info(
+        "[temp.debug] summary",
+        extra={
+            'endpoint': 'POST /generatePriceTrends',
+            'phase': 'temp.debug.summary',
+            'elapsed_ms': total_elapsed_ms,
+            'counters': {
+                'status': 'completed',
+                'success': success_count,
+                'fail': fail_count,
+                'events': len(events),
+                'trades': len(trades)
+            },
             'progress': {},
             'rate': {},
             'batch': {},

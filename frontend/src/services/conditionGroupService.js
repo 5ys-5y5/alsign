@@ -4,14 +4,16 @@
  * Provides methods for managing condition groups via the backend API.
  */
 
-import { API_BASE_URL } from './api';
+import { API_BASE_URL, getAuthHeaders } from './api';
 
 /**
  * Get list of allowed columns for condition groups
  * @returns {Promise<string[]>} Array of column names
  */
 export async function getAllowedColumns() {
-  const response = await fetch(`${API_BASE_URL}/conditionGroups/columns`);
+  const response = await fetch(`${API_BASE_URL}/conditionGroups/columns`, {
+    headers: await getAuthHeaders(),
+  });
 
   if (!response.ok) {
     throw new Error(`Failed to fetch allowed columns: ${response.statusText}`);
@@ -27,7 +29,8 @@ export async function getAllowedColumns() {
  */
 export async function getColumnValues(column) {
   const response = await fetch(
-    `${API_BASE_URL}/conditionGroups/values?column=${encodeURIComponent(column)}`
+    `${API_BASE_URL}/conditionGroups/values?column=${encodeURIComponent(column)}`,
+    { headers: await getAuthHeaders() }
   );
 
   if (!response.ok) {
@@ -42,7 +45,9 @@ export async function getColumnValues(column) {
  * @returns {Promise<Array>} Array of condition group objects
  */
 export async function getConditionGroups() {
-  const response = await fetch(`${API_BASE_URL}/conditionGroups`);
+  const response = await fetch(`${API_BASE_URL}/conditionGroups`, {
+    headers: await getAuthHeaders(),
+  });
 
   if (!response.ok) {
     throw new Error(`Failed to fetch condition groups: ${response.statusText}`);
@@ -63,9 +68,7 @@ export async function getConditionGroups() {
 export async function createConditionGroup(data) {
   const response = await fetch(`${API_BASE_URL}/conditionGroups`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: await getAuthHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(data),
   });
 
@@ -87,6 +90,7 @@ export async function deleteConditionGroup(name) {
     `${API_BASE_URL}/conditionGroups/${encodeURIComponent(name)}`,
     {
       method: 'DELETE',
+      headers: await getAuthHeaders(),
     }
   );
 

@@ -139,7 +139,7 @@
   border: 1px solid var(--border);
   border-radius: var(--rounded-xl);
   background-color: white;
-  overflow: hidden;
+  overflow: visible;
   position: relative;
   z-index: var(--z-base);
 }
@@ -248,6 +248,18 @@ tbody td {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 0; /* Enable ellipsis with table layout */
+}
+
+.row-blurred {
+  filter: blur(4px);
+  opacity: 0.7;
+}
+
+.cell-locked {
+  color: var(--text-dim);
+  font-weight: var(--font-medium);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
 /* Table Footer - Sticky at bottom of scroll container */

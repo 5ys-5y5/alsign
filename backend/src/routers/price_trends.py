@@ -72,8 +72,12 @@ async def generate_price_trends_endpoint(
             tables=table_list,
             start_point=params.get_start_point(),
             batch_size=params.batch_size,
-            max_workers=params.max_workers
+            max_workers=params.max_workers,
+            overwrite=params.overwrite
         )
+
+        if result.get("errorCode"):
+            response.status_code = 400
 
         return {
             "reqId": req_id,
@@ -81,7 +85,11 @@ async def generate_price_trends_endpoint(
             "summary": {
                 "success": result.get('success', 0),
                 "fail": result.get('fail', 0)
-            }
+            },
+            "error": result.get("error"),
+            "errorCode": result.get("errorCode"),
+            "missingTickers": result.get("missingTickers"),
+            "missingCount": result.get("missingCount"),
         }
 
     except Exception as e:
@@ -157,8 +165,16 @@ async def stream_generate_price_trends(
                         tables=table_list,
                         start_point=params.get_start_point(),
                         batch_size=params.batch_size,
-                        max_workers=params.max_workers
+                        max_workers=params.max_workers,
+                        overwrite=params.overwrite
                     )
+
+                    if result.get("errorCode"):
+                        await log_queue.put(json.dumps({
+                            'type': 'error',
+                            'error': result.get("error")
+                        }))
+                        return
 
                     total_elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -215,6 +231,8 @@ async def stream_generate_price_trends(
 
             collection_task = asyncio.create_task(collect_data())
 
+            last_ping = time.time()
+
             while True:
                 try:
                     log_line = await asyncio.wait_for(log_queue.get(), timeout=0.1)
@@ -234,6 +252,9 @@ async def stream_generate_price_trends(
                 except asyncio.TimeoutError:
                     if collection_task.done():
                         break
+                    if time.time() - last_ping >= 10:
+                        yield "event: ping\ndata: {}\n\n"
+                        last_ping = time.time()
                     continue
 
         except Exception as e:

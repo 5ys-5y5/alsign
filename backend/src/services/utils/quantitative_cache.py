@@ -6,6 +6,7 @@ config_lv3_quantitatives와 config_lv3_targets 테이블에서 데이터를 조�
 """
 import logging
 import json
+import time
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("alsign")
@@ -288,17 +289,37 @@ async def get_batch_quantitative_data_from_db(
     columns_str = ", ".join(columns_to_fetch)
 
     # 배치 쿼리로 모든 ticker 데이터 한 번에 조회
-    logger.info(f"[DB-Cache] Batch query from config_lv3_quantitatives: {len(tickers)} tickers × {len(required_apis)} APIs (No API calls)")
+    logger.info(
+        f"[DB-Cache] Batch query from config_lv3_quantitatives: "
+        f"{len(tickers)} tickers × {len(required_apis)} APIs (No API calls)"
+    )
+    query_start = time.time()
+    logger.info(
+        f"[temp.debug] quant cache query start: tickers={len(tickers)} apis={len(required_apis)}"
+    )
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
+        try:
+            await conn.execute("SET statement_timeout = '300s'")
+            rows = await conn.fetch(
+                f"""
             SELECT {columns_str}
             FROM config_lv3_quantitatives
             WHERE ticker = ANY($1::text[])
             """,
-            tickers
-        )
+                tickers
+            )
+        except Exception as e:
+            elapsed_ms = int((time.time() - query_start) * 1000)
+            logger.error(
+                f"[temp.debug] quant cache query failed: {type(e).__name__}: {e!r} elapsed_ms={elapsed_ms}",
+                exc_info=True
+            )
+            raise
+    query_elapsed_ms = int((time.time() - query_start) * 1000)
+    logger.info(
+        f"[temp.debug] quant cache query done: rows={len(rows)} elapsed_ms={query_elapsed_ms}"
+    )
 
     # 결과 변환: DB row → API cache 형식
     result = {}

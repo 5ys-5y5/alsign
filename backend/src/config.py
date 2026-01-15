@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # Application Configuration
     LOG_LEVEL: str = "INFO"
     ENVIRONMENT: str = "development"
+    SUPABASE_JWT_SECRET: str | None = None
 
     # CORS Settings
     CORS_ORIGINS: str = '["http://localhost:3000","http://localhost:5173"]'

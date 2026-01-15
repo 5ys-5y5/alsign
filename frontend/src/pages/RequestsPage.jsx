@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useLog } from '../contexts/LogContext';
 
-import { API_BASE_URL } from '../services/api';
+import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
 /**
  * Default timeout settings per endpoint (in milliseconds)
@@ -621,6 +621,8 @@ function RequestForm({ title, method, path, queryFields, bodyFields, bodyExample
 
           options.body = JSON.stringify(parsedBody);
         }
+
+        options.headers = await getAuthHeaders(options.headers);
 
         // Log request start
         onLog?.('info', `${method} ${path} - Request started`, requestId);

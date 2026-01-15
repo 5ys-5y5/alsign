@@ -2,13 +2,14 @@
 
 import logging
 import json
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from uuid import UUID
 
 from ..database.connection import db_pool
+from ..auth import get_current_user, require_admin, UserContext
 
 logger = logging.getLogger("alsign")
 
@@ -39,7 +40,7 @@ class EventRow(BaseModel):
     condition: Optional[str]
     # WTS - which day offset (D+N) has the maximum return
     wts: Optional[int]
-    # Day offset returns D-14 to D14 (excluding D0)
+    # Day offset returns D-14 to D14 (including D0)
     d_neg14: Optional[float]
     d_neg13: Optional[float]
     d_neg12: Optional[float]
@@ -54,6 +55,7 @@ class EventRow(BaseModel):
     d_neg3: Optional[float]
     d_neg2: Optional[float]
     d_neg1: Optional[float]
+    d_0: Optional[float]
     d_pos1: Optional[float]
     d_pos2: Optional[float]
     d_pos3: Optional[float]
@@ -99,7 +101,7 @@ class DayOffsetMetricsResponse(BaseModel):
 
 
 @router.get("/kpis", response_model=KPIResponse)
-async def get_kpis():
+async def get_kpis(user: UserContext = Depends(require_admin)):
     """
     Get KPI data for dashboard.
 
@@ -156,6 +158,7 @@ async def get_kpis():
 
 @router.get("/events", response_model=EventsResponse)
 async def get_events(
+    user: UserContext = Depends(require_admin),
     page: int = Query(1, ge=1, description="Page number starting from 1"),
     pageSize: int = Query(50, ge=1, le=1000, description="Number of rows per page"),
     sortBy: Optional[str] = Query(None, description="Column to sort by"),
@@ -342,7 +345,7 @@ async def get_events(
                     -- Price trend data from txn_price_trend table
                     pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
                     pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
-                    pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1,
+                    pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1, pt.d_0,
                     pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
                     pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
                     pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14
@@ -375,7 +378,9 @@ async def get_events(
                     def get_day_value(day_offset: int) -> Optional[float]:
                         """Extract performance.close value for day offset from txn_price_trend JSONB."""
                         # Map offset to column name
-                        if day_offset < 0:
+                        if day_offset == 0:
+                            col_name = "d_0"
+                        elif day_offset < 0:
                             col_name = f"d_neg{abs(day_offset)}"
                         else:
                             col_name = f"d_pos{day_offset}"
@@ -403,11 +408,9 @@ async def get_events(
 
                         return None
 
-                    # Extract all day offsets (D-14 to D14, excluding D0)
+                    # Extract all day offsets (D-14 to D14, including D0)
                     day_values = {}
                     for offset in range(-14, 15):
-                        if offset == 0:
-                            continue
                         day_values[offset] = get_day_value(offset)
 
                     # Calculate WTS: day offset with maximum absolute return
@@ -426,6 +429,8 @@ async def get_events(
                         max_return = None
                         max_offset = None
                         for offset, value in day_values.items():
+                            if offset == 0:
+                                continue
                             if value is not None:
                                 adjusted_return = value * position_multiplier
                                 if max_return is None or adjusted_return > max_return:
@@ -447,7 +452,7 @@ async def get_events(
                         disparity_qualitative=row["disparity_qualitative"],
                         condition=row["condition"],
                         wts=wts,
-                        # Day offset values (D-14 to D14, excluding D0)
+                        # Day offset values (D-14 to D14, including D0)
                         d_neg14=day_values.get(-14),
                         d_neg13=day_values.get(-13),
                         d_neg12=day_values.get(-12),
@@ -462,6 +467,7 @@ async def get_events(
                         d_neg3=day_values.get(-3),
                         d_neg2=day_values.get(-2),
                         d_neg1=day_values.get(-1),
+                        d_0=day_values.get(0),
                         d_pos1=day_values.get(1),
                         d_pos2=day_values.get(2),
                         d_pos3=day_values.get(3),
@@ -516,6 +522,7 @@ async def get_events(
 
 @router.get("/dayOffsetMetrics", response_model=DayOffsetMetricsResponse)
 async def get_day_offset_metrics(
+    user: UserContext = Depends(require_admin),
     groupBy: str = Query(
         "sector", description="Group by dimension: sector, industry, source, analyst"
     ),
@@ -653,9 +660,9 @@ class BulkUpdateResponse(BaseModel):
 class TradeRow(BaseModel):
     """Response model for a single trade row."""
 
-    ticker: str
-    trade_date: str
-    model: str
+    ticker: Optional[str]
+    trade_date: Optional[str]
+    model: Optional[str]
     source: Optional[str]
     position: Optional[str]
     entry_price: Optional[float]
@@ -664,7 +671,7 @@ class TradeRow(BaseModel):
     notes: Optional[str]
     # WTS - which day offset (D+N) has the maximum return
     wts: Optional[int]
-    # Day offset returns D-14 to D14 (excluding D0)
+    # Day offset returns D-14 to D14 (including D0)
     d_neg14: Optional[float]
     d_neg13: Optional[float]
     d_neg12: Optional[float]
@@ -679,6 +686,7 @@ class TradeRow(BaseModel):
     d_neg3: Optional[float]
     d_neg2: Optional[float]
     d_neg1: Optional[float]
+    d_0: Optional[float]
     d_pos1: Optional[float]
     d_pos2: Optional[float]
     d_pos3: Optional[float]
@@ -693,6 +701,10 @@ class TradeRow(BaseModel):
     d_pos12: Optional[float]
     d_pos13: Optional[float]
     d_pos14: Optional[float]
+    day_offset_performance: Optional[Dict[str, Optional[float]]] = None
+    day_offset_price_trend: Optional[Dict[str, Optional[float]]] = None
+    day_offset_target_dates: Optional[Dict[str, Optional[str]]] = None
+    is_blurred: Optional[bool] = None
 
 
 class TradesResponse(BaseModel):
@@ -706,6 +718,7 @@ class TradesResponse(BaseModel):
 
 @router.get("/trades", response_model=TradesResponse)
 async def get_trades(
+    user: UserContext = Depends(get_current_user),
     page: int = Query(1, ge=1, description="Page number starting from 1"),
     pageSize: int = Query(50, ge=1, le=1000, description="Number of rows per page"),
     sortBy: Optional[str] = Query(None, description="Column to sort by"),
@@ -718,6 +731,12 @@ async def get_trades(
     position: Optional[str] = Query(None, description="Filter by position (contains)"),
     trade_date_from: Optional[str] = Query(None, alias="tradeDateFrom", description="Filter by trade_date >= (YYYY-MM-DD)"),
     trade_date_to: Optional[str] = Query(None, alias="tradeDateTo", description="Filter by trade_date <= (YYYY-MM-DD)"),
+    day_offset_mode: str = Query(
+        "performance",
+        alias="dayOffsetMode",
+        regex="^(performance|price_trend)$",
+        description="Day offset display mode: performance or price_trend",
+    ),
 ):
     """
     Get trades from txn_trades table with pagination, filtering, and sorting.
@@ -731,7 +750,8 @@ async def get_trades(
     logger.info(
         f"action=get_trades phase=request_received "
         f"page={page} pageSize={pageSize} sortBy={sortBy} sortOrder={sortOrder} "
-        f"ticker={ticker} model={model} source={source} position={position}"
+        f"ticker={ticker} model={model} source={source} position={position} "
+        f"day_offset_mode={day_offset_mode}"
     )
     try:
         # Build WHERE clause
@@ -773,17 +793,13 @@ async def get_trades(
 
         # Build ORDER BY clause
         allowed_sort_columns = [
-            "ticker",
             "trade_date",
-            "model",
-            "source",
             "position",
-            "entry_price",
-            "exit_price",
-            "quantity",
+            "ticker",
         ]
 
-        order_clause = "t.ticker ASC, t.trade_date ASC"  # Default sort
+        order_clause = "t.trade_date DESC, t.position DESC, t.ticker DESC"
+        order_clause_outer = "trade_date_date DESC, position DESC, ticker DESC"
         if sortBy and sortOrder:
             if sortBy not in allowed_sort_columns:
                 raise HTTPException(
@@ -791,47 +807,126 @@ async def get_trades(
                     detail=f"Invalid sort column. Allowed: {', '.join(allowed_sort_columns)}",
                 )
             order_clause = f"t.{sortBy} {sortOrder.upper()}"
+            order_column_outer = "trade_date_date" if sortBy == "trade_date" else sortBy
+            order_clause_outer = f"{order_column_outer} {sortOrder.upper()}"
 
         # Calculate offset
         offset = (page - 1) * pageSize
 
         pool = await db_pool.get_pool()
         async with pool.acquire() as conn:
-            # Get total count
-            count_query = f"SELECT COUNT(*) FROM txn_trades t WHERE {where_clause}"
-            total = await conn.fetchval(count_query, *params)
-
-            # Get data with txn_price_trend JOIN
-            data_query = f"""
-                SELECT
-                    t.ticker,
-                    TO_CHAR(t.trade_date, 'YYYY-MM-DD') as trade_date,
-                    t.model,
-                    t.source,
-                    t.position,
-                    t.entry_price,
-                    t.exit_price,
-                    t.quantity,
-                    t.notes,
-                    -- Price trend data from txn_price_trend table (JOIN on trade_date = event_date)
-                    pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
-                    pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
-                    pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1,
-                    pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
-                    pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
-                    pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14
-                FROM txn_trades t
-                LEFT JOIN txn_price_trend pt ON (
-                    t.ticker = pt.ticker
-                    AND t.trade_date = pt.event_date
+            is_paying = user.is_subscriber
+            if user.is_authenticated and user.user_id:
+                profile = await conn.fetchrow(
+                    """
+                    SELECT is_paying, subscription_expires_at
+                    FROM public.user_profiles
+                    WHERE user_id = $1
+                    """,
+                    user.user_id,
                 )
-                WHERE {where_clause}
-                ORDER BY {order_clause}
-                LIMIT {pageSize}
-                OFFSET {offset}
-            """
+                if profile:
+                    expires_at = profile["subscription_expires_at"]
+                    if expires_at is None:
+                        is_paying = bool(profile["is_paying"])
+                    else:
+                        is_paying = bool(profile["is_paying"]) and expires_at > datetime.now(timezone.utc)
 
-            rows = await conn.fetch(data_query, *params)
+            cutoff_date = date.today() - timedelta(days=30)
+
+            if is_paying:
+                # Get total count
+                count_query = f"SELECT COUNT(*) FROM txn_trades t WHERE {where_clause}"
+                total = await conn.fetchval(count_query, *params)
+
+                # Get data with txn_price_trend JOIN
+                data_query = f"""
+                    SELECT
+                        t.ticker,
+                        TO_CHAR(t.trade_date, 'YYYY-MM-DD') as trade_date,
+                        t.model,
+                        t.source,
+                        t.position,
+                        t.entry_price,
+                        t.exit_price,
+                        t.quantity,
+                        t.notes,
+                        -- Price trend data from txn_price_trend table (JOIN on trade_date = event_date)
+                        pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
+                        pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
+                        pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1, pt.d_0,
+                        pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
+                        pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
+                        pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14
+                    FROM txn_trades t
+                    LEFT JOIN txn_price_trend pt ON (
+                        t.ticker = pt.ticker
+                        AND t.trade_date = pt.event_date
+                    )
+                    WHERE {where_clause}
+                    ORDER BY {order_clause}
+                    LIMIT {pageSize}
+                    OFFSET {offset}
+                """
+
+                rows = await conn.fetch(data_query, *params)
+            else:
+                cutoff_param_index = len(params) + 1
+                params_with_cutoff = [*params, cutoff_date]
+
+                count_query = f"""
+                    WITH base AS (
+                        SELECT
+                            t.trade_date AS trade_date_date,
+                            ROW_NUMBER() OVER (ORDER BY {order_clause}) AS rn
+                        FROM txn_trades t
+                        WHERE {where_clause}
+                    )
+                    SELECT COUNT(*)
+                    FROM base
+                    WHERE (trade_date_date > ${cutoff_param_index} AND rn <= 5)
+                       OR trade_date_date <= ${cutoff_param_index}
+                """
+                total = await conn.fetchval(count_query, *params_with_cutoff)
+
+                data_query = f"""
+                    WITH base AS (
+                        SELECT
+                            t.ticker,
+                            t.trade_date AS trade_date_date,
+                            TO_CHAR(t.trade_date, 'YYYY-MM-DD') as trade_date,
+                            t.model,
+                            t.source,
+                            t.position,
+                            t.entry_price,
+                            t.exit_price,
+                            t.quantity,
+                            t.notes,
+                            -- Price trend data from txn_price_trend table (JOIN on trade_date = event_date)
+                            pt.d_neg14, pt.d_neg13, pt.d_neg12, pt.d_neg11, pt.d_neg10,
+                            pt.d_neg9, pt.d_neg8, pt.d_neg7, pt.d_neg6, pt.d_neg5,
+                            pt.d_neg4, pt.d_neg3, pt.d_neg2, pt.d_neg1, pt.d_0,
+                            pt.d_pos1, pt.d_pos2, pt.d_pos3, pt.d_pos4, pt.d_pos5,
+                            pt.d_pos6, pt.d_pos7, pt.d_pos8, pt.d_pos9, pt.d_pos10,
+                            pt.d_pos11, pt.d_pos12, pt.d_pos13, pt.d_pos14,
+                            ROW_NUMBER() OVER (ORDER BY {order_clause}) AS rn
+                        FROM txn_trades t
+                        LEFT JOIN txn_price_trend pt ON (
+                            t.ticker = pt.ticker
+                            AND t.trade_date = pt.event_date
+                        )
+                        WHERE {where_clause}
+                    )
+                    SELECT *
+                    FROM base
+                    WHERE (trade_date_date > ${cutoff_param_index} AND rn <= 5)
+                       OR trade_date_date <= ${cutoff_param_index}
+                    ORDER BY {order_clause_outer}
+                    LIMIT {pageSize}
+                    OFFSET {offset}
+                """
+
+                rows = await conn.fetch(data_query, *params_with_cutoff)
 
             logger.debug(
                 f"action=get_trades phase=query_complete "
@@ -842,11 +937,71 @@ async def get_trades(
             data = []
             for row in rows:
                 try:
-                    # Helper function to extract performance.close from JSONB
-                    def get_day_value(day_offset: int) -> Optional[float]:
-                        """Extract performance.close value for day offset from txn_price_trend JSONB."""
+                    trade_date_str = row["trade_date"]
+                    is_blurred = False
+                    if not is_paying and trade_date_str:
+                        try:
+                            trade_date_obj = date.fromisoformat(trade_date_str)
+                            if trade_date_obj > cutoff_date:
+                                is_blurred = True
+                        except ValueError:
+                            pass
+
+                    if is_blurred:
+                        data.append(TradeRow(
+                            ticker=None,
+                            trade_date=None,
+                            model=None,
+                            source=None,
+                            position=None,
+                            entry_price=None,
+                            exit_price=None,
+                            quantity=None,
+                            notes=None,
+                            wts=None,
+                            d_neg14=None,
+                            d_neg13=None,
+                            d_neg12=None,
+                            d_neg11=None,
+                            d_neg10=None,
+                            d_neg9=None,
+                            d_neg8=None,
+                            d_neg7=None,
+                            d_neg6=None,
+                            d_neg5=None,
+                            d_neg4=None,
+                            d_neg3=None,
+                            d_neg2=None,
+                            d_neg1=None,
+                            d_0=None,
+                            d_pos1=None,
+                            d_pos2=None,
+                            d_pos3=None,
+                            d_pos4=None,
+                            d_pos5=None,
+                            d_pos6=None,
+                            d_pos7=None,
+                            d_pos8=None,
+                            d_pos9=None,
+                            d_pos10=None,
+                            d_pos11=None,
+                            d_pos12=None,
+                            d_pos13=None,
+                            d_pos14=None,
+                            day_offset_performance=None,
+                            day_offset_price_trend=None,
+                            day_offset_target_dates=None,
+                            is_blurred=True,
+                        ))
+                        continue
+
+                    # Helper function to extract day offset values from txn_price_trend JSONB
+                    def get_day_value(day_offset: int, value_mode: str) -> Optional[float]:
+                        """Extract performance.close or price_trend.close for day offset from txn_price_trend JSONB."""
                         # Map offset to column name
-                        if day_offset < 0:
+                        if day_offset == 0:
+                            col_name = "d_0"
+                        elif day_offset < 0:
                             col_name = f"d_neg{abs(day_offset)}"
                         else:
                             col_name = f"d_pos{day_offset}"
@@ -864,9 +1019,19 @@ async def get_trades(
                             else:
                                 return None
 
-                            # Extract performance.close
-                            performance = data_obj.get('performance', {})
-                            close_value = performance.get('close')
+                            if not isinstance(data_obj, dict):
+                                return None
+
+                            if value_mode == "price_trend":
+                                price_trend = data_obj.get('price_trend')
+                                if not isinstance(price_trend, dict):
+                                    return None
+                                close_value = price_trend.get('close')
+                            else:
+                                performance = data_obj.get('performance')
+                                if not isinstance(performance, dict):
+                                    return None
+                                close_value = performance.get('close')
                             if close_value is not None:
                                 return float(close_value)
                         except (json.JSONDecodeError, TypeError, ValueError):
@@ -875,11 +1040,63 @@ async def get_trades(
                         return None
 
                     # Extract all day offsets (D-14 to D14, excluding D0)
-                    day_values = {}
+                    performance_day_values = {}
+                    price_trend_day_values = {}
+                    display_day_values = {}
+                    for offset in range(-14, 15):
+                        performance_day_values[offset] = get_day_value(offset, "performance")
+                        price_trend_day_values[offset] = get_day_value(offset, "price_trend")
+                        if day_offset_mode == "price_trend":
+                            display_day_values[offset] = price_trend_day_values[offset]
+                        else:
+                            display_day_values[offset] = performance_day_values[offset]
+
+                    def build_day_offset_map(day_values: Dict[int, Optional[float]]) -> Dict[str, Optional[float]]:
+                        result = {}
+                        for offset in range(-14, 15):
+                            if offset == 0:
+                                key = "d_0"
+                            else:
+                                key = f"d_neg{abs(offset)}" if offset < 0 else f"d_pos{offset}"
+                            result[key] = day_values.get(offset)
+                        return result
+
+                    def get_day_target_date(day_offset: int) -> Optional[str]:
+                        if day_offset < 0:
+                            col_name = f"d_neg{abs(day_offset)}"
+                        else:
+                            col_name = f"d_pos{day_offset}"
+
+                        raw_data = row.get(col_name)
+                        if not raw_data:
+                            return None
+
+                        try:
+                            if isinstance(raw_data, str):
+                                data_obj = json.loads(raw_data)
+                            elif isinstance(raw_data, dict):
+                                data_obj = raw_data
+                            else:
+                                return None
+
+                            if not isinstance(data_obj, dict):
+                                return None
+
+                            target_date = data_obj.get('targetDate')
+                            if isinstance(target_date, str) and target_date:
+                                return target_date
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+
+                        return None
+
+                    target_dates = {}
                     for offset in range(-14, 15):
                         if offset == 0:
-                            continue
-                        day_values[offset] = get_day_value(offset)
+                            key = "d_0"
+                        else:
+                            key = f"d_neg{abs(offset)}" if offset < 0 else f"d_pos{offset}"
+                        target_dates[key] = get_day_target_date(offset)
 
                     # Calculate WTS: day offset with maximum return
                     # For trades, use position to determine multiplier
@@ -896,7 +1113,9 @@ async def get_trades(
                     if position_multiplier != 0:
                         max_return = None
                         max_offset = None
-                        for offset, value in day_values.items():
+                        for offset, value in performance_day_values.items():
+                            if offset == 0:
+                                continue
                             if value is not None:
                                 adjusted_return = value * position_multiplier
                                 if max_return is None or adjusted_return > max_return:
@@ -916,34 +1135,39 @@ async def get_trades(
                         notes=row["notes"],
                         wts=wts,
                         # Day offset values
-                        d_neg14=day_values.get(-14),
-                        d_neg13=day_values.get(-13),
-                        d_neg12=day_values.get(-12),
-                        d_neg11=day_values.get(-11),
-                        d_neg10=day_values.get(-10),
-                        d_neg9=day_values.get(-9),
-                        d_neg8=day_values.get(-8),
-                        d_neg7=day_values.get(-7),
-                        d_neg6=day_values.get(-6),
-                        d_neg5=day_values.get(-5),
-                        d_neg4=day_values.get(-4),
-                        d_neg3=day_values.get(-3),
-                        d_neg2=day_values.get(-2),
-                        d_neg1=day_values.get(-1),
-                        d_pos1=day_values.get(1),
-                        d_pos2=day_values.get(2),
-                        d_pos3=day_values.get(3),
-                        d_pos4=day_values.get(4),
-                        d_pos5=day_values.get(5),
-                        d_pos6=day_values.get(6),
-                        d_pos7=day_values.get(7),
-                        d_pos8=day_values.get(8),
-                        d_pos9=day_values.get(9),
-                        d_pos10=day_values.get(10),
-                        d_pos11=day_values.get(11),
-                        d_pos12=day_values.get(12),
-                        d_pos13=day_values.get(13),
-                        d_pos14=day_values.get(14),
+                        d_neg14=display_day_values.get(-14),
+                        d_neg13=display_day_values.get(-13),
+                        d_neg12=display_day_values.get(-12),
+                        d_neg11=display_day_values.get(-11),
+                        d_neg10=display_day_values.get(-10),
+                        d_neg9=display_day_values.get(-9),
+                        d_neg8=display_day_values.get(-8),
+                        d_neg7=display_day_values.get(-7),
+                        d_neg6=display_day_values.get(-6),
+                        d_neg5=display_day_values.get(-5),
+                        d_neg4=display_day_values.get(-4),
+                        d_neg3=display_day_values.get(-3),
+                        d_neg2=display_day_values.get(-2),
+                        d_neg1=display_day_values.get(-1),
+                        d_0=display_day_values.get(0),
+                        d_pos1=display_day_values.get(1),
+                        d_pos2=display_day_values.get(2),
+                        d_pos3=display_day_values.get(3),
+                        d_pos4=display_day_values.get(4),
+                        d_pos5=display_day_values.get(5),
+                        d_pos6=display_day_values.get(6),
+                        d_pos7=display_day_values.get(7),
+                        d_pos8=display_day_values.get(8),
+                        d_pos9=display_day_values.get(9),
+                        d_pos10=display_day_values.get(10),
+                        d_pos11=display_day_values.get(11),
+                        d_pos12=display_day_values.get(12),
+                        d_pos13=display_day_values.get(13),
+                        d_pos14=display_day_values.get(14),
+                        day_offset_performance=build_day_offset_map(performance_day_values),
+                        day_offset_price_trend=build_day_offset_map(price_trend_day_values),
+                        day_offset_target_dates=target_dates,
+                        is_blurred=False,
                     )
                     data.append(row_data)
                 except Exception as e:
@@ -980,7 +1204,10 @@ async def get_trades(
 
 
 @router.post("/bulkUpdate", response_model=BulkUpdateResponse)
-async def bulk_update_events(request: BulkUpdateRequest = Body(...)):
+async def bulk_update_events(
+    request: BulkUpdateRequest = Body(...),
+    user: UserContext = Depends(require_admin),
+):
     """
     Bulk update events.
 

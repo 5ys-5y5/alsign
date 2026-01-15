@@ -8,6 +8,7 @@
 import React, { useState, useEffect } from 'react';
 import DataTable from '../table/DataTable';
 import { getTxnEventsState, setTxnEventsState } from '../../services/localStorage';
+import { getAuthHeaders } from '../../services/api';
 
 /**
  * Column catalog for txn_events (Events)
@@ -55,7 +56,7 @@ const EVENTS_COLUMNS = [
   // WTS column
   { key: 'wts', label: 'WTS', type: 'number', width: 80, isDefault: true },
 
-  // Day offset columns (D-14 to D14, excluding D0)
+  // Day offset columns (D-14 to D14, including D0)
   { key: 'd_neg14', label: 'D-14', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_neg13', label: 'D-13', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_neg12', label: 'D-12', type: 'dayoffset', width: 90, isDefault: true },
@@ -70,6 +71,7 @@ const EVENTS_COLUMNS = [
   { key: 'd_neg3', label: 'D-3', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_neg2', label: 'D-2', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_neg1', label: 'D-1', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_0', label: 'D0', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_pos1', label: 'D1', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_pos2', label: 'D2', type: 'dayoffset', width: 90, isDefault: true },
   { key: 'd_pos3', label: 'D3', type: 'dayoffset', width: 90, isDefault: true },
@@ -221,7 +223,7 @@ export default function EventsTable({
     try {
       const response = await fetch(`${API_BASE_URL}/dashboard/bulkUpdate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           event_ids: Array.from(selectedRowIds),
           field: bulkEditField,

@@ -17,7 +17,11 @@ import SortHeader from './SortHeader';
  * @param {Object} column - Column configuration
  * @returns {JSX.Element|string} Rendered cell content
  */
-function renderCellValue(value, column) {
+function renderCellValue(value, column, row, dayOffsetMode) {
+  if (row?.is_blurred) {
+    return <span className="cell-locked">Locked</span>;
+  }
+
   // Handle null/undefined
   if (value === null || value === undefined || value === '') {
     return <span className="cell-null">-</span>;
@@ -52,10 +56,44 @@ function renderCellValue(value, column) {
 
   // Handle day offset columns (D-14 to D14)
   if (column.type === 'dayoffset') {
+    const arrowUp = '▲';
+    const arrowDown = '▼';
     const numValue = Number(value);
-    const percentage = (numValue * 100).toFixed(2);
-    const arrow = numValue > 0 ? '▲' : numValue < 0 ? '▼' : '';
-    const colorClass = numValue > 0 ? 'text-red' : numValue < 0 ? 'text-blue' : '';
+    if (!Number.isFinite(numValue)) {
+      return <span className="cell-null">-</span>;
+    }
+
+    if (dayOffsetMode === 'price_trend') {
+      const displayValue = numValue;
+      const baseValueRaw = Number(row?.d_neg14);
+      const baseValue = Number.isFinite(baseValueRaw) ? baseValueRaw : null;
+      const hasBase = Number.isFinite(baseValue);
+      const isBaseColumn = column.key === 'd_neg14';
+
+      let arrow = '';
+      let colorClass = '';
+      if (hasBase && !isBaseColumn) {
+        if (displayValue > baseValue) {
+          arrow = arrowUp;
+          colorClass = 'text-red';
+        } else if (displayValue < baseValue) {
+          arrow = arrowDown;
+          colorClass = 'text-blue';
+        }
+      }
+
+      return (
+        <span className={colorClass}>
+          {arrow} {displayValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+        </span>
+      );
+    }
+    const position = row?.position ? String(row.position).toLowerCase() : '';
+    const positionMultiplier = position === 'short' ? -1 : 1;
+    const displayValue = numValue * positionMultiplier;
+    const percentage = (displayValue * 100).toFixed(2);
+    const arrow = displayValue > 0 ? arrowUp : displayValue < 0 ? arrowDown : '';
+    const colorClass = displayValue > 0 ? 'text-red' : displayValue < 0 ? 'text-blue' : '';
     return (
       <span className={colorClass}>
         {arrow} {percentage}%
@@ -85,6 +123,64 @@ function renderCellValue(value, column) {
 
   // Default: render as string
   return String(value);
+}
+
+function formatNumber(value) {
+  if (!Number.isFinite(value)) {
+    return '-';
+  }
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function getDayOffsetTooltipContent(row, column, dayOffsetMode) {
+  if (!row || row.is_blurred) {
+    return null;
+  }
+
+  const targetDates = row.day_offset_target_dates;
+  const targetDate = targetDates ? targetDates[column.key] : null;
+  const targetLine = targetDate ? `기준일: ${targetDate}` : null;
+
+  if (dayOffsetMode === 'performance') {
+    const priceTrendMap = row.day_offset_price_trend;
+    if (!priceTrendMap) {
+      return null;
+    }
+    const baseValue = Number(priceTrendMap.d_neg14);
+    const currentValue = Number(priceTrendMap[column.key]);
+    const baseLabel = 'D-14';
+    const currentLabel = column.label || column.key;
+    const lines = [];
+    if (targetLine) {
+      lines.push(targetLine);
+      lines.push('');
+    }
+    if (column.key !== 'd_neg14') {
+      lines.push(`${currentLabel} N: ${formatNumber(currentValue)}`);
+    }
+    lines.push(`${baseLabel} N: ${formatNumber(baseValue)}`);
+    return lines.join('\n');
+  }
+
+  const performanceMap = row.day_offset_performance;
+  if (!performanceMap) {
+    return null;
+  }
+  const rawValue = Number(performanceMap[column.key]);
+  if (!Number.isFinite(rawValue)) {
+    return null;
+  }
+  const position = row?.position ? String(row.position).toLowerCase() : '';
+  const positionMultiplier = position === 'short' ? -1 : 1;
+  const displayValue = rawValue * positionMultiplier;
+  const label = column.label || column.key;
+  const lines = [];
+  if (targetLine) {
+    lines.push(targetLine);
+    lines.push('');
+  }
+  lines.push(`${label} %: ${(displayValue * 100).toFixed(2)}%`);
+  return lines.join('\n');
 }
 
 /**
@@ -241,12 +337,15 @@ export default function DataTable({
   enableServerSideSort = false,
   enableServerSideFilter = false,
   onSelectionChange,
+  getRowClassName,
+  dayOffsetMode = 'performance',
 }) {
   // Track expanded rows
   const [expandedRows, setExpandedRows] = useState(new Set());
 
   // Track selected rows (for checkboxes)
   const [selectedRows, setSelectedRows] = useState(new Set());
+  const [hoverTooltip, setHoverTooltip] = useState({ visible: false, x: 0, y: 0, content: '' });
 
   // Notify parent when selection changes
   useEffect(() => {
@@ -336,6 +435,28 @@ export default function DataTable({
     }
   };
 
+  const handleDayOffsetMove = (event, row, column) => {
+    const content = getDayOffsetTooltipContent(row, column, dayOffsetMode);
+    if (!content) {
+      if (hoverTooltip.visible) {
+        setHoverTooltip((prev) => ({ ...prev, visible: false }));
+      }
+      return;
+    }
+    setHoverTooltip({
+      visible: true,
+      x: event.clientX + 12,
+      y: event.clientY + 12,
+      content,
+    });
+  };
+
+  const handleDayOffsetLeave = () => {
+    if (hoverTooltip.visible) {
+      setHoverTooltip((prev) => ({ ...prev, visible: false }));
+    }
+  };
+
   // Calculate footer statistics
   const calculateFooterStats = (columnKey, column) => {
     if (!enableFooterStats) return null;
@@ -397,7 +518,24 @@ export default function DataTable({
       default:
         // For day offset columns (d_neg14 ~ d_pos14), show average
         if (column.type === 'dayoffset') {
-          const avg = values.reduce((sum, v) => sum + Number(v), 0) / values.length;
+          if (dayOffsetMode !== 'performance') {
+            return '-';
+          }
+          const adjustedValues = processedData
+            .map((row) => {
+              const rawValue = Number(row[columnKey]);
+              if (!Number.isFinite(rawValue)) {
+                return null;
+              }
+              const position = row?.position ? String(row.position).toLowerCase() : '';
+              const positionMultiplier = position === 'short' ? -1 : 1;
+              return rawValue * positionMultiplier;
+            })
+            .filter((v) => v !== null);
+          if (adjustedValues.length === 0) {
+            return '-';
+          }
+          const avg = adjustedValues.reduce((sum, v) => sum + v, 0) / adjustedValues.length;
           return `avg: ${(avg * 100).toFixed(2)}%`;
         }
         return '-';
@@ -476,11 +614,13 @@ export default function DataTable({
                   processedData.map((row, rowIndex) => {
                   const isExpanded = expandedRows.has(row.id);
                   const isSelected = selectedRows.has(row.id);
+                  const rowClassName = getRowClassName ? getRowClassName(row) : '';
 
                   return (
                     <React.Fragment key={row.id || rowIndex}>
                       <tr
                         onClick={() => enableRowExpand && toggleRowExpand(row.id)}
+                        className={rowClassName}
                         style={{ cursor: enableRowExpand ? 'pointer' : 'default' }}
                       >
                         {enableCheckboxes && (
@@ -499,12 +639,21 @@ export default function DataTable({
                               width: column.width ? `${column.width}px` : 'auto',
                             }}
                           >
-                            {renderCellValue(row[column.key], column)}
+                            {column.type === 'dayoffset' ? (
+                              <span
+                                onMouseMove={(event) => handleDayOffsetMove(event, row, column)}
+                                onMouseLeave={handleDayOffsetLeave}
+                              >
+                                {renderCellValue(row[column.key], column, row, dayOffsetMode)}
+                              </span>
+                            ) : (
+                              renderCellValue(row[column.key], column, row, dayOffsetMode)
+                            )}
                           </td>
                         ))}
                       </tr>
                       {isExpanded && (
-                        <tr className="expanded-row">
+                        <tr className={`expanded-row ${rowClassName}`}>
                           <td colSpan={visibleColumns.length + (enableCheckboxes ? 1 : 0)}>
                             <div style={{ padding: 'var(--space-3)', backgroundColor: 'var(--surface)' }}>
                               <h4 style={{ marginBottom: 'var(--space-2)', fontWeight: 'var(--font-semibold)' }}>
@@ -513,7 +662,7 @@ export default function DataTable({
                               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--space-2)' }}>
                                 {columns.map((column) => (
                                   <div key={column.key} style={{ fontSize: 'var(--text-sm)' }}>
-                                    <strong>{column.label}:</strong> {renderCellValue(row[column.key], column)}
+                                    <strong>{column.label}:</strong> {renderCellValue(row[column.key], column, row, dayOffsetMode)}
                                   </div>
                                 ))}
                               </div>
@@ -548,6 +697,27 @@ export default function DataTable({
           </div>
         )}
       </div>
+      {hoverTooltip.visible && (
+        <div
+          style={{
+            position: 'fixed',
+            left: hoverTooltip.x,
+            top: hoverTooltip.y,
+            backgroundColor: 'white',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--rounded-lg)',
+            padding: 'var(--space-2)',
+            fontSize: 'var(--text-sm)',
+            color: 'var(--text)',
+            boxShadow: 'var(--shadow-md)',
+            pointerEvents: 'none',
+            whiteSpace: 'pre',
+            zIndex: 1000,
+          }}
+        >
+          {hoverTooltip.content}
+        </div>
+      )}
     </div>
   );
 }

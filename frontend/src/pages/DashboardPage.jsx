@@ -8,9 +8,8 @@
 import React, { useState, useEffect } from 'react';
 import KPICard from '../components/dashboard/KPICard';
 import EventsTable from '../components/dashboard/EventsTable';
-import TradesTable from '../components/dashboard/TradesTable';
 
-import { API_BASE_URL } from '../services/api';
+import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
 /**
  * Format date string for display.
@@ -50,16 +49,6 @@ export default function DashboardPage() {
   const [eventsFilters, setEventsFilters] = useState({});
   const [eventsRefreshTrigger, setEventsRefreshTrigger] = useState(0);
 
-  // Trades state
-  const [tradesData, setTradesData] = useState([]);
-  const [tradesTotal, setTradesTotal] = useState(0);
-  const [tradesPage, setTradesPage] = useState(1);
-  const [tradesPageSize, setTradesPageSize] = useState(50);
-  const [tradesLoading, setTradesLoading] = useState(true);
-  const [tradesError, setTradesError] = useState(null);
-  const [tradesSortConfig, setTradesSortConfig] = useState({ key: null, direction: null });
-  const [tradesFilters, setTradesFilters] = useState({});
-  const [tradesRefreshTrigger, setTradesRefreshTrigger] = useState(0);
 
   // Fetch KPIs
   useEffect(() => {
@@ -67,7 +56,9 @@ export default function DashboardPage() {
       try {
         setKpisLoading(true);
         setKpisError(null);
-        const response = await fetch(`${API_BASE_URL}/dashboard/kpis`);
+        const response = await fetch(`${API_BASE_URL}/dashboard/kpis`, {
+          headers: await getAuthHeaders(),
+        });
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
           const errorMessage = errorData.detail || errorData.error?.message || `HTTP ${response.status}`;
@@ -181,7 +172,8 @@ export default function DashboardPage() {
         }
 
         const response = await fetch(
-          `${API_BASE_URL}/dashboard/events?${params.toString()}`
+          `${API_BASE_URL}/dashboard/events?${params.toString()}`,
+          { headers: await getAuthHeaders() }
         );
         if (!response.ok) {
           const errorData = await response.json().catch(() => ({}));
@@ -207,71 +199,6 @@ export default function DashboardPage() {
     fetchEvents();
   }, [eventsPage, eventsPageSize, eventsSortConfig, eventsFilters, eventsRefreshTrigger]);
 
-  // Fetch trades
-  useEffect(() => {
-    async function fetchTrades() {
-      try {
-        setTradesLoading(true);
-        setTradesError(null);
-
-        // Build query parameters
-        const params = new URLSearchParams({
-          page: tradesPage.toString(),
-          pageSize: tradesPageSize.toString(),
-        });
-
-        // Add sort parameters if sorting is active
-        if (tradesSortConfig.key && tradesSortConfig.direction) {
-          params.append('sortBy', tradesSortConfig.key);
-          params.append('sortOrder', tradesSortConfig.direction);
-        }
-
-        // Add filter parameters
-        if (tradesFilters.ticker) {
-          params.append('ticker', tradesFilters.ticker);
-        }
-        if (tradesFilters.model) {
-          params.append('model', tradesFilters.model);
-        }
-        if (tradesFilters.source) {
-          params.append('source', tradesFilters.source);
-        }
-        if (tradesFilters.position) {
-          params.append('position', tradesFilters.position);
-        }
-        if (tradesFilters.tradeDateFrom) {
-          params.append('tradeDateFrom', tradesFilters.tradeDateFrom);
-        }
-        if (tradesFilters.tradeDateTo) {
-          params.append('tradeDateTo', tradesFilters.tradeDateTo);
-        }
-
-        const response = await fetch(
-          `${API_BASE_URL}/dashboard/trades?${params.toString()}`
-        );
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          const errorMessage = errorData.detail || errorData.error?.message || `HTTP ${response.status}`;
-          throw new Error(errorMessage);
-        }
-        const result = await response.json();
-        setTradesData(result.data);
-        setTradesTotal(result.total);
-
-        // Warn if no data found
-        if (result.data.length === 0 || result.total === 0) {
-          setTradesError('No trades in database. To populate data: use POST /trades to insert trade records.');
-        }
-      } catch (error) {
-        console.error('Failed to fetch trades:', error);
-        setTradesError(error.message || 'Failed to connect to backend. Please ensure the backend server is running on port 8000.');
-      } finally {
-        setTradesLoading(false);
-      }
-    }
-
-    fetchTrades();
-  }, [tradesPage, tradesPageSize, tradesSortConfig, tradesFilters, tradesRefreshTrigger]);
 
 
   return (
@@ -347,38 +274,6 @@ export default function DashboardPage() {
         )}
       </section>
 
-      {/* Trades Section */}
-      <section style={{ marginBottom: 'var(--space-5)' }}>
-        {tradesError ? (
-          <div className="alert alert-error">
-            Error loading trades: {tradesError}
-          </div>
-        ) : (
-          <TradesTable
-            data={tradesData}
-            loading={tradesLoading}
-            total={tradesTotal}
-            page={tradesPage}
-            pageSize={tradesPageSize}
-            onPageChange={setTradesPage}
-            onPageSizeChange={(newSize) => {
-              setTradesPageSize(newSize);
-              setTradesPage(1); // Reset to first page
-            }}
-            sortConfig={tradesSortConfig}
-            onSortChange={(newSortConfig) => {
-              setTradesSortConfig(newSortConfig);
-              setTradesPage(1); // Reset to first page when sorting changes
-            }}
-            filters={tradesFilters}
-            onFiltersChange={(newFilters) => {
-              setTradesFilters(newFilters);
-              setTradesPage(1); // Reset to first page when filters change
-            }}
-            onRefresh={() => setTradesRefreshTrigger(prev => prev + 1)}
-          />
-        )}
-      </section>
     </>
   );
 }

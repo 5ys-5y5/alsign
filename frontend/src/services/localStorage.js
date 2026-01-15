@@ -189,3 +189,37 @@ export function setDayOffsetState(state) {
     setSort('ui.dayoffset_sort', state.sort);
   }
 }
+
+/**
+ * Get persisted state for trades table.
+ *
+ * @returns {Object} { selectedColumns, filters, sort }
+ */
+export function getTradesState() {
+  return {
+    selectedColumns: getSelectedColumns('ui.trades_columns', null),
+    filters: getFilters('ui.trades_filters', {}),
+    sort: getSort('ui.trades_sort', { key: null, direction: null }),
+    dayOffsetMode: getItem('ui.trades_day_offset_mode', 'performance'),
+  };
+}
+
+/**
+ * Set persisted state for trades table.
+ *
+ * @param {Object} state - { selectedColumns?, filters?, sort? }
+ */
+export function setTradesState(state) {
+  if (state.selectedColumns !== undefined) {
+    setSelectedColumns('ui.trades_columns', state.selectedColumns);
+  }
+  if (state.filters !== undefined) {
+    setFilters('ui.trades_filters', state.filters);
+  }
+  if (state.sort !== undefined) {
+    setSort('ui.trades_sort', state.sort);
+  }
+  if (state.dayOffsetMode !== undefined) {
+    setItem('ui.trades_day_offset_mode', state.dayOffsetMode);
+  }
+}

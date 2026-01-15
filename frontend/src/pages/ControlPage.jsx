@@ -7,7 +7,7 @@
 
 import React, { useState, useEffect } from 'react';
 
-import { API_BASE_URL } from '../services/api';
+import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
 /**
  * APIServicePanel - Environment & API configuration panel.
@@ -29,7 +29,9 @@ function APIServicePanel() {
     try {
       setLoading(true);
       setError(null);
-      const response = await fetch(`${API_BASE_URL}/control/apiServices`);
+      const response = await fetch(`${API_BASE_URL}/control/apiServices`, {
+        headers: await getAuthHeaders(),
+      });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -69,7 +71,7 @@ function APIServicePanel() {
       setSaveStatus('saving');
       const response = await fetch(`${API_BASE_URL}/control/apiServices/${serviceName}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           apiKey: editValues.apiKey || null,
           usagePerMin: editValues.usagePerMin ? parseInt(editValues.usagePerMin) : null,
@@ -271,7 +273,9 @@ function TimebasePanel() {
     try {
       setLoading(true);
       setError(null);
-      const response = await fetch(`${API_BASE_URL}/control/runtime`);
+      const response = await fetch(`${API_BASE_URL}/control/runtime`, {
+        headers: await getAuthHeaders(),
+      });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -408,7 +412,9 @@ export default function ControlPage() {
       try {
         setApiListLoading(true);
         setApiListError(null);
-        const response = await fetch(`${API_BASE_URL}/control/apiList`);
+        const response = await fetch(`${API_BASE_URL}/control/apiList`, {
+          headers: await getAuthHeaders(),
+        });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         setApiList(data);
@@ -427,7 +433,9 @@ export default function ControlPage() {
       try {
         setMetricsLoading(true);
         setMetricsError(null);
-        const response = await fetch(`${API_BASE_URL}/control/metrics`);
+        const response = await fetch(`${API_BASE_URL}/control/metrics`, {
+          headers: await getAuthHeaders(),
+        });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         setMetrics(data);
@@ -446,7 +454,9 @@ export default function ControlPage() {
       try {
         setTransformsLoading(true);
         setTransformsError(null);
-        const response = await fetch(`${API_BASE_URL}/control/metricTransforms`);
+        const response = await fetch(`${API_BASE_URL}/control/metricTransforms`, {
+          headers: await getAuthHeaders(),
+        });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         setTransforms(data);

@@ -9,7 +9,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 
-import { API_BASE_URL } from '../services/api';
+import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
 /**
  * Endpoint Flow Definitions
@@ -223,7 +223,7 @@ const ENDPOINT_FLOWS = {
   getQuantitatives: {
     id: 'getQuantitatives',
     title: 'POST /getQuantitatives',
-    description: 'config_lv3_targets의 ticker + peer를 모아 재무/가격 API를 호출하고 config_lv3_quantitatives에 JSONB로 저장',
+    description: 'config_lv3_targets의 ticker + peer를 모아 8개 재무/가격 API를 호출하고 config_lv3_quantitatives에 JSONB로 저장 (ratios, key-metrics, cash-flow, balance-sheet, market-cap, price, income, quote)',
     parameters: [
       {
         name: 'overwrite',
@@ -341,6 +341,13 @@ const ENDPOINT_FLOWS = {
             configKey: 'quantitatives.cash_flow_statement'
           },
           {
+            id: 'balance_sheet',
+            title: 'Balance Sheet Statement',
+            apiId: 'fmp-balance-sheet-statement',
+            requiredKeys: ['date', 'totalAssets', 'totalLiabilities'],
+            configKey: 'quantitatives.balance_sheet_statement'
+          },
+          {
             id: 'key_metrics',
             title: 'Key Metrics',
             apiId: 'fmp-key-metrics',
@@ -367,6 +374,13 @@ const ENDPOINT_FLOWS = {
             apiId: 'fmp-historical-price-eod-full',
             requiredKeys: ['date', 'open', 'high', 'low', 'close'],
             configKey: 'quantitatives.historical_price'
+          },
+          {
+            id: 'quote',
+            title: 'Quote (Realtime)',
+            apiId: 'fmp-quote',
+            requiredKeys: ['symbol', 'price', 'changesPercentage'],
+            configKey: 'quantitatives.quote'
           }
         ]
       },
@@ -388,10 +402,12 @@ const ENDPOINT_FLOWS = {
       'status (API별 minDate/maxDate)',
       'income_statement (JSONB)',
       'cash_flow_statement (JSONB)',
+      'balance_sheet_statement (JSONB)',
       'key_metrics (JSONB)',
       'financial_ratios (JSONB)',
       'historical_price (JSONB)',
-      'historical_market_cap (JSONB)'
+      'historical_market_cap (JSONB)',
+      'quote (JSONB)'
     ]
   },
 
@@ -643,6 +659,21 @@ const ENDPOINT_FLOWS = {
         description: '소스 테이블 필터 (쉼표 구분: "txn_events,txn_trades"). 미지정 시 둘 다 처리'
       },
       {
+        name: 'startPoint',
+        type: 'string',
+        required: false,
+        description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: "MSFT"부터 처리'
+      },
+      {
+        name: 'batch_size',
+        type: 'number',
+        required: false,
+        default: 'None',
+        min: 1,
+        max: 2000,
+        description: '배치 처리: unique ticker를 청크 단위로 처리 (1-2000). 예: 500 = 500개 ticker 처리 후 다음 500개. Supabase 무료 플랜 기준 200-1000 권장.'
+      },
+      {
         name: 'max_workers',
         type: 'number',
         required: false,
@@ -753,16 +784,16 @@ const ENDPOINT_FLOWS = {
       {
         id: 'calc_performance',
         title: '10. 성과(Performance) 계산',
-        description: 'D0(event_date) close 대비 각 dayOffset의 수익률',
+        description: 'D-14 close 대비 각 dayOffset의 수익률',
         apiId: null,
-        note: 'performance = (close - d0_close) / d0_close'
+        note: 'performance = (close - d_neg14_close) / d_neg14_close'
       },
       {
         id: 'build_jsonb',
         title: '11. JSONB 컬럼 생성',
         description: '29개 컬럼 생성 (d_neg_14 ~ d_pos_14)',
         apiId: null,
-        note: '각 컬럼: {targetDate, price_trend{ohlc}, dayOffset0{close}, performance{close}}'
+        note: '각 컬럼: {targetDate, price_trend{ohlc}, dayOffsetNeg14{close: d_neg14_close}, performance{close}}'
       },
       {
         id: 'batch_upsert',
@@ -777,14 +808,14 @@ const ENDPOINT_FLOWS = {
       'd_neg_14 ~ d_neg_1 (14 JSONB columns)',
       'd_0 (JSONB column)',
       'd_pos_1 ~ d_pos_14 (14 JSONB columns)',
-      '각 JSONB: {targetDate, price_trend{low,high,open,close}, dayOffset0{close}, performance{close}}'
+      '각 JSONB: {targetDate, price_trend{low,high,open,close}, dayOffsetNeg14{close: d_neg14_close}, performance{close}}'
     ]
   },
   trades: {
     id: 'trades',
     title: 'POST /trades',
-    description: 'txn_trades 테이블에 실제 거래 기록 벌크 삽입 (성과 추적용)',
-    performanceNote: 'Unique key: (ticker, trade_date, model). 중복 시 UPSERT로 기존 레코드 업데이트',
+    description: 'txn_trades 테이블에 실제 거래 기록을 벌크 삽입 (중복 키는 건너뜀)',
+    performanceNote: 'Unique key: (ticker, trade_date, model). 중복 키는 삽입하지 않고 실패 목록으로 보고',
     bodyStructure: {
       description: 'JSON 배열로 여러 거래 기록을 한번에 삽입',
       example: {
@@ -821,10 +852,10 @@ const ENDPOINT_FLOWS = {
         description: 'Pydantic 모델로 거래 데이터 검증 (source: consensus/earning, position: long/short/neutral)'
       },
       {
-        id: 'bulk_upsert',
-        title: '2. 벌크 UPSERT',
-        description: 'PostgreSQL UNNEST 패턴 사용, ON CONFLICT (ticker, trade_date, model) DO UPDATE',
-        note: '중복 키 발생 시 source, position, prices, quantity, notes 업데이트'
+        id: 'bulk_insert',
+        title: '2. 벌크 INSERT',
+        description: 'PostgreSQL UNNEST 패턴 사용, ON CONFLICT (ticker, trade_date, model) DO NOTHING',
+        note: '이미 존재하는 키는 삽입하지 않고 실패 목록으로 보고'
       }
     ],
     integration: [
@@ -835,7 +866,7 @@ const ENDPOINT_FLOWS = {
       }
     ],
     outputs: [
-      'txn_trades 테이블에 레코드 삽입/업데이트',
+      'txn_trades 테이블에 레코드 삽입',
       'Primary key: (ticker, trade_date, model)',
       'Indexes: ticker, trade_date, model, (ticker, trade_date)'
     ]
@@ -1748,7 +1779,9 @@ export default function SetRequestsPage() {
   const fetchApiList = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await fetch(`${API_BASE_URL}/control/apiList`);
+      const response = await fetch(`${API_BASE_URL}/control/apiList`, {
+        headers: await getAuthHeaders(),
+      });
       if (!response.ok) throw new Error('Failed to fetch API list');
       const data = await response.json();
       setApiList(data);
