@@ -121,3 +121,4 @@ async def require_admin(request: Request) -> UserContext:
     if not await _is_profile_admin(user.user_id):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+

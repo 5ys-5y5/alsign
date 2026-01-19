@@ -13,7 +13,6 @@ const ENDPOINT_TIMEOUTS = {
   '/setEventsTable': 3600000,          // 60 minutes
   '/backfillEventsTable': 0,           // No timeout (can run for hours)
   '/getQuantitatives': 0,              // No timeout (can run for hours)
-  '/generatePriceTrends': 0,          // No timeout (can run for hours)
 };
 
 /**
@@ -424,8 +423,7 @@ function RequestForm({ title, method, path, queryFields, bodyFields, bodyExample
       (path === '/sourceData' && method === 'GET') ||
       (path === '/setEventsTable' && method === 'POST') ||
       (path === '/backfillEventsTable' && method === 'POST') ||
-      (path === '/getQuantitatives' && method === 'POST') ||
-      (path === '/generatePriceTrends' && method === 'POST');
+      (path === '/getQuantitatives' && method === 'POST');
 
     if (isStreaming) {
       // Use SSE for real-time streaming
@@ -438,8 +436,6 @@ function RequestForm({ title, method, path, queryFields, bodyFields, bodyExample
         streamUrl = `${API_BASE_URL}/backfillEventsTable/stream${queryString ? '?' + queryString : ''}`;
       } else if (path === '/getQuantitatives' && method === 'POST') {
         streamUrl = `${API_BASE_URL}/getQuantitatives/stream${queryString ? '?' + queryString : ''}`;
-      } else if (path === '/generatePriceTrends' && method === 'POST') {
-        streamUrl = `${API_BASE_URL}/generatePriceTrends/stream${queryString ? '?' + queryString : ''}`;
       }
       const eventSource = new EventSource(streamUrl);
       let requestId = null;
@@ -910,7 +906,6 @@ export default function RequestsPage() {
     { id: 'getQuantitatives', title: 'POST /getQuantitatives' },
     { id: 'setEventsTable', title: 'POST /setEventsTable' },
     { id: 'backfillEventsTable', title: 'POST /backfillEventsTable' },
-    { id: 'generatePriceTrends', title: 'POST /generatePriceTrends' },
     { id: 'trades', title: 'POST /trades' },
     { id: 'fillAnalyst', title: 'POST /fillAnalyst' }
   ];
@@ -1319,97 +1314,6 @@ export default function RequestsPage() {
               min: 1,
               max: 2000,
               description: 'BATCH PROCESSING: Processes unique tickers in chunks. Example: 500 = process 500 tickers per batch (equivalent to calling with grouped tickers). Maximum: 2,000 (Supabase free tier: 1GB RAM). Use 200-1000 to prevent memory exhaustion.',
-            },
-            {
-              key: 'max_workers',
-              type: 'number',
-              control: 'input',
-              placeholder: '20',
-              min: 1,
-              max: 100,
-              required: false,
-              description: '동시 실행 worker 수 (1-100). DB CPU 모니터링하며 조정. 낮음=안전/느림, 높음=빠름/부하',
-            },
-            { ...TIMEOUT_FIELD },
-          ]}
-          bodyFields={[
-            {
-              key: '__body__',
-              label: 'Request Body (JSON)',
-              type: 'json',
-              default: '{}',
-            }
-          ]}
-          onRequestStart={handleRequestStart}
-          onRequestComplete={handleRequestComplete}
-          onLog={handleLog}
-        />}
-
-        {/* POST /generatePriceTrends */}
-        {selectedEndpoint === 'generatePriceTrends' && <RequestForm
-          title="POST /generatePriceTrends"
-          method="POST"
-          path="/generatePriceTrends"
-          queryFields={[
-            {
-              key: 'overwrite',
-              type: 'boolean',
-              control: 'checkbox',
-              required: false,
-              description: 'If false, update only NULL values. If true, overwrite existing values.',
-            },
-            {
-              key: 'from',
-              label: 'From Date',
-              type: 'date',
-              control: 'input',
-              required: false,
-              placeholder: 'YYYY-MM-DD',
-            },
-            {
-              key: 'to',
-              label: 'To Date',
-              type: 'date',
-              control: 'input',
-              required: false,
-              placeholder: 'YYYY-MM-DD',
-            },
-            {
-              key: 'tickers',
-              label: 'Tickers (comma-separated)',
-              type: 'text',
-              control: 'input',
-              required: false,
-              placeholder: 'AAPL,MSFT,GOOGL or [AAPL,MSFT,GOOGL]',
-            },
-            {
-              key: 'table',
-              label: 'Table (comma-separated)',
-              type: 'text',
-              control: 'input',
-              required: false,
-              placeholder: 'txn_events,txn_trades',
-              description: '처리할 테이블 선택: txn_events, txn_trades. 미지정 시 둘 다 처리',
-            },
-            {
-              key: 'startPoint',
-              label: 'Start Point (ticker)',
-              type: 'text',
-              control: 'input',
-              required: false,
-              placeholder: 'MSFT',
-              description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: MSFT부터 처리',
-            },
-            {
-              key: 'batch_size',
-              label: 'Batch Size (1-2,000)',
-              type: 'number',
-              control: 'input',
-              required: false,
-              placeholder: '500',
-              min: 1,
-              max: 2000,
-              description: 'BATCH PROCESSING: Processes unique tickers in chunks. Example: 500 = process 500 tickers per batch. Maximum: 2,000 (Supabase free tier: 1GB RAM).',
             },
             {
               key: 'max_workers',

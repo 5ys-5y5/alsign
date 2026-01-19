@@ -10,6 +10,11 @@ from pydantic import BaseModel, Field
 from ..database.connection import db_pool
 from ..config import settings
 from ..utils.logging_utils import log_error, log_warning
+from ..services.best_window_policy import (
+    BEST_WINDOW_POLICY_ENDPOINT,
+    BEST_WINDOW_POLICY_FUNCTION,
+    merge_best_window_policy,
+)
 
 logger = logging.getLogger("alsign")
 
@@ -84,6 +89,20 @@ class MetricTransformItem(BaseModel):
     version: Optional[Union[str, int]]
     is_active: Optional[bool]
     created_at: Optional[str]
+
+
+class BestWindowPolicyResponse(BaseModel):
+    endpoint: str
+    function: str
+    description: Optional[str]
+    policy: Dict[str, Any]
+    isDefault: bool = False
+
+
+class BestWindowPolicyUpdate(BaseModel):
+    policy: Dict[str, Any] = Field(..., description="Best Window policy JSON")
+    description: Optional[str] = Field(None, description="Policy description")
+    endpoint: Optional[str] = Field(None, description="Policy endpoint override")
 
 
 # ===== ENDPOINTS =====
@@ -215,6 +234,97 @@ async def get_runtime_info():
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch runtime info: {str(e)}"
         )
+
+
+@router.get("/bestWindowPolicy", response_model=BestWindowPolicyResponse)
+async def get_best_window_policy():
+    try:
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT endpoint, function, description, policy
+                FROM config_lv0_policy
+                WHERE function = $1
+                """,
+                BEST_WINDOW_POLICY_FUNCTION,
+            )
+
+        if not row:
+            return BestWindowPolicyResponse(
+                endpoint=BEST_WINDOW_POLICY_ENDPOINT,
+                function=BEST_WINDOW_POLICY_FUNCTION,
+                description="Default (not stored in config_lv0_policy)",
+                policy=merge_best_window_policy(None),
+                isDefault=True,
+            )
+
+        policy_value = row["policy"]
+        if isinstance(policy_value, str):
+            try:
+                policy_value = json.loads(policy_value)
+            except json.JSONDecodeError:
+                policy_value = {}
+        elif policy_value is None:
+            policy_value = {}
+
+        return BestWindowPolicyResponse(
+            endpoint=row["endpoint"] or BEST_WINDOW_POLICY_ENDPOINT,
+            function=row["function"] or BEST_WINDOW_POLICY_FUNCTION,
+            description=row["description"],
+            policy=policy_value,
+            isDefault=False,
+        )
+
+    except Exception as e:
+        log_error(logger, "Failed to fetch Best Window policy", exception=e)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Best Window policy: {str(e)}")
+
+
+@router.put("/bestWindowPolicy", response_model=BestWindowPolicyResponse)
+async def update_best_window_policy(update: BestWindowPolicyUpdate):
+    try:
+        endpoint = update.endpoint or BEST_WINDOW_POLICY_ENDPOINT
+        policy_json = json.dumps(update.policy)
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO config_lv0_policy (endpoint, function, description, policy, created_at)
+                VALUES ($1, $2, $3, $4::jsonb, NOW())
+                ON CONFLICT (function)
+                DO UPDATE SET
+                    endpoint = EXCLUDED.endpoint,
+                    description = EXCLUDED.description,
+                    policy = EXCLUDED.policy
+                RETURNING endpoint, function, description, policy
+                """,
+                endpoint,
+                BEST_WINDOW_POLICY_FUNCTION,
+                update.description,
+                policy_json,
+            )
+
+        policy_value = row["policy"]
+        if isinstance(policy_value, str):
+            try:
+                policy_value = json.loads(policy_value)
+            except json.JSONDecodeError:
+                policy_value = {}
+        elif policy_value is None:
+            policy_value = {}
+
+        return BestWindowPolicyResponse(
+            endpoint=row["endpoint"] or BEST_WINDOW_POLICY_ENDPOINT,
+            function=row["function"] or BEST_WINDOW_POLICY_FUNCTION,
+            description=row["description"],
+            policy=policy_value,
+            isDefault=False,
+        )
+
+    except Exception as e:
+        log_error(logger, "Failed to update Best Window policy", exception=e)
+        raise HTTPException(status_code=500, detail=f"Failed to update Best Window policy: {str(e)}")
 
 
 @router.get("/apiList", response_model=List[APIListItem])

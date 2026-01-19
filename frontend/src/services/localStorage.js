@@ -262,6 +262,7 @@ export function getEventsSettings() {
     baseField: 'close',
     minThreshold: null,
     maxThreshold: null,
+    bestWindowMinConf: 95,
   });
 }
 
@@ -320,6 +321,7 @@ export function getEventsHistoryState() {
     selectedColumns: getSelectedColumns('ui.events_history_columns', null),
     filters: getFilters('ui.events_history_filters', {}),
     sort: getSort('ui.events_history_sort', { key: 'event_date', direction: 'desc' }),
+    dayOffsetMode: getItem('ui.events_history_day_offset_mode', 'performance_designated'),
   };
 }
 
@@ -337,6 +339,9 @@ export function setEventsHistoryState(state) {
   }
   if (state.sort !== undefined) {
     setSort('ui.events_history_sort', state.sort);
+  }
+  if (state.dayOffsetMode !== undefined) {
+    setItem('ui.events_history_day_offset_mode', state.dayOffsetMode);
   }
 }
 

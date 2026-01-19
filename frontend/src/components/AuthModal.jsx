@@ -22,7 +22,7 @@ export default function AuthModal({ isOpen, onClose, nextHash }) {
       if (nextHash && isAdmin) {
         window.location.hash = nextHash;
       } else if (!nextHash) {
-        window.location.hash = '#/trades';
+        window.location.hash = '#/events';
       }
       onClose();
     }

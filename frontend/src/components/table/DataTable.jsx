@@ -132,6 +132,47 @@ function formatNumber(value) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
+function parseDayOffsetKey(key) {
+  if (key === 'd_0') return 0;
+  if (key.startsWith('d_neg')) {
+    const raw = Number(key.replace('d_neg', ''));
+    return Number.isFinite(raw) ? -raw : null;
+  }
+  if (key.startsWith('d_pos')) {
+    const raw = Number(key.replace('d_pos', ''));
+    return Number.isFinite(raw) ? raw : null;
+  }
+  return null;
+}
+
+function buildDayOffsetKey(offset) {
+  if (offset === 0) return 'd_0';
+  if (offset > 0) return `d_pos${offset}`;
+  return `d_neg${Math.abs(offset)}`;
+}
+
+function isPerformanceMode(dayOffsetMode) {
+  return Boolean(dayOffsetMode) && String(dayOffsetMode).startsWith('performance');
+}
+
+function getPerformanceMap(row, dayOffsetMode) {
+  if (!row) return null;
+  if (dayOffsetMode === 'performance_previous') {
+    return row.day_offset_performance_previous || row.day_offset_performance || null;
+  }
+  return row.day_offset_performance || null;
+}
+
+function getDayOffsetValue(row, columnKey, dayOffsetMode) {
+  if (isPerformanceMode(dayOffsetMode)) {
+    const performanceMap = getPerformanceMap(row, dayOffsetMode);
+    if (performanceMap && Object.prototype.hasOwnProperty.call(performanceMap, columnKey)) {
+      return performanceMap[columnKey];
+    }
+  }
+  return row ? row[columnKey] : null;
+}
+
 function getDayOffsetTooltipContent(
   row,
   column,
@@ -161,7 +202,7 @@ function getDayOffsetTooltipContent(
   const ohlcMapKey = `day_offset_price_trend_${baseField}`;
   const ohlcMap = row[ohlcMapKey];
 
-  if (dayOffsetMode === 'performance') {
+  if (dayOffsetMode !== 'performance_previous' && isPerformanceMode(dayOffsetMode)) {
     // Get base price from the configured baseOffset and baseField
     const baseValue = ohlcMap ? Number(ohlcMap[baseDayKey]) : null;
     const baseDate = targetDates ? targetDates[baseDayKey] : null;
@@ -177,7 +218,7 @@ function getDayOffsetTooltipContent(
     const currentLow = lowMap ? Number(lowMap[column.key]) : null;
     const currentClose = closeMap ? Number(closeMap[column.key]) : null;
 
-    const performanceMap = row.day_offset_performance;
+    const performanceMap = getPerformanceMap(row, dayOffsetMode);
     const rawValue = performanceMap ? Number(performanceMap[column.key]) : null;
     const position = row?.position ? String(row.position).toLowerCase() : '';
     const positionMultiplier = position === 'short' ? -1 : 1;
@@ -196,7 +237,7 @@ function getDayOffsetTooltipContent(
     }
 
     const dimStyle = { color: '#d1d5db' };
-    const activeStyle = { fontWeight: 700, color: '#111827' };
+    const activeStyle = { color: '#111827' };
 
     return (
       <div>
@@ -231,7 +272,75 @@ function getDayOffsetTooltipContent(
     );
   }
 
-  const performanceMap = row.day_offset_performance;
+  if (dayOffsetMode === 'performance_previous') {
+    const performanceMap = getPerformanceMap(row, dayOffsetMode);
+    if (!performanceMap) {
+      return null;
+    }
+    const offset = parseDayOffsetKey(column.key);
+    const prevOffset = Number.isFinite(offset) ? offset - 1 : null;
+    const prevKey = Number.isFinite(prevOffset) ? buildDayOffsetKey(prevOffset) : null;
+    const prevClose = prevKey && row.day_offset_price_trend_close
+      ? Number(row.day_offset_price_trend_close[prevKey])
+      : null;
+    const fallbackBase = row.day_offset_price_trend_open
+      ? Number(row.day_offset_price_trend_open[column.key])
+      : null;
+    const previousBase = Number.isFinite(prevClose) ? prevClose : fallbackBase;
+    const currentLabel = column.label || column.key;
+    const currentOpen = row.day_offset_price_trend_open ? Number(row.day_offset_price_trend_open[column.key]) : null;
+    const currentHigh = row.day_offset_price_trend_high ? Number(row.day_offset_price_trend_high[column.key]) : null;
+    const currentLow = row.day_offset_price_trend_low ? Number(row.day_offset_price_trend_low[column.key]) : null;
+    const currentClose = row.day_offset_price_trend_close ? Number(row.day_offset_price_trend_close[column.key]) : null;
+    const rawValue = Number(performanceMap[column.key]);
+    const position = row?.position ? String(row.position).toLowerCase() : '';
+    const positionMultiplier = position === 'short' ? -1 : 1;
+    const displayValue = Number.isFinite(rawValue) ? rawValue * positionMultiplier : null;
+    const dimStyle = { color: '#d1d5db' };
+    const activeStyle = { color: '#111827' };
+
+    return (
+      <div>
+        {targetDates && targetDates[column.key] ? <div>기준일: {targetDates[column.key]}</div> : null}
+        <div style={{ marginTop: '6px' }}>
+          <div>
+            <span style={baseField === 'open' ? activeStyle : dimStyle}>
+              {currentLabel} open: {formatNumber(currentOpen)}
+            </span>
+          </div>
+          <div>
+            <span style={baseField === 'high' ? activeStyle : dimStyle}>
+              {currentLabel} high: {formatNumber(currentHigh)}
+            </span>
+          </div>
+          <div>
+            <span style={baseField === 'low' ? activeStyle : dimStyle}>
+              {currentLabel} low: {formatNumber(currentLow)}
+            </span>
+          </div>
+          <div>
+            <span style={baseField === 'close' ? activeStyle : dimStyle}>
+              {currentLabel} close: {formatNumber(currentClose)}
+            </span>
+          </div>
+        </div>
+        <div style={{ borderTop: '1px solid #e5e7eb', margin: '8px 0' }} />
+        <div>
+          <span style={activeStyle}>Prev close: {formatNumber(previousBase)}</span>
+        </div>
+        <div>
+          <span style={activeStyle}>Current close: {formatNumber(currentClose)}</span>
+        </div>
+        <div>
+          <span style={activeStyle}>
+            Return: {Number.isFinite(displayValue) ? `${(displayValue * 100).toFixed(2)}%` : '-'}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const performanceMap = getPerformanceMap(row, dayOffsetMode);
   if (!performanceMap) {
     return null;
   }
@@ -248,7 +357,7 @@ function getDayOffsetTooltipContent(
   return lines.join('\n');
 }
 
-function applyFilters(data, filters, columns) {
+function applyFilters(data, filters, columns, dayOffsetMode) {
   return data.filter((row) => {
     return Object.entries(filters).every(([columnKey, filterValue]) => {
       if (!filterValue) return true;
@@ -256,7 +365,9 @@ function applyFilters(data, filters, columns) {
       const column = columns.find((col) => col.key === columnKey);
       if (!column) return true;
 
-      const cellValue = row[columnKey];
+      const cellValue = column.type === 'dayoffset'
+        ? getDayOffsetValue(row, columnKey, dayOffsetMode)
+        : row[columnKey];
 
       // Handle null values
       if (cellValue === null || cellValue === undefined) {
@@ -319,7 +430,7 @@ function applyFilters(data, filters, columns) {
  * @param {Array} columns - Column configurations
  * @returns {Array} Sorted data rows
  */
-function applySort(data, sortConfig, columns) {
+function applySort(data, sortConfig, columns, dayOffsetMode) {
   if (!sortConfig.key || !sortConfig.direction) {
     return data;
   }
@@ -328,8 +439,12 @@ function applySort(data, sortConfig, columns) {
   if (!column) return data;
 
   return [...data].sort((a, b) => {
-    const aVal = a[sortConfig.key];
-    const bVal = b[sortConfig.key];
+    const aVal = column.type === 'dayoffset'
+      ? getDayOffsetValue(a, sortConfig.key, dayOffsetMode)
+      : a[sortConfig.key];
+    const bVal = column.type === 'dayoffset'
+      ? getDayOffsetValue(b, sortConfig.key, dayOffsetMode)
+      : b[sortConfig.key];
 
     // Handle null/undefined: always last (asc), always first (desc)
     if (aVal === null || aVal === undefined) {
@@ -347,7 +462,7 @@ function applySort(data, sortConfig, columns) {
     }
 
     // Number comparison
-    if (column.type === 'number') {
+    if (column.type === 'number' || column.type === 'dayoffset') {
       return sortConfig.direction === 'asc' ? aVal - bVal : bVal - aVal;
     }
 
@@ -376,6 +491,7 @@ function applySort(data, sortConfig, columns) {
  * @param {boolean} [props.enableServerSideSort] - If true, skip client-side sorting (data is already sorted by server)
  * @param {boolean} [props.enableServerSideFilter] - If true, skip client-side filtering (data is already filtered by server)
  * @param {Function} [props.onSelectionChange] - Callback when row selection changes (receives Set of row IDs)
+ * @param {React.ReactNode} [props.toolbarContent] - Optional toolbar content rendered below the default toolbar row
  * @returns {JSX.Element} Data table component
  */
 export default function DataTable({
@@ -400,6 +516,13 @@ export default function DataTable({
   maxThreshold = null,
   baseOffset = 0,
   baseField = 'close',
+  toolbarContent = null,
+  toolbarActions = null,
+  toolbarRightActions = null,
+  hideColumnSelector = false,
+  enableToolbarToggle = false,
+  toolbarToggleLabel = 'Filters',
+  defaultToolbarOpen = false,
 }) {
   // Track expanded rows
   const [expandedRows, setExpandedRows] = useState(new Set());
@@ -407,6 +530,7 @@ export default function DataTable({
   // Track selected rows (for checkboxes)
   const [selectedRows, setSelectedRows] = useState(new Set());
   const [hoverTooltip, setHoverTooltip] = useState({ visible: false, x: 0, y: 0, content: '' });
+  const [toolbarOpen, setToolbarOpen] = useState(defaultToolbarOpen);
 
   // Notify parent when selection changes
   useEffect(() => {
@@ -425,14 +549,14 @@ export default function DataTable({
     let result = data;
     // Only apply client-side filtering if server-side filtering is not enabled
     if (!enableServerSideFilter) {
-      result = applyFilters(result, filters, columns);
+      result = applyFilters(result, filters, columns, dayOffsetMode);
     }
     // Only apply client-side sorting if server-side sorting is not enabled
     if (!enableServerSideSort) {
-      result = applySort(result, sortConfig, columns);
+      result = applySort(result, sortConfig, columns, dayOffsetMode);
     }
     return result;
-  }, [data, filters, sortConfig, columns, enableServerSideSort, enableServerSideFilter]);
+  }, [data, filters, sortConfig, columns, enableServerSideSort, enableServerSideFilter, dayOffsetMode]);
 
   // Handle sort click: null → asc → desc → null
   const handleSort = (columnKey) => {
@@ -568,7 +692,7 @@ export default function DataTable({
           if (offset === 0) continue;
           const key = offset < 0 ? `d_neg${Math.abs(offset)}` : `d_pos${offset}`;
           const dayValues = processedData
-            .map((row) => row[key])
+            .map((row) => getDayOffsetValue(row, key, dayOffsetMode))
             .filter((v) => v !== null && v !== undefined)
             .map((v) => Number(v));
           if (dayValues.length > 0) {
@@ -588,12 +712,16 @@ export default function DataTable({
       default:
         // For day offset columns (d_neg14 ~ d_pos14), show average
         if (column.type === 'dayoffset') {
-          if (dayOffsetMode !== 'performance') {
+          if (!isPerformanceMode(dayOffsetMode)) {
             return '-';
           }
           const adjustedValues = processedData
             .map((row) => {
-              const rawValue = Number(row[columnKey]);
+              const raw = getDayOffsetValue(row, columnKey, dayOffsetMode);
+              if (raw === null || raw === undefined) {
+                return null;
+              }
+              const rawValue = Number(raw);
               if (!Number.isFinite(rawValue)) {
                 return null;
               }
@@ -612,19 +740,62 @@ export default function DataTable({
     }
   };
 
+  const hasToolbarContent = Boolean(toolbarContent);
+  const showToolbarToggle = enableToolbarToggle && hasToolbarContent;
+  const toolbarLabel = toolbarToggleLabel || 'Filters';
+
   return (
     <div className="table-shell">
       {/* Toolbar - Always visible at top */}
-      <div className="table-toolbar">
-        <ColumnSelector
-          allColumns={columns}
-          selectedColumns={selectedColumns}
-          onChange={onSelectedColumnsChange}
-        />
-        <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-dim)' }}>
-          {processedData.length} {processedData.length === 1 ? 'row' : 'rows'}
-          {data.length !== processedData.length && ` (filtered from ${data.length})`}
+      <div className={`table-toolbar${hasToolbarContent ? ' table-toolbar--stacked' : ''}`}>
+        <div className="table-toolbar__row">
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            {!hideColumnSelector ? (
+              <ColumnSelector
+                allColumns={columns}
+                selectedColumns={selectedColumns}
+                onChange={onSelectedColumnsChange}
+              />
+            ) : null}
+            {showToolbarToggle ? (
+              <button
+                type="button"
+                className="btn btn-sm btn-outline"
+                onClick={() => setToolbarOpen((prev) => !prev)}
+                aria-expanded={toolbarOpen}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                </svg>
+                {toolbarLabel}
+              </button>
+            ) : null}
+            {toolbarActions}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-dim)' }}>
+              {processedData.length} {processedData.length === 1 ? 'row' : 'rows'}
+              {data.length !== processedData.length && ` (filtered from ${data.length})`}
+            </div>
+            {toolbarRightActions}
+          </div>
         </div>
+        {hasToolbarContent && (!showToolbarToggle || toolbarOpen) ? (
+          <div className="table-toolbar__row table-toolbar__row--extras">
+            {toolbarContent}
+          </div>
+        ) : null}
       </div>
 
       {/* Scrollable Table Container with sticky header */}
@@ -703,10 +874,13 @@ export default function DataTable({
                           </td>
                         )}
                         {visibleColumns.map((column) => {
+                          const cellValue = column.type === 'dayoffset'
+                            ? getDayOffsetValue(row, column.key, dayOffsetMode)
+                            : row[column.key];
                           // Check for threshold breach on dayoffset columns
                           let thresholdStyle = null;
-                          if (column.type === 'dayoffset' && dayOffsetMode === 'performance') {
-                            const rawValue = Number(row[column.key]);
+                          if (column.type === 'dayoffset' && dayOffsetMode !== 'performance_previous' && isPerformanceMode(dayOffsetMode)) {
+                            const rawValue = Number(cellValue);
                             if (Number.isFinite(rawValue)) {
                               const position = row?.position ? String(row.position).toLowerCase() : '';
                               const positionMultiplier = position === 'short' ? -1 : 1;
@@ -731,7 +905,7 @@ export default function DataTable({
                             >
                               {column.render ? (
                                 column.render({
-                                  value: row[column.key],
+                                  value: cellValue,
                                   row,
                                   column,
                                 })
@@ -740,10 +914,10 @@ export default function DataTable({
                                   onMouseMove={(event) => handleDayOffsetMove(event, row, column)}
                                   onMouseLeave={handleDayOffsetLeave}
                                 >
-                                  {renderCellValue(row[column.key], column, row, dayOffsetMode)}
+                                  {renderCellValue(cellValue, column, row, dayOffsetMode)}
                                 </span>
                               ) : (
-                                renderCellValue(row[column.key], column, row, dayOffsetMode)
+                                renderCellValue(cellValue, column, row, dayOffsetMode)
                               )}
                             </td>
                           );
@@ -762,11 +936,20 @@ export default function DataTable({
                                     <strong>{column.label}:</strong>{' '}
                                     {column.render
                                       ? column.render({
-                                        value: row[column.key],
+                                        value: column.type === 'dayoffset'
+                                          ? getDayOffsetValue(row, column.key, dayOffsetMode)
+                                          : row[column.key],
                                         row,
                                         column,
                                       })
-                                      : renderCellValue(row[column.key], column, row, dayOffsetMode)}
+                                      : renderCellValue(
+                                        column.type === 'dayoffset'
+                                          ? getDayOffsetValue(row, column.key, dayOffsetMode)
+                                          : row[column.key],
+                                        column,
+                                        row,
+                                        dayOffsetMode
+                                      )}
                                   </div>
                                 ))}
                               </div>
@@ -825,3 +1008,4 @@ export default function DataTable({
     </div>
   );
 }
+

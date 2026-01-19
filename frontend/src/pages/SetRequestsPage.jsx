@@ -621,196 +621,6 @@ const ENDPOINT_FLOWS = {
       'disparity_quantitative, disparity_qualitative'
     ]
   },
-  generatePriceTrends: {
-    id: 'generatePriceTrends',
-    title: 'POST /generatePriceTrends',
-    description: 'txn_price_trend 테이블에 ±14 trading days OHLC 가격 추세 데이터 생성 (backfillEventsTable과 독립 실행). txn_events/txn_trades 소스에 따라 type=event|trade로 저장 (table 파라미터로 선택 가능)',
-    performanceNote: '100개 레코드 (10개 티커) 처리 시: ~10 API calls (OHLC만), ~5초 소요. Trading days는 전역 캐싱으로 DB 쿼리 1회만. txn_trades에서 txn_events에 없는 거래도 자동 처리',
-    parameters: [
-      {
-        name: 'overwrite',
-        type: 'boolean',
-        required: false,
-        default: 'false',
-        description: 'NULL만 채우기(false) vs 덮어쓰기(true)'
-      },
-      {
-        name: 'from',
-        type: 'date',
-        required: false,
-        description: '이벤트 시작 날짜 필터 (YYYY-MM-DD). 미지정 시 전체 기간'
-      },
-      {
-        name: 'to',
-        type: 'date',
-        required: false,
-        description: '이벤트 종료 날짜 필터 (YYYY-MM-DD). 미지정 시 전체 기간'
-      },
-      {
-        name: 'tickers',
-        type: 'string',
-        required: false,
-        description: '티커 필터 (쉼표 구분, 예: "AAPL,MSFT"). 미지정 시 전체 티커'
-      },
-      {
-        name: 'table',
-        type: 'string',
-        required: false,
-        description: '소스 테이블 필터 (쉼표 구분: "txn_events,txn_trades"). 미지정 시 둘 다 처리'
-      },
-      {
-        name: 'startPoint',
-        type: 'string',
-        required: false,
-        description: '알파벳 순 티커 진행 재개 지점 (inclusive). 예: "MSFT"부터 처리'
-      },
-      {
-        name: 'batch_size',
-        type: 'number',
-        required: false,
-        default: 'None',
-        min: 1,
-        max: 2000,
-        description: '배치 처리: unique ticker를 청크 단위로 처리 (1-2000). 예: 500 = 500개 ticker 처리 후 다음 500개. Supabase 무료 플랜 기준 200-1000 권장.'
-      },
-      {
-        name: 'max_workers',
-        type: 'number',
-        required: false,
-        default: '20',
-        min: 1,
-        max: 100,
-        description: '동시 실행 worker 수 (1-100). 낮은 값은 DB CPU 부하 감소, 높은 값은 처리 속도 향상. 권장: DB CPU 모니터링하며 10-30 사이 조정',
-        examples: [
-          { value: '10', description: 'DB CPU 부하가 높을 때 (안전)' },
-          { value: '20', description: '기본값 (균형)' },
-          { value: '30', description: 'DB에 여유가 있을 때 (빠름)' }
-        ]
-      },
-    ],
-    usageExamples: [
-      {
-        title: '기본: 전체 이벤트 price trend 생성',
-        url: 'POST /generatePriceTrends',
-        description: 'txn_events의 모든 이벤트에 대해 price trend 계산 (NULL만)'
-      },
-      {
-        title: '특정 티커만 생성',
-        url: 'POST /generatePriceTrends?tickers=RGTI',
-        description: 'RGTI 티커만 price trend 계산'
-      },
-      {
-        title: '날짜 범위 + 강제 재계산',
-        url: 'POST /generatePriceTrends?from=2024-01-01&to=2024-12-31&overwrite=true',
-        description: '2024년 이벤트만 price trend 강제 재계산'
-      },
-      {
-        title: '여러 티커 + 날짜 필터링',
-        url: 'POST /generatePriceTrends?tickers=AAPL,MSFT&from=2024-01-01',
-        description: '2024년 이후 AAPL/MSFT 이벤트만 계산'
-      },
-      {
-        title: '거래 테이블만 생성',
-        url: 'POST /generatePriceTrends?table=txn_trades',
-        description: 'txn_trades의 거래만 price trend 계산 (type=trade)'
-      },
-    ],
-    phases: [
-      {
-        id: 'load_policies',
-        title: '1. 정책 로드',
-        description: 'fillPriceTrend_dateRange (-14~+14 trading days) 정책',
-        apiId: null,
-        note: 'DB 쿼리 (API 아님)'
-      },
-      {
-        id: 'load_events',
-        title: '2. 이벤트 & 거래 로드 & 그룹화',
-        description: 'txn_events에서 이벤트 + txn_trades에서 txn_events에 없는 거래 조회 → 티커별 그룹화',
-        apiId: null,
-        note: 'DB 쿼리 2개 (API 아님). 거래와 이벤트 모두 price trend 계산 대상'
-      },
-      {
-        id: 'cache_trading_days',
-        title: '3. Trading Days 전역 캐싱 (CRITICAL)',
-        description: '전체 기간의 모든 거래일을 1회 DB 쿼리로 로드',
-        apiId: null,
-        note: ' 핵심 최적화: 100개 이벤트 처리 시 100회 쿼리 → 1회 쿼리로 단축! config_lv3_market_holidays 테이블 사용'
-      },
-      {
-        id: 'calc_ohlc_ranges',
-        title: '4. OHLC 페치 범위 계산',
-        description: '티커별 min/max event_date 기준으로 필요한 날짜 범위 계산',
-        apiId: null,
-        note: '±14 trading days = 약 ±25 calendar days (주말/휴일 포함) + 15일 버퍼'
-      },
-      {
-        id: 'fetch_ohlc',
-        title: '5. OHLC 데이터 티커별 캐싱',
-        description: '티커당 1회 API 호출 → 모든 이벤트가 캐시 재사용',
-        apiId: 'fmp-historical-price-eod-full',
-        requiredKeys: ['date', 'open', 'high', 'low', 'close'],
-        configKey: 'generatePriceTrends.ohlc',
-        note: '티커당 1 API call × 10 티커 = 10 API calls total (100개 이벤트에 대해)'
-      },
-      {
-        id: 'event_processing',
-        title: '6. 이벤트별 처리 (캐시 사용)',
-        description: '각 이벤트: dayOffset 날짜 계산 → OHLC 매핑 → 성과 계산',
-        apiId: null,
-        note: '100개 이벤트 처리해도 추가 API 호출 0개 (모두 캐시 사용)'
-      },
-      {
-        id: 'calc_dayoffset_dates',
-        title: '7. dayOffset 날짜 계산',
-        description: 'event_date 기준 -14~+14 trading days 계산',
-        apiId: null,
-        note: '캐시된 trading_days_set 사용 (O(1) lookup)'
-      },
-      {
-        id: 'map_ohlc',
-        title: '8. OHLC 데이터 매핑',
-        description: '각 dayOffset 날짜에 대응하는 OHLC 데이터 조회',
-        apiId: null,
-        note: '캐시된 ohlc_cache 사용 (API 호출 없음)'
-      },
-      {
-        id: 'forward_backward_fill',
-        title: '9. Forward/Backward Fill',
-        description: '휴일로 OHLC 누락 시 인접 거래일 데이터로 채우기',
-        apiId: null,
-        note: 'neg offset: backward fill (이전 거래일), pos offset: forward fill (다음 거래일)'
-      },
-      {
-        id: 'calc_performance',
-        title: '10. 성과(Performance) 계산',
-        description: 'D-14 close 대비 각 dayOffset의 수익률',
-        apiId: null,
-        note: 'performance = (close - d_neg14_close) / d_neg14_close'
-      },
-      {
-        id: 'build_jsonb',
-        title: '11. JSONB 컬럼 생성',
-        description: '29개 컬럼 생성 (d_neg_14 ~ d_pos_14)',
-        apiId: null,
-        note: '각 컬럼: {targetDate, price_trend{ohlc}, dayOffsetNeg14{close: d_neg14_close}, performance{close}}'
-      },
-      {
-        id: 'batch_upsert',
-        title: '12. 배치 UPSERT',
-        description: 'txn_price_trend 테이블 일괄 UPSERT (티커당 1회)',
-        apiId: null,
-        note: 'PostgreSQL UNNEST 패턴 사용: 100개 이벤트를 단일 쿼리로 처리'
-      }
-    ],
-    outputs: [
-      'type (event|trade)',
-      'd_neg_14 ~ d_neg_1 (14 JSONB columns)',
-      'd_0 (JSONB column)',
-      'd_pos_1 ~ d_pos_14 (14 JSONB columns)',
-      '각 JSONB: {targetDate, price_trend{low,high,open,close}, dayOffsetNeg14{close: d_neg14_close}, performance{close}}'
-    ]
-  },
   trades: {
     id: 'trades',
     title: 'POST /trades',
@@ -858,13 +668,7 @@ const ENDPOINT_FLOWS = {
         note: '이미 존재하는 키는 삽입하지 않고 실패 목록으로 보고'
       }
     ],
-    integration: [
-      {
-        endpoint: 'POST /generatePriceTrends',
-        description: 'txn_events에 없고 txn_trades에만 존재하는 ticker, trade_date 조합에 대해 가격 추세 데이터 생성',
-        note: '거래 기록도 이벤트처럼 가격 추세 분석 가능'
-      }
-    ],
+    integration: [],
     outputs: [
       'txn_trades 테이블에 레코드 삽입',
       'Primary key: (ticker, trade_date, model)',
@@ -1929,7 +1733,6 @@ export default function SetRequestsPage() {
             </li>
             <li><strong>POST /getQuantitatives</strong>: 티커별 재무/가격 데이터를 DB에 저장 (API 호출)</li>
             <li><strong>POST /backfillEventsTable</strong>: txn_events의 valuation metrics 계산 (DB 조회만, API 호출 없음, batch_size는 unique ticker 기준)</li>
-            <li><strong>POST /generatePriceTrends</strong>: 가격 추세 데이터 생성 (±14 trading days)</li>
           </ol>
         </div>
 

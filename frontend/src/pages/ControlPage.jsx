@@ -355,6 +355,282 @@ function TimebasePanel() {
 }
 
 /**
+ * BestWindowPolicyPanel - Edit Best Window policy via control route.
+ */
+function BestWindowPolicyPanel() {
+  const [policyText, setPolicyText] = useState('');
+  const [description, setDescription] = useState('');
+  const [endpoint, setEndpoint] = useState('');
+  const [isDefault, setIsDefault] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [saveStatus, setSaveStatus] = useState(null);
+
+  useEffect(() => {
+    fetchPolicy();
+  }, []);
+
+  async function fetchPolicy() {
+    try {
+      setLoading(true);
+      setError(null);
+      const response = await fetch(`${API_BASE_URL}/control/bestWindowPolicy`, {
+        headers: await getAuthHeaders(),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      setPolicyText(JSON.stringify(data.policy || {}, null, 2));
+      setDescription(data.description || '');
+      setEndpoint(data.endpoint || '');
+      setIsDefault(Boolean(data.isDefault));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const savePolicy = async () => {
+    try {
+      setSaveStatus('saving');
+      setError(null);
+      let parsed = {};
+      try {
+        parsed = JSON.parse(policyText || '{}');
+      } catch (parseError) {
+        throw new Error(`Invalid JSON: ${parseError.message}`);
+      }
+
+      const response = await fetch(`${API_BASE_URL}/control/bestWindowPolicy`, {
+        method: 'PUT',
+        headers: await getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+          policy: parsed,
+          description: description || null,
+          endpoint: endpoint || null,
+        }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      setPolicyText(JSON.stringify(data.policy || {}, null, 2));
+      setDescription(data.description || '');
+      setEndpoint(data.endpoint || '');
+      setIsDefault(Boolean(data.isDefault));
+      setSaveStatus('success');
+      setTimeout(() => setSaveStatus(null), 1200);
+    } catch (err) {
+      setSaveStatus('error');
+      setError(err.message);
+    }
+  };
+
+  if (loading) return <div className="loading">Loading Best Window policy...</div>;
+  if (error) return <div className="alert alert-error">Error: {error}</div>;
+
+  return (
+    <div style={{ marginBottom: 'var(--space-4)' }}>
+      <h3 style={{ marginBottom: 'var(--space-2)' }}>Best Window Policy</h3>
+      <div
+        style={{
+          border: '2px solid #f59e0b',
+          borderRadius: 'var(--rounded-lg)',
+          padding: 'var(--space-3)',
+          background: 'linear-gradient(135deg, rgba(251, 191, 36, 0.15) 0%, rgba(253, 230, 138, 0.35) 100%)',
+          boxShadow: '0 12px 30px rgba(245, 158, 11, 0.18)',
+        }}
+      >
+        <details
+          style={{
+            marginBottom: 'var(--space-2)',
+            padding: 'var(--space-2)',
+            borderRadius: 'var(--rounded-md)',
+            backgroundColor: 'rgba(255, 255, 255, 0.85)',
+            fontSize: 'var(--text-xs)',
+            color: 'var(--text)',
+          }}
+        >
+          <summary style={{ cursor: 'pointer', fontWeight: 700, marginBottom: 'var(--space-1)' }}>
+            사용법 안내
+          </summary>
+          <div
+            style={{
+              padding: 'var(--space-2)',
+              borderRadius: 'var(--rounded-md)',
+              backgroundColor: 'rgba(245, 158, 11, 0.08)',
+              border: '1px dashed rgba(245, 158, 11, 0.4)',
+            }}
+          >
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            - 이 JSON은 Best Window 계산식을 정의합니다. 저장 즉시 적용됩니다.
+            </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            - 이벤트 날짜를 기준으로 한 일간 OHLC 데이터의 day offset 평균을 사용합니다.
+            </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>필수 구조</strong>
+            <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+{`{
+  "offsets": { "start": -14, "end": 14 },
+  "designated": { "totalReturnFormula": "...", "avgFormula": "...", "avgAfterFeeFormula": "...", "topK": 2 },
+  "previous":   { "totalReturnFormula": "...", "avgFormula": "...", "avgAfterFeeFormula": "...", "topK": 2 },
+  "backtest": {
+    "atr": { "period": 14, "method": "wilder" },
+    "exit": { "mode": "percent", "stopLossAtr": 1.0, "takeProfitAtr": 2.0 },
+    "risk": { "lambda": 1.0 },
+    "strategy": { "dailyReturnMode": "spread", "annualizationDays": 252 }
+  }
+}`}
+            </pre>
+          </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>offsets</strong>: start/end는 -14~14 범위만 허용됩니다.
+            </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>designated</strong>: 기준일(base offset)에서 종료일까지의 창(window) 계산
+            </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>previous</strong>: 모든 시작~종료 조합을 스캔해 최적 창을 계산
+            </div>
+            <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>사용 가능한 변수</strong>
+            <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+{`mean_value       # 단일 offset 평균
+running_sum      # 구간 합 (previous 전용)
+running_compound # (1+mean_value) 누적 곱
+compound_return  # running_compound - 1
+total_return     # totalReturnFormula 결과
+avg              # avgFormula 결과
+length           # window 길이 (previous)
+hold             # end-start (designated)
+fee_rate         # 수수료율 (예: 0.001 = 0.1%)
+start_offset
+end_offset
+count_value`}
+            </pre>
+            </div>
+          <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>허용 함수</strong>: abs, min, max, sum, len, round, float, int, math
+          </div>
+          <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>backtest 설정</strong>: atr.period/atr.method(sma|wilder), risk.lambda,
+            exit.mode(percent|atr), exit.stopLossAtr, exit.takeProfitAtr,
+            strategy.dailyReturnMode(spread|lump), strategy.annualizationDays(기본 252)
+          </div>
+          <div style={{ marginBottom: 'var(--space-1)' }}>
+            exit.mode=percent는 MIN/MAX 퍼센트 기준, exit.mode=atr는 ATR 기준으로 조기 청산합니다.
+          </div>
+          <div style={{ marginBottom: 'var(--space-1)' }}>
+            <strong>예시</strong>: 로그 수익률 일간화
+            <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+{`"avgFormula": "math.log(1 + total_return) / hold"`}
+            </pre>
+            </div>
+            <div>
+            저장 후 Best Window 계산이 즉시 변경됩니다.
+            </div>
+          </div>
+        </details>
+        <div style={{ marginBottom: 'var(--space-2)', display: 'flex', gap: 'var(--space-2)' }}>
+          <div style={{ flex: 1 }}>
+            <label
+              style={{
+                display: 'block',
+                fontSize: 'var(--text-sm)',
+                fontWeight: 'var(--font-semibold)',
+                color: 'var(--ink)',
+                marginBottom: 'var(--space-1)',
+              }}
+            >
+              Endpoint
+            </label>
+            <input
+              type="text"
+              value={endpoint}
+              onChange={(e) => setEndpoint(e.target.value)}
+              placeholder="eventsHistory"
+            />
+          </div>
+          <div style={{ flex: 2 }}>
+            <label
+              style={{
+                display: 'block',
+                fontSize: 'var(--text-sm)',
+                fontWeight: 'var(--font-semibold)',
+                color: 'var(--ink)',
+                marginBottom: 'var(--space-1)',
+              }}
+            >
+              Description
+            </label>
+            <input
+              type="text"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Policy description"
+            />
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 'var(--space-2)' }}>
+          <label
+            style={{
+              display: 'block',
+              fontSize: 'var(--text-sm)',
+              fontWeight: 'var(--font-semibold)',
+              color: 'var(--ink)',
+              marginBottom: 'var(--space-1)',
+            }}
+          >
+            Policy JSON
+          </label>
+          <textarea
+            rows={12}
+            value={policyText}
+            onChange={(e) => setPolicyText(e.target.value)}
+            style={{
+              width: '100%',
+              fontFamily: 'SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+              fontSize: 'var(--text-xs)',
+              lineHeight: 1.4,
+            }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 'var(--space-1)', alignItems: 'center' }}>
+          <button
+            type="button"
+            className="btn btn-md btn-primary"
+            onClick={savePolicy}
+            disabled={saveStatus === 'saving'}
+          >
+            {saveStatus === 'saving' ? 'Saving...' : 'Save'}
+          </button>
+          <button type="button" className="btn btn-sm btn-outline" onClick={fetchPolicy}>
+            Reload
+          </button>
+          {isDefault ? (
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
+              Default policy (not stored)
+            </span>
+          ) : null}
+        </div>
+
+        {saveStatus === 'success' && (
+          <div className="alert alert-success" style={{ marginTop: 'var(--space-2)' }}>
+            Saved successfully
+          </div>
+        )}
+        {saveStatus === 'error' && (
+          <div className="alert alert-error" style={{ marginTop: 'var(--space-2)' }}>
+            Failed to save policy
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
  * DataCatalogPanel - Displays JSON data in compact format.
  */
 function DataCatalogPanel({ title, data, loading, error }) {
@@ -481,6 +757,7 @@ export default function ControlPage() {
       {/* Control Panels Section */}
       <section style={{ marginBottom: 'var(--space-5)' }}>
         <h2 style={{ marginBottom: 'var(--space-3)' }}>Control Panels</h2>
+        <BestWindowPolicyPanel />
         <APIServicePanel />
         <TimebasePanel />
       </section>

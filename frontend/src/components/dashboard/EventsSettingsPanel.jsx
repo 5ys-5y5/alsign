@@ -6,11 +6,6 @@
  */
 
 import React, { useState } from 'react';
-import {
-  getEventsSettings,
-  setEventsSettings,
-} from '../../services/localStorage';
-import { requestEventsHistoryCacheRefresh } from '../../services/eventsHistoryData';
 
 const DAY_OFFSET_OPTIONS = Array.from({ length: 29 }, (_, i) => {
   const offset = i - 14;
@@ -28,14 +23,21 @@ const OHLC_OPTIONS = [
   { value: 'close', label: 'Close' },
 ];
 
-export default function EventsSettingsPanel() {
-  const [settings, setSettings] = useState(() => getEventsSettings());
+const DEFAULT_SETTINGS = {
+  baseOffset: 0,
+  baseField: 'close',
+  minThreshold: null,
+  maxThreshold: null,
+};
+
+export default function EventsSettingsPanel({ settings = DEFAULT_SETTINGS, onChange }) {
   const [isExpanded, setIsExpanded] = useState(true);
 
   const handleSettingChange = (key, value) => {
     const newSettings = { ...settings, [key]: value };
-    setSettings(newSettings);
-    setEventsSettings(newSettings);
+    if (onChange) {
+      onChange(newSettings);
+    }
   };
 
   const handleBaseOffsetChange = (e) => {
@@ -56,17 +58,13 @@ export default function EventsSettingsPanel() {
     handleSettingChange('maxThreshold', value === '' ? null : parseFloat(value));
   };
 
-  const handleUpdateClick = () => {
-    requestEventsHistoryCacheRefresh({ preserveData: true });
-  };
-
   return (
     <div
       style={{
-        backgroundColor: 'white',
-        borderRadius: '8px',
-        border: '1px solid var(--border)',
-        marginBottom: 'var(--space-4)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 'var(--space-2)',
+        width: '100%',
       }}
     >
       {/* Header with toggle */}
@@ -75,8 +73,6 @@ export default function EventsSettingsPanel() {
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          padding: 'var(--space-3) var(--space-4)',
-          borderBottom: isExpanded ? '1px solid var(--border)' : 'none',
           gap: 'var(--space-2)',
         }}
       >
@@ -100,23 +96,15 @@ export default function EventsSettingsPanel() {
             {isExpanded ? 'v' : '>'}
           </span>
         </button>
-        <button
-          type="button"
-          className="btn btn-sm btn-primary"
-          onClick={handleUpdateClick}
-        >
-          Update
-        </button>
       </div>
 
       {/* Settings content */}
       {isExpanded && (
         <div
           style={{
-            padding: 'var(--space-4)',
             display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-            gap: 'var(--space-4)',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+            gap: 'var(--space-2)',
           }}
         >
           {/* Base Day Offset */}

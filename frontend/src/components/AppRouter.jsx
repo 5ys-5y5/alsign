@@ -11,8 +11,6 @@ import RequestsPage from '../pages/RequestsPage';
 import SetRequestsPage from '../pages/SetRequestsPage';
 import ConditionGroupPage from '../pages/ConditionGroupPage';
 import DashboardPage from '../pages/DashboardPage';
-import TradesPage from '../pages/TradesPage';
-import HistoryPage from '../pages/HistoryPage';
 import EventsHistoryPage from '../pages/EventsHistoryPage';
 import ProfilePage from '../pages/ProfilePage';
 import AuthModal from './AuthModal';
@@ -91,9 +89,7 @@ const ROUTES = [
   { id: 'setRequests', label: 'setRequests', path: '#/setRequests', component: SetRequestsPage, adminOnly: true },
   { id: 'conditionGroup', label: 'conditionGroup', path: '#/conditionGroup', component: ConditionGroupPage, adminOnly: true },
   { id: 'dashboard', label: 'dashboard', path: '#/dashboard', component: DashboardPage, adminOnly: true },
-  { id: 'history', label: 'history', path: '#/history', component: HistoryPage, adminOnly: true },
   { id: 'events', label: 'events', path: '#/events', component: EventsHistoryPage, adminOnly: true },
-  { id: 'trades', label: 'trades', path: '#/trades', component: TradesPage },
   { id: 'profile', label: 'profile', path: '#/profile', component: ProfilePage, hideInNav: true },
 ];
 
@@ -189,10 +185,10 @@ function Navigation({ currentRoute, onNavigate, onOpenAuth, navRef, panelOffsetR
               <button
                 type="button"
                 className="btn btn-sm btn-outline"
-                onClick={async () => {
-                  await supabase.auth.signOut();
-                  onNavigate('trades');
-                }}
+                  onClick={async () => {
+                    await supabase.auth.signOut();
+                    onNavigate('events');
+                  }}
                 style={{
                   height: '32px',
                   padding: '0 14px',
@@ -228,7 +224,7 @@ function Navigation({ currentRoute, onNavigate, onOpenAuth, navRef, panelOffsetR
  * AppRouter component.
  */
 export default function AppRouter() {
-  const [currentRoute, setCurrentRoute] = useState('trades'); // Default route
+  const [currentRoute, setCurrentRoute] = useState('events'); // Default route
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authNext, setAuthNext] = useState(null);
 
@@ -238,7 +234,7 @@ export default function AppRouter() {
       const hash = window.location.hash;
       const baseHash = hash.split('?')[0];
       if (baseHash === '#/login') {
-        setCurrentRoute('trades');
+        setCurrentRoute('events');
         setAuthModalOpen(true);
         return;
       }
@@ -246,9 +242,9 @@ export default function AppRouter() {
       if (route) {
         setCurrentRoute(route.id);
       } else {
-        // Default to trades if no hash or invalid hash
-        setCurrentRoute('trades');
-        window.location.hash = '#/trades';
+        // Default to events if no hash or invalid hash
+        setCurrentRoute('events');
+        window.location.hash = '#/events';
       }
     };
 
@@ -311,12 +307,12 @@ function AppContent({ currentRoute, onNavigate, CurrentComponent, onOpenAuth }) 
 
   useEffect(() => {
     if (loading) return;
-    if (isAdminOnly && !isAdmin) {
-      onOpenAuth(window.location.hash || '#/dashboard');
-      if (currentRoute !== 'trades') {
-        onNavigate('trades');
+      if (isAdminOnly && !isAdmin) {
+        onOpenAuth(window.location.hash || '#/dashboard');
+        if (currentRoute !== 'events') {
+          onNavigate('events');
+        }
       }
-    }
   }, [isAdminOnly, isAdmin, loading, currentRoute, onNavigate, onOpenAuth]);
 
   useLayoutEffect(() => {

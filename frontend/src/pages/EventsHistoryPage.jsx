@@ -11,21 +11,25 @@ import {
   getEventsHistoryState,
   setEventsHistoryState,
   getEventsSettings,
+  setEventsSettings,
 } from '../services/localStorage';
 import {
   loadEventsHistoryDataset,
+  loadEventsHistoryBestWindow,
   requestEventsHistoryCacheRefresh,
   subscribeEventsHistoryCacheRefresh,
   getCachedEventsHistorySettings,
   subscribeEventsHistoryProgress,
 } from '../services/eventsHistoryData';
-import EventsSettingsPanel from '../components/dashboard/EventsSettingsPanel';
 import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
-function formatDate(dateString) {
+function formatDate(dateString, { dateOnly = false } = {}) {
   if (!dateString) return 'N/A';
   try {
     const date = new Date(dateString);
+    if (dateOnly) {
+      return date.toLocaleDateString();
+    }
     return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
   } catch (e) {
     return dateString;
@@ -47,7 +51,17 @@ export default function EventsHistoryPage() {
   const [eventsError, setEventsError] = useState(null);
   const [eventsSortConfig, setEventsSortConfig] = useState(() => getEventsHistoryState().sort);
   const [eventsFilters, setEventsFilters] = useState(() => getEventsHistoryState().filters);
+  const [eventsDayOffsetMode, setEventsDayOffsetMode] = useState(
+    () => getEventsHistoryState().dayOffsetMode || 'performance_designated'
+  );
   const [lastSettings, setLastSettings] = useState(() => getEventsSettings());
+  const [settingsDraft, setSettingsDraft] = useState(() => getEventsSettings());
+  const [appliedSettings, setAppliedSettings] = useState(() => getEventsSettings());
+  const [feeDraft, setFeeDraft] = useState(0.1);
+  const [appliedFee, setAppliedFee] = useState(0);
+  const [bestWindowSummary, setBestWindowSummary] = useState(null);
+  const [bestWindowLoading, setBestWindowLoading] = useState(false);
+  const [bestWindowError, setBestWindowError] = useState(null);
   const [kpis, setKpis] = useState({
     coverage: 0,
     targetsFreshness: null,
@@ -61,6 +75,7 @@ export default function EventsHistoryPage() {
   const [progressLogs, setProgressLogs] = useState([]);
   const [showProgressLogs, setShowProgressLogs] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [showOptionalSettings, setShowOptionalSettings] = useState(false);
   const [filterDraft, setFilterDraft] = useState({
     eventDateFrom: '',
     eventDateTo: '',
@@ -86,6 +101,10 @@ export default function EventsHistoryPage() {
   useEffect(() => {
     setEventsHistoryState({ filters: eventsFilters });
   }, [eventsFilters]);
+
+  useEffect(() => {
+    setEventsHistoryState({ dayOffsetMode: eventsDayOffsetMode });
+  }, [eventsDayOffsetMode]);
 
   useEffect(() => {
     let mounted = true;
@@ -212,6 +231,8 @@ export default function EventsHistoryPage() {
     return filters;
   };
 
+  const draftFilters = React.useMemo(() => buildAppliedFilters(filterDraft), [filterDraft]);
+
   const hasActiveFilters = (filters) => {
     return Boolean(
       filters.eventDateFrom
@@ -223,6 +244,49 @@ export default function EventsHistoryPage() {
       || filters.positionQualitative
     );
   };
+
+  const appliedFilterSummary = React.useMemo(() => {
+    if (!appliedFilters) return [];
+    const summary = [];
+    if (appliedFilters.eventDateFrom || appliedFilters.eventDateTo) {
+      const fromLabel = appliedFilters.eventDateFrom || '...';
+      const toLabel = appliedFilters.eventDateTo || '...';
+      summary.push(`Date: ${fromLabel} to ${toLabel}`);
+    }
+    if (appliedFilters.sector) summary.push(`Sector: ${appliedFilters.sector}`);
+    if (appliedFilters.industry) summary.push(`Industry: ${appliedFilters.industry}`);
+    if (appliedFilters.source) summary.push(`Source: ${appliedFilters.source}`);
+    if (appliedFilters.positionQuantitative) summary.push(`Pos(Q): ${appliedFilters.positionQuantitative}`);
+    if (appliedFilters.positionQualitative) summary.push(`Pos(QL): ${appliedFilters.positionQualitative}`);
+    return summary;
+  }, [appliedFilters]);
+
+  const appliedSettingsSummary = React.useMemo(() => {
+    if (!appliedSettings) return [];
+    const summary = [];
+    const baseOffset = appliedSettings.baseOffset ?? 0;
+    const baseField = appliedSettings.baseField ? String(appliedSettings.baseField).toUpperCase() : 'CLOSE';
+    summary.push(`Base D${baseOffset} ${baseField}`);
+    if (appliedSettings.minThreshold !== null && appliedSettings.minThreshold !== undefined) {
+      summary.push(`MIN ${appliedSettings.minThreshold}%`);
+    }
+    if (appliedSettings.maxThreshold !== null && appliedSettings.maxThreshold !== undefined) {
+      summary.push(`MAX ${appliedSettings.maxThreshold}%`);
+    }
+    if (Number.isFinite(appliedFee) && appliedFee > 0) {
+      summary.push(`Fee ${appliedFee}%`);
+    }
+    if (Number.isFinite(appliedSettings?.bestWindowMinConf)) {
+      summary.push(`Conf >= ${appliedSettings.bestWindowMinConf}%`);
+    }
+    return summary;
+  }, [appliedSettings, appliedFee]);
+
+  const hasDraftChanges = React.useMemo(() => {
+    const draftKey = JSON.stringify(draftFilters);
+    const appliedKey = appliedFilters ? JSON.stringify(appliedFilters) : '';
+    return draftKey !== appliedKey;
+  }, [draftFilters, appliedFilters]);
 
   useEffect(() => {
     let mounted = true;
@@ -241,7 +305,9 @@ export default function EventsHistoryPage() {
         if (!mounted) return;
         setEventsData(payload.rows || []);
         setEventsTotal(payload.total || 0);
-        setLastSettings(payload.settings || getCachedEventsHistorySettings() || getEventsSettings());
+        const resolvedSettings = payload.settings || getCachedEventsHistorySettings() || getEventsSettings();
+        setLastSettings(resolvedSettings);
+        setAppliedSettings(resolvedSettings);
       } catch (error) {
         if (!mounted) return;
         console.error('Failed to fetch events history data:', error);
@@ -259,32 +325,49 @@ export default function EventsHistoryPage() {
     };
   }, [refreshCounter, appliedFilters]);
 
-  const handleRefresh = async () => {
-    if (!appliedFilters || !hasActiveFilters(appliedFilters)) {
-      setEventsData([]);
-      setEventsTotal(0);
-      setEventsLoading(false);
-      return;
+  useEffect(() => {
+    let mounted = true;
+    async function fetchBestWindow() {
+      if (!appliedFilters || !hasActiveFilters(appliedFilters)) {
+        setBestWindowSummary(null);
+        return;
+      }
+      try {
+        setBestWindowLoading(true);
+        setBestWindowError(null);
+        const payload = await loadEventsHistoryBestWindow(appliedFilters, appliedFee);
+        if (mounted) {
+          setBestWindowSummary(payload);
+        }
+      } catch (error) {
+        if (mounted) {
+          setBestWindowError(error.message || 'Failed to load best window.');
+        }
+      } finally {
+        if (mounted) {
+          setBestWindowLoading(false);
+        }
+      }
     }
-    requestEventsHistoryCacheRefresh();
-    try {
-      setEventsLoading(true);
-      setEventsError(null);
-      const payload = await loadEventsHistoryDataset(appliedFilters);
-      setEventsData(payload.rows || []);
-      setEventsTotal(payload.total || 0);
-      setLastSettings(payload.settings || getEventsSettings());
-      setEventsPage(1);
-    } catch (error) {
-      console.error('Failed to refresh events history data:', error);
-      setEventsError(error.message || 'Failed to refresh events history data.');
-    } finally {
-      setEventsLoading(false);
-    }
-  };
+
+    fetchBestWindow();
+    return () => {
+      mounted = false;
+    };
+  }, [appliedFilters, appliedFee, appliedSettings]);
 
   const handleApplyFilters = () => {
-    const nextFilters = buildAppliedFilters(filterDraft);
+    const nextFilters = draftFilters;
+    const settingsChanged = JSON.stringify(settingsDraft) !== JSON.stringify(appliedSettings);
+    const feeChanged = feeDraft !== appliedFee;
+    if (settingsChanged) {
+      setEventsSettings(settingsDraft);
+      setAppliedSettings(settingsDraft);
+      requestEventsHistoryCacheRefresh({ preserveData: true });
+    }
+    if (feeChanged) {
+      setAppliedFee(feeDraft);
+    }
     setAppliedFilters(nextFilters);
     setEventsPage(1);
     setRefreshCounter((prev) => prev + 1);
@@ -305,6 +388,9 @@ export default function EventsHistoryPage() {
       sourceAll: true,
     };
     setFilterDraft(reset);
+    setSettingsDraft(appliedSettings);
+    setFeeDraft(appliedFee);
+    setShowOptionalSettings(false);
     setAppliedFilters(null);
     setEventsData([]);
     setEventsTotal(0);
@@ -313,10 +399,10 @@ export default function EventsHistoryPage() {
     setProgress(null);
   };
 
-  const baseFieldLabel = lastSettings?.baseField ? lastSettings.baseField.toUpperCase() : '-';
-  const settingsLabel = lastSettings
-    ? `Base D${lastSettings.baseOffset} - ${baseFieldLabel} - MIN ${lastSettings.minThreshold || '-'}% - MAX ${lastSettings.maxThreshold || '-'}%`
-    : '';
+  const handleReload = () => {
+    requestEventsHistoryCacheRefresh({ preserveData: true });
+    setProgress(null);
+  };
 
   const progressLabel = (() => {
     if (!progress) return null;
@@ -386,45 +472,373 @@ export default function EventsHistoryPage() {
 
   const tableLoading = eventsLoading && eventsData.length === 0;
   const activeFilters = appliedFilters ? hasActiveFilters(appliedFilters) : false;
+  const settingsChanged = JSON.stringify(settingsDraft) !== JSON.stringify(appliedSettings);
+  const feeChanged = feeDraft !== appliedFee;
+  const canApplyFilters = (hasActiveFilters(draftFilters) && (hasDraftChanges || !activeFilters)) || settingsChanged || feeChanged;
+  const canResetFilters = activeFilters || hasDraftChanges || settingsChanged || feeChanged;
 
-  const bestWindow = React.useMemo(() => {
-    if (!eventsData || eventsData.length === 0) {
-      return null;
-    }
-    const candidates = [];
-    for (let offset = -14; offset <= 14; offset += 1) {
-      if (offset === 0) continue;
-      const key = offset < 0 ? `d_neg${Math.abs(offset)}` : `d_pos${offset}`;
-      let sum = 0;
-      let count = 0;
-      for (const row of eventsData) {
-        const raw = Number(row[key]);
-        if (!Number.isFinite(raw)) {
-          continue;
-        }
-        const position = row.position || row.position_quantitative || row.position_qualitative;
-        const multiplier = getPositionMultiplier(position);
-        sum += raw * multiplier;
-        count += 1;
-      }
-      if (count > 0) {
-        candidates.push({ offset, avg: sum / count, count });
-      }
-    }
-    if (candidates.length === 0) {
-      return null;
-    }
-    return candidates.reduce((best, current) => (current.avg > best.avg ? current : best));
-  }, [eventsData]);
+  const toolbarContent = (
+    <div className="events-toolbar">
+      <div className="events-toolbar__summary">
+        <span className="events-toolbar__summary-label">Applied:</span>
+        {[...appliedSettingsSummary, ...appliedFilterSummary].length === 0 ? (
+          <span className="events-toolbar__chip events-toolbar__chip--muted">None</span>
+        ) : (
+          [...appliedSettingsSummary, ...appliedFilterSummary].map((item) => (
+            <span key={item} className="events-toolbar__chip">
+              {item}
+            </span>
+          ))
+        )}
+      </div>
+      <div className="events-toolbar__form">
+        <div>
+          <label className="events-toolbar__label">Fee (%)</label>
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            placeholder="e.g. 0.1"
+            value={feeDraft}
+            onChange={(e) => {
+              const value = e.target.value.trim();
+              setFeeDraft(value === '' ? 0 : parseFloat(value));
+            }}
+          />
+        </div>
+        <div>
+          <label className="events-toolbar__label">
+            Base Day Offset <span className="required-asterisk">*</span>
+          </label>
+          <select
+            value={settingsDraft.baseOffset}
+            onChange={(e) => setSettingsDraft((prev) => ({ ...prev, baseOffset: parseInt(e.target.value, 10) }))}
+          >
+            {Array.from({ length: 29 }, (_, i) => {
+              const offset = i - 14;
+              const label = offset === 0 ? 'D0' : `D${offset > 0 ? `+${offset}` : offset}`;
+              return (
+                <option key={offset} value={offset}>
+                  {label}
+                </option>
+              );
+            })}
+          </select>
+        </div>
+        <div>
+          <label className="events-toolbar__label">
+            Base OHLC Field <span className="required-asterisk">*</span>
+          </label>
+          <select
+            value={settingsDraft.baseField}
+            onChange={(e) => setSettingsDraft((prev) => ({ ...prev, baseField: e.target.value }))}
+          >
+            <option value="open">Open</option>
+            <option value="high">High</option>
+            <option value="low">Low</option>
+            <option value="close">Close</option>
+          </select>
+        </div>
+        <div>
+          <label className="events-toolbar__label">
+            Event date from <span className="required-asterisk">*</span>
+          </label>
+          <input
+            type="date"
+            value={filterDraft.eventDateFrom}
+            onChange={(e) => setFilterDraft((prev) => ({ ...prev, eventDateFrom: e.target.value }))}
+          />
+        </div>
+        <div>
+          <label className="events-toolbar__label">
+            Event date to <span className="required-asterisk">*</span>
+          </label>
+          <input
+            type="date"
+            value={filterDraft.eventDateTo}
+            onChange={(e) => setFilterDraft((prev) => ({ ...prev, eventDateTo: e.target.value }))}
+          />
+        </div>
+        <div>
+          <label className="events-toolbar__label">
+            Position (Quantitative) <span className="required-asterisk">*</span>
+          </label>
+          <select
+            value={filterDraft.positionQuantitative}
+            onChange={(e) => setFilterDraft((prev) => ({ ...prev, positionQuantitative: e.target.value }))}
+          >
+            <option value="all">All</option>
+            <option value="long">long</option>
+            <option value="short">short</option>
+            <option value="undefined">undefined</option>
+          </select>
+        </div>
+      </div>
+      <div className="events-toolbar__optional">
+        <button
+          type="button"
+          className="btn btn-sm btn-outline"
+          onClick={() => setShowOptionalSettings((prev) => !prev)}
+        >
+          {showOptionalSettings ? '선택 항목 숨기기' : '선택 항목 보기'}
+        </button>
+        {showOptionalSettings ? (
+          <div className="events-toolbar__optional-grid">
+            <div>
+              <label className="events-toolbar__label">MIN% (Stop Loss)</label>
+              <input
+                type="number"
+                placeholder="e.g. -10"
+                value={settingsDraft.minThreshold ?? ''}
+                onChange={(e) => {
+                  const value = e.target.value.trim();
+                  setSettingsDraft((prev) => ({
+                    ...prev,
+                    minThreshold: value === '' ? null : parseFloat(value),
+                  }));
+                }}
+              />
+            </div>
+            <div>
+              <label className="events-toolbar__label">MAX% (Profit Target)</label>
+              <input
+                type="number"
+                placeholder="e.g. 20"
+                value={settingsDraft.maxThreshold ?? ''}
+                onChange={(e) => {
+                  const value = e.target.value.trim();
+                  setSettingsDraft((prev) => ({
+                    ...prev,
+                    maxThreshold: value === '' ? null : parseFloat(value),
+                  }));
+                }}
+              />
+            </div>
+            <div>
+              <label className="events-toolbar__label">Best Window Conf (%)</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                step="0.1"
+                placeholder="e.g. 95"
+                value={settingsDraft.bestWindowMinConf ?? ''}
+                onChange={(e) => {
+                  const value = e.target.value.trim();
+                  setSettingsDraft((prev) => ({
+                    ...prev,
+                    bestWindowMinConf: value === '' ? null : parseFloat(value),
+                  }));
+                }}
+              />
+            </div>
+            <div>
+              <label className="events-toolbar__label">Sector</label>
+              <div className="events-toolbar__inline">
+                <input
+                  type="text"
+                  placeholder="e.g. Technology"
+                  value={filterDraft.sector}
+                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, sector: e.target.value, sectorAll: false }))}
+                  disabled={filterDraft.sectorAll}
+                />
+                <label className="events-toolbar__check">
+                  <input
+                    type="checkbox"
+                    checked={filterDraft.sectorAll}
+                    onChange={(e) => setFilterDraft((prev) => ({ ...prev, sectorAll: e.target.checked }))}
+                  />
+                  All
+                </label>
+              </div>
+            </div>
+            <div>
+              <label className="events-toolbar__label">Industry</label>
+              <div className="events-toolbar__inline">
+                <input
+                  type="text"
+                  placeholder="e.g. Semiconductors"
+                  value={filterDraft.industry}
+                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, industry: e.target.value, industryAll: false }))}
+                  disabled={filterDraft.industryAll}
+                />
+                <label className="events-toolbar__check">
+                  <input
+                    type="checkbox"
+                    checked={filterDraft.industryAll}
+                    onChange={(e) => setFilterDraft((prev) => ({ ...prev, industryAll: e.target.checked }))}
+                  />
+                  All
+                </label>
+              </div>
+            </div>
+            <div>
+              <label className="events-toolbar__label">Source</label>
+              <div className="events-toolbar__inline">
+                <input
+                  type="text"
+                  placeholder="e.g. Bloomberg"
+                  value={filterDraft.source}
+                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, source: e.target.value, sourceAll: false }))}
+                  disabled={filterDraft.sourceAll}
+                />
+                <label className="events-toolbar__check">
+                  <input
+                    type="checkbox"
+                    checked={filterDraft.sourceAll}
+                    onChange={(e) => setFilterDraft((prev) => ({ ...prev, sourceAll: e.target.checked }))}
+                  />
+                  All
+                </label>
+              </div>
+            </div>
+            <div>
+              <label className="events-toolbar__label">Position (Qualitative)</label>
+              <select
+                value={filterDraft.positionQualitative}
+                onChange={(e) => setFilterDraft((prev) => ({ ...prev, positionQualitative: e.target.value }))}
+              >
+                <option value="all">All</option>
+                <option value="long">long</option>
+                <option value="short">short</option>
+                <option value="undefined">undefined</option>
+              </select>
+            </div>
+          </div>
+        ) : null}
+      </div>
+      <div className="events-toolbar__actions">
+        <button
+          type="button"
+          className="btn btn-sm btn-primary"
+          onClick={handleApplyFilters}
+          disabled={!canApplyFilters || eventsLoading}
+        >
+          Apply
+        </button>
+        <button
+          type="button"
+          className="btn btn-sm btn-outline"
+          onClick={handleResetFilters}
+          disabled={!canResetFilters || eventsLoading}
+        >
+          Reset
+        </button>
+      </div>
+    </div>
+  );
 
-  const baseOffset = lastSettings?.baseOffset ?? 0;
-  const buyLabel = baseOffset === 0 ? 'D0' : `D${baseOffset > 0 ? `+${baseOffset}` : baseOffset}`;
-  const sellLabel = bestWindow
-    ? `D${bestWindow.offset > 0 ? `+${bestWindow.offset}` : bestWindow.offset}`
-    : '-';
-  const bestReturnLabel = bestWindow
-    ? `${(bestWindow.avg * 100).toFixed(2)}%`
-    : 'N/A';
+  const bestWindowMeta = React.useMemo(() => {
+    if (!bestWindowSummary) return null;
+    const modeKey = eventsDayOffsetMode === 'performance_previous' ? 'previous' : 'designated';
+    return bestWindowSummary[modeKey] || null;
+  }, [bestWindowSummary, eventsDayOffsetMode]);
+
+  const formatOffsetLabel = (offset) => (offset === 0 ? 'D0' : `D${offset}`);
+  const parseOffsetKey = (key) => {
+    if (key === 'd_0') return 0;
+    const match = key.match(/^d_(pos|neg)(\d+)$/);
+    if (!match) return null;
+    const value = parseInt(match[2], 10);
+    return match[1] === 'neg' ? -value : value;
+  };
+  const bestWindowMinConf = Number.isFinite(appliedSettings?.bestWindowMinConf)
+    ? appliedSettings.bestWindowMinConf
+    : null;
+  const bestWindowDetailItems = React.useMemo(() => {
+    if (!bestWindowMeta?.offsetAverages) return [];
+    const minConf = bestWindowMinConf;
+    const items = Object.entries(bestWindowMeta.offsetAverages)
+      .map(([key, avg]) => {
+        if (!Number.isFinite(avg)) return null;
+        const confValue = Number.isFinite(bestWindowMeta?.offsetPValues?.[key])
+          ? (1 - bestWindowMeta.offsetPValues[key]) * 100
+          : null;
+        if (!Number.isFinite(confValue)) return null;
+        const avgPct = avg * 100;
+        const score = avgPct * confValue;
+        const offsetValue = parseOffsetKey(key);
+        const offsetLabel = offsetValue !== null ? formatOffsetLabel(offsetValue) : key;
+        return {
+          offsetKey: key,
+          offsetLabel,
+          avg: avgPct.toFixed(2),
+          conf: confValue.toFixed(1),
+          score: score.toFixed(2),
+          scoreValue: score,
+          count: bestWindowMeta?.offsetCounts?.[key] ?? 0,
+        };
+      })
+      .filter(Boolean);
+    const filtered = Number.isFinite(minConf)
+      ? items.filter((item) => Number(item.conf) >= minConf)
+      : items;
+    return filtered
+      .sort((a, b) => b.scoreValue - a.scoreValue)
+      .slice(0, 2)
+      .map((item, index) => ({
+        ...item,
+        label: `${index + 1}${index === 0 ? 'st' : 'nd'}`,
+      }));
+  }, [bestWindowMeta, bestWindowMinConf]);
+  const bestReturnLabel = bestWindowDetailItems.length
+    ? `${bestWindowDetailItems[0].avg}%`
+    : bestWindowLoading ? 'Loading...' : 'N/A';
+  const [backtestMode, setBacktestMode] = React.useState('percent');
+  const backtestModes = bestWindowMeta?.backtestModes || null;
+  const selectedBacktest = backtestModes?.[backtestMode] || bestWindowMeta?.backtest || null;
+  const backtestDetailLines = selectedBacktest
+    ? [
+      `Backtest(${selectedBacktest.exitMode || backtestMode}): hold=${selectedBacktest.holdDays ?? '-'}d | trades=${selectedBacktest.trades ?? 0}`,
+      `Avg Daily Log=${((selectedBacktest.avgDailyLogReturn ?? 0) * 100).toFixed(2)}% | Score=${((selectedBacktest.avgScore ?? 0) * 100).toFixed(2)}%`,
+      `Sharpe=${(selectedBacktest.strategy?.sharpe ?? 0).toFixed(2)} | Sortino=${(selectedBacktest.strategy?.sortino ?? 0).toFixed(2)} | Calmar=${(selectedBacktest.strategy?.calmar ?? 0).toFixed(2)}`,
+    ]
+    : [];
+
+  React.useEffect(() => {
+    if (bestWindowMeta?.backtest?.exitMode) {
+      setBacktestMode(bestWindowMeta.backtest.exitMode);
+    }
+  }, [bestWindowMeta?.backtest?.exitMode]);
+  const backtestDefaultLabel = bestWindowMeta?.backtest?.exitMode
+    ? `Default mode: ${bestWindowMeta.backtest.exitMode}`
+    : null;
+  const backtestModeNote = eventsDayOffsetMode === 'performance_previous'
+    ? 'Previous day 모드는 전일 대비 변화로 계산합니다. Hold=1일 때 일부 지표가 불안정할 수 있습니다.'
+    : 'Designated date 모드는 기준일(Base Offset) 가격을 진입 기준으로 계산합니다.';
+  const backtestModeTitle = eventsDayOffsetMode === 'performance_previous'
+    ? 'Previous day 모드 설명'
+    : 'Designated date 모드 설명';
+  const backtestTableRows = selectedBacktest
+    ? [
+      ['Avg Log Return', (selectedBacktest.avgLogReturn ?? 0).toFixed(6), '전체 거래의 로그 수익 평균입니다. 클수록 좋아요.'],
+      ['Avg Daily Log', (selectedBacktest.avgDailyLogReturn ?? 0).toFixed(6), '하루 평균 수익입니다. 클수록 좋아요.'],
+      ['Avg CAGR Daily', (selectedBacktest.avgCagrDaily ?? 0).toFixed(6), '하루 복리 수익입니다. 클수록 좋아요.'],
+      ['Avg MDD', (selectedBacktest.avgMdd ?? 0).toFixed(6), '거래 중 가장 크게 떨어진 비율의 평균입니다. 작을수록 좋아요.'],
+      ['Avg ATR', (selectedBacktest.avgAtr ?? 0).toFixed(6), '평균 변동성입니다. 수치가 크면 가격이 많이 흔들린다는 뜻입니다.'],
+      ['Avg Risk Penalty', (selectedBacktest.avgRiskPenalty ?? 0).toFixed(6), '위험 벌점입니다. 작을수록 좋아요.'],
+      ['Avg Score', (selectedBacktest.avgScore ?? 0).toFixed(6), '수익에서 위험을 뺀 점수입니다. 클수록 좋아요.'],
+      ['Sharpe', (selectedBacktest.strategy?.sharpe ?? 0).toFixed(6), '수익을 흔들림으로 나눈 값입니다. 클수록 좋아요.'],
+      ['Sortino', (selectedBacktest.strategy?.sortino ?? 0).toFixed(6), '나쁜 흔들림만 고려한 점수입니다. 클수록 좋아요.'],
+      ['Calmar', (selectedBacktest.strategy?.calmar ?? 0).toFixed(6), '연복리 수익을 최대 낙폭으로 나눈 값입니다. 클수록 좋아요.'],
+      ['CAGR', (selectedBacktest.strategy?.cagr ?? 0).toFixed(6), '연 복리 수익률입니다. 클수록 좋아요.'],
+      ['Max Drawdown', (selectedBacktest.strategy?.maxDrawdown ?? 0).toFixed(6), '전체 기간 중 가장 크게 떨어진 비율입니다. 작을수록 좋아요.'],
+      ['Total Return', (selectedBacktest.strategy?.totalReturn ?? 0).toFixed(6), '전체 기간의 누적 수익률입니다. 클수록 좋아요.'],
+      ['Trades', String(selectedBacktest.trades ?? 0), '계산에 사용된 거래 수입니다. 너무 적으면 참고용입니다.'],
+    ]
+    : [];
+  const offsetAverageRows = bestWindowMeta?.offsetAverages
+    ? Object.entries(bestWindowMeta.offsetAverages)
+      .filter(([, value]) => Number.isFinite(value))
+      .map(([key, value]) => {
+        const count = bestWindowMeta.offsetCounts?.[key] ?? 0;
+        const pValueRaw = bestWindowMeta.offsetPValues?.[key];
+        const confidence = Number.isFinite(pValueRaw) ? ((1 - pValueRaw) * 100).toFixed(1) : null;
+        const stdevRaw = bestWindowMeta.offsetStdDevs?.[key];
+        const stdev = Number.isFinite(stdevRaw) ? (stdevRaw * 100).toFixed(4) : null;
+        return [key, ((value || 0) * 100).toFixed(4), count, stdev, confidence];
+      })
+    : [];
 
   const formatLogMessage = (entry) => {
     const stage = entry.stage || 'unknown';
@@ -459,202 +873,284 @@ export default function EventsHistoryPage() {
       <header style={{ marginBottom: 'var(--space-4)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h1 style={{ marginBottom: 'var(--space-1)' }}>Events</h1>
-          <p style={{ color: 'var(--text-dim)', fontSize: 'var(--text-sm)', margin: 0 }}>
-            Cached calculations - {settingsLabel}
-          </p>
         </div>
       </header>
 
       <section style={{ marginBottom: 'var(--space-4)' }}>
         <h2 style={{ marginBottom: 'var(--space-2)' }}>Dashboard</h2>
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-            gap: 'var(--space-3)',
-          }}
-        >
-          {kpisLoading ? (
-            <div className="loading">Loading KPIs...</div>
-          ) : kpisError ? (
-            <div className="alert alert-error">Error loading KPIs: {kpisError}</div>
-          ) : (
-            <>
+        {kpisLoading ? (
+          <div className="loading">Loading KPIs...</div>
+        ) : kpisError ? (
+          <div className="alert alert-error">Error loading KPIs: {kpisError}</div>
+        ) : (
+          <>
+            <div className="events-kpi-row">
               <KPICard
                 title="Coverage"
                 value={kpis.coverage.toLocaleString()}
                 subtitle="Active tickers"
               />
               <KPICard
+                title="Best Window"
+                value={bestReturnLabel}
+                subtitle={(
+                  <div>
+                    {bestWindowDetailItems.length === 0 ? (
+                      <div>
+                        {bestWindowLoading
+                          ? 'Loading...'
+                          : bestWindowError
+                            || (bestWindowMeta?.topWindows?.length
+                              ? (Number.isFinite(bestWindowMinConf)
+                                ? `No windows with Conf >= ${bestWindowMinConf}%`
+                                : 'Complete to compute')
+                              : 'Complete to compute')}
+                      </div>
+                    ) : (
+                      <>
+                        <details style={{ marginBottom: 'var(--space-1)' }}>
+                          <summary style={{ cursor: 'pointer', fontSize: 'var(--text-xs)' }}>
+                            Best Window Details
+                          </summary>
+                          {bestWindowDetailItems.map((item) => (
+                            <div
+                              key={`${item.label}-${item.buy}-${item.sell}`}
+                              style={{
+                                marginTop: '4px',
+                                padding: '6px 8px',
+                                borderRadius: 'var(--rounded-sm)',
+                                backgroundColor: 'var(--surface)',
+                              }}
+                            >
+                              <table
+                                style={{
+                                  width: '100%',
+                                  borderCollapse: 'collapse',
+                                  fontSize: 'var(--text-xs)',
+                                  tableLayout: 'fixed',
+                                }}
+                              >
+                                <tbody>
+                                  <tr>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>Rank</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.label}</td>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>Offset</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.offsetLabel}</td>
+                                  </tr>
+                                  <tr>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>Avg (%)</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.avg}</td>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>Conf (%)</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.conf}</td>
+                                  </tr>
+                                  <tr>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>Score</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.score}</td>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>N</td>
+                                    <td style={{ padding: '2px 6px' }}>{item.count}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          ))}
+                        </details>
+                        {backtestTableRows.length > 0 ? (
+                          <details style={{ marginTop: 'var(--space-1)' }}>
+                            <summary style={{ cursor: 'pointer', fontSize: 'var(--text-xs)' }}>
+                              Backtest Details
+                            </summary>
+                            <div style={{ marginTop: '6px', marginBottom: '6px' }}>
+                              {backtestDefaultLabel ? (
+                                <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)' }}>
+                                  현재 기본값: {backtestDefaultLabel.replace('Default mode: ', '')}
+                                </div>
+                              ) : null}
+                              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-dim)', display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px' }}>
+                                <span>{backtestModeTitle}</span>
+                                <span
+                                  title={`${backtestModeNote} percent는 퍼센트 기준, ATR은 변동성 기준으로 손절/익절을 계산합니다.`}
+                                  style={{
+                                    display: 'inline-flex',
+                                    justifyContent: 'center',
+                                    alignItems: 'center',
+                                    width: '16px',
+                                    height: '16px',
+                                    borderRadius: '999px',
+                                    backgroundColor: 'var(--surface)',
+                                    border: '1px solid var(--border)',
+                                    fontSize: '10px',
+                                    color: 'var(--text-dim)',
+                                    cursor: 'help',
+                                  }}
+                                >
+                                  ?
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                                <button
+                                  type="button"
+                                  className={`btn btn-sm ${backtestMode === 'percent' ? 'btn-primary' : 'btn-outline'}`}
+                                  onClick={() => setBacktestMode('percent')}
+                                  style={{ flex: 1 }}
+                                >
+                                  %
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`btn btn-sm ${backtestMode === 'atr' ? 'btn-primary' : 'btn-outline'}`}
+                                  onClick={() => setBacktestMode('atr')}
+                                  style={{ flex: 1 }}
+                                >
+                                  ATR
+                                </button>
+                              </div>
+                            </div>
+                            <table
+                              style={{
+                                width: '100%',
+                                marginTop: 'var(--space-1)',
+                                borderCollapse: 'collapse',
+                                fontSize: 'var(--text-xs)',
+                              }}
+                            >
+                              <tbody>
+                                {backtestTableRows.map(([label, value, help]) => (
+                                  <tr key={label}>
+                                    <td style={{ padding: '2px 6px', color: 'var(--text-dim)' }}>
+                                      <span>{label}</span>
+                                      <span
+                                        title={help}
+                                        style={{
+                                          display: 'inline-flex',
+                                          justifyContent: 'center',
+                                          alignItems: 'center',
+                                          marginLeft: '6px',
+                                          width: '16px',
+                                          height: '16px',
+                                          borderRadius: '999px',
+                                          backgroundColor: 'var(--surface)',
+                                          border: '1px solid var(--border)',
+                                          fontSize: '10px',
+                                          color: 'var(--text-dim)',
+                                          cursor: 'help',
+                                        }}
+                                      >
+                                        ?
+                                      </span>
+                                    </td>
+                                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>{value}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </details>
+                        ) : null}
+                        {offsetAverageRows.length > 0 ? (
+                          <details style={{ marginTop: 'var(--space-1)' }}>
+                            <summary style={{ cursor: 'pointer', fontSize: 'var(--text-xs)' }}>
+                              Raw Offset Averages (Backend)
+                            </summary>
+                            <table
+                              style={{
+                                width: '100%',
+                                marginTop: 'var(--space-1)',
+                                borderCollapse: 'collapse',
+                                fontSize: 'var(--text-xs)',
+                              }}
+                            >
+                              <thead>
+                                <tr>
+                                  <th style={{ textAlign: 'left', padding: '2px 6px', color: 'var(--text-dim)' }}>Offset</th>
+                                  <th style={{ textAlign: 'right', padding: '2px 6px', color: 'var(--text-dim)' }}>Avg (%)</th>
+                                  <th style={{ textAlign: 'right', padding: '2px 6px', color: 'var(--text-dim)' }}>N</th>
+                                  <th style={{ textAlign: 'right', padding: '2px 6px', color: 'var(--text-dim)' }}>
+                                    Std (%)
+                                    <span
+                                      title="평균값이 얼마나 흔들리는지 보여줍니다. 숫자가 클수록 들쑥날쑥합니다."
+                                      style={{
+                                        display: 'inline-flex',
+                                        justifyContent: 'center',
+                                        alignItems: 'center',
+                                        marginLeft: '6px',
+                                        width: '14px',
+                                        height: '14px',
+                                        borderRadius: '999px',
+                                        backgroundColor: 'var(--surface)',
+                                        border: '1px solid var(--border)',
+                                        fontSize: '9px',
+                                        color: 'var(--text-dim)',
+                                        cursor: 'help',
+                                      }}
+                                    >
+                                      ?
+                                    </span>
+                                  </th>
+                                  <th style={{ textAlign: 'right', padding: '2px 6px', color: 'var(--text-dim)' }}>
+                                    Conf (%)
+                                    <span
+                                      title="평균이 우연일 가능성이 낮다는 뜻입니다. 표본이 작거나 변동이 크면 낮아질 수 있습니다."
+                                      style={{
+                                        display: 'inline-flex',
+                                        justifyContent: 'center',
+                                        alignItems: 'center',
+                                        marginLeft: '6px',
+                                        width: '14px',
+                                        height: '14px',
+                                        borderRadius: '999px',
+                                        backgroundColor: 'var(--surface)',
+                                        border: '1px solid var(--border)',
+                                        fontSize: '9px',
+                                        color: 'var(--text-dim)',
+                                        cursor: 'help',
+                                      }}
+                                    >
+                                      ?
+                                    </span>
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {offsetAverageRows.map(([key, value, count, stdev, confidence]) => (
+                                  <tr key={key}>
+                                    <td style={{ padding: '2px 6px' }}>{key}</td>
+                                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>{value}</td>
+                                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>{count}</td>
+                                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>{stdev ?? '-'}</td>
+                                    <td style={{ padding: '2px 6px', textAlign: 'right' }}>{confidence ?? '-'}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </details>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                )}
+              />
+            </div>
+            <div className="events-kpi-row events-kpi-row--freshness">
+              <KPICard
                 title="Targets Freshness"
-                value={formatDate(kpis.targetsFreshness)}
+                value={formatDate(kpis.targetsFreshness, { dateOnly: true })}
                 subtitle="config_lv3_targets updated_at"
+                className="kpi-card--compact"
               />
               <KPICard
                 title="Quantitatives Freshness"
-                value={formatDate(kpis.quantitativesFreshness)}
+                value={formatDate(kpis.quantitativesFreshness, { dateOnly: true })}
                 subtitle="config_lv3_quantitatives updated_at"
+                className="kpi-card--compact"
               />
               <KPICard
                 title="Events Freshness"
-                value={formatDate(kpis.eventsFreshness)}
+                value={formatDate(kpis.eventsFreshness, { dateOnly: true })}
                 subtitle="txn_events updated_at"
+                className="kpi-card--compact"
               />
-              <KPICard
-                title="Best Window"
-                value={bestReturnLabel}
-                subtitle={`Buy ${buyLabel} / Sell ${sellLabel}`}
-              />
-            </>
-          )}
-        </div>
-      </section>
-
-      <section
-        className="table-toolbar"
-        style={{
-          marginBottom: 'var(--space-4)',
-          border: '1px solid var(--border)',
-          borderRadius: 'var(--rounded-lg)',
-          flexWrap: 'wrap',
-          gap: 'var(--space-2)',
-        }}
-      >
-        <div style={{ flexBasis: '100%' }}>
-          <EventsSettingsPanel />
-        </div>
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-            gap: 'var(--space-2)',
-            alignItems: 'end',
-            width: '100%',
-          }}
-        >
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Event date from
-            </label>
-            <input
-              type="date"
-              value={filterDraft.eventDateFrom}
-              onChange={(e) => setFilterDraft((prev) => ({ ...prev, eventDateFrom: e.target.value }))}
-            />
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Event date to
-            </label>
-            <input
-              type="date"
-              value={filterDraft.eventDateTo}
-              onChange={(e) => setFilterDraft((prev) => ({ ...prev, eventDateTo: e.target.value }))}
-            />
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Sector
-            </label>
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-              <input
-                type="text"
-                placeholder="e.g. Technology"
-                value={filterDraft.sector}
-                onChange={(e) => setFilterDraft((prev) => ({ ...prev, sector: e.target.value, sectorAll: false }))}
-                disabled={filterDraft.sectorAll}
-              />
-              <label style={{ fontSize: 'var(--text-xs)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <input
-                  type="checkbox"
-                  checked={filterDraft.sectorAll}
-                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, sectorAll: e.target.checked }))}
-                />
-                All
-              </label>
             </div>
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Industry
-            </label>
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-              <input
-                type="text"
-                placeholder="e.g. Semiconductors"
-                value={filterDraft.industry}
-                onChange={(e) => setFilterDraft((prev) => ({ ...prev, industry: e.target.value, industryAll: false }))}
-                disabled={filterDraft.industryAll}
-              />
-              <label style={{ fontSize: 'var(--text-xs)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <input
-                  type="checkbox"
-                  checked={filterDraft.industryAll}
-                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, industryAll: e.target.checked }))}
-                />
-                All
-              </label>
-            </div>
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Source
-            </label>
-            <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-              <input
-                type="text"
-                placeholder="e.g. Bloomberg"
-                value={filterDraft.source}
-                onChange={(e) => setFilterDraft((prev) => ({ ...prev, source: e.target.value, sourceAll: false }))}
-                disabled={filterDraft.sourceAll}
-              />
-              <label style={{ fontSize: 'var(--text-xs)', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <input
-                  type="checkbox"
-                  checked={filterDraft.sourceAll}
-                  onChange={(e) => setFilterDraft((prev) => ({ ...prev, sourceAll: e.target.checked }))}
-                />
-                All
-              </label>
-            </div>
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Position (Quantitative)
-            </label>
-            <select
-              value={filterDraft.positionQuantitative}
-              onChange={(e) => setFilterDraft((prev) => ({ ...prev, positionQuantitative: e.target.value }))}
-            >
-              <option value="all">All</option>
-              <option value="long">long</option>
-              <option value="short">short</option>
-              <option value="undefined">undefined</option>
-            </select>
-          </div>
-          <div>
-            <label style={{ display: 'block', fontSize: 'var(--text-xs)', fontWeight: 600, marginBottom: '4px' }}>
-              Position (Qualitative)
-            </label>
-            <select
-              value={filterDraft.positionQualitative}
-              onChange={(e) => setFilterDraft((prev) => ({ ...prev, positionQualitative: e.target.value }))}
-            >
-              <option value="all">All</option>
-              <option value="long">long</option>
-              <option value="short">short</option>
-              <option value="undefined">undefined</option>
-            </select>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'flex-end' }}>
-            <button type="button" className="btn btn-sm btn-primary" onClick={handleApplyFilters}>
-              Apply
-            </button>
-            <button type="button" className="btn btn-sm btn-outline" onClick={handleResetFilters}>
-              Reset
-            </button>
-          </div>
-        </div>
+          </>
+        )}
       </section>
 
       {!activeFilters ? (
@@ -808,11 +1304,14 @@ export default function EventsHistoryPage() {
             setEventsFilters(newFilters);
             setEventsPage(1);
           }}
-          dayOffsetMode="performance"
+          dayOffsetMode={eventsDayOffsetMode}
+          onDayOffsetModeChange={setEventsDayOffsetMode}
           minThreshold={lastSettings?.minThreshold}
           maxThreshold={lastSettings?.maxThreshold}
           baseOffset={lastSettings?.baseOffset}
           baseField={lastSettings?.baseField}
+          toolbarContent={toolbarContent}
+          onReload={handleReload}
         />
       )}
     </>
