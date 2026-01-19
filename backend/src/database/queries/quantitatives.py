@@ -102,7 +102,8 @@ async def upsert_quantitatives(
                 financial_ratios = EXCLUDED.financial_ratios,
                 quote = EXCLUDED.quote,
                 historical_price = EXCLUDED.historical_price,
-                historical_market_cap = EXCLUDED.historical_market_cap
+                historical_market_cap = EXCLUDED.historical_market_cap,
+                updated_at = NOW()
             """,
             record.get("ticker"),
             to_jsonb(record.get("status")),
@@ -115,3 +116,34 @@ async def upsert_quantitatives(
             to_jsonb(record.get("historical_price")),
             to_jsonb(record.get("historical_market_cap")),
         )
+
+
+async def touch_quantitatives_updated_at(
+    pool: asyncpg.Pool,
+    tickers: List[str]
+) -> int:
+    """
+    Touch updated_at for skip tickers to reflect freshness evaluation.
+
+    Returns:
+        Number of rows updated.
+    """
+    if not tickers:
+        return 0
+
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE config_lv3_quantitatives
+            SET updated_at = NOW()
+            WHERE ticker = ANY($1::text[])
+            """,
+            tickers,
+        )
+
+    if result and "UPDATE" in result:
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+    return 0

@@ -1,0 +1,26 @@
+export const TRADES_COLUMNS = [
+  { key: 'ticker', label: 'ticker', type: 'string', width: 110, isDefault: true },
+  { key: 'trade_date', label: 'trade_date', type: 'daterange', width: 170, isDefault: true },
+  { key: 'model', label: 'model', type: 'string', width: 140, isDefault: true },
+  { key: 'source', label: 'source', type: 'string', width: 120, isDefault: true },
+  { key: 'position', label: 'position', type: 'string', width: 110, isDefault: true },
+  { key: 'wts', label: 'WTS', type: 'number', width: 80, isDefault: true },
+
+  { key: 'd_0', label: 'D0', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos1', label: 'D1', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos2', label: 'D2', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos3', label: 'D3', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos4', label: 'D4', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos5', label: 'D5', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos6', label: 'D6', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos7', label: 'D7', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos8', label: 'D8', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos9', label: 'D9', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos10', label: 'D10', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos11', label: 'D11', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos12', label: 'D12', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos13', label: 'D13', type: 'dayoffset', width: 90, isDefault: true },
+  { key: 'd_pos14', label: 'D14', type: 'dayoffset', width: 90, isDefault: true },
+
+  { key: 'notes', label: 'notes', type: 'string', width: 220, isDefault: false },
+];

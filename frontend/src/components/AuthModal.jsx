@@ -19,14 +19,14 @@ export default function AuthModal({ isOpen, onClose, nextHash }) {
   useEffect(() => {
     if (!isOpen) return;
     if (!loading && isAuthenticated) {
-      if (nextHash) {
+      if (nextHash && isAdmin) {
         window.location.hash = nextHash;
-      } else {
+      } else if (!nextHash) {
         window.location.hash = '#/trades';
       }
       onClose();
     }
-  }, [isOpen, loading, isAuthenticated, nextHash, onClose]);
+  }, [isOpen, loading, isAuthenticated, isAdmin, nextHash, onClose]);
 
   useEffect(() => {
     if (!isOpen) {

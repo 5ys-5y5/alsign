@@ -9,6 +9,8 @@ from datetime import datetime, date, timedelta, timezone
 from uuid import UUID
 
 from ..database.connection import db_pool
+from ..services.utils.datetime_utils import is_trading_day
+from ..services.utils.freshness_utils import get_previous_quarter_end
 from ..auth import get_current_user, require_admin, UserContext
 
 logger = logging.getLogger("alsign")
@@ -20,7 +22,18 @@ class KPIResponse(BaseModel):
     """Response model for KPI data."""
 
     coverage: int
-    dataFreshness: Optional[str]
+    quantitativesFreshness: Optional[str]
+    holidaysFreshness: Optional[str]
+    tradesFreshness: Optional[str]
+
+
+class EventsKPIResponse(BaseModel):
+    """Response model for events page KPI data."""
+
+    coverage: int
+    targetsFreshness: Optional[str]
+    quantitativesFreshness: Optional[str]
+    eventsFreshness: Optional[str]
 
 
 class EventRow(BaseModel):
@@ -121,28 +134,38 @@ async def get_kpis(user: UserContext = Depends(require_admin)):
             )
             logger.debug(f"action=get_kpis phase=coverage_fetched count={coverage_result}")
 
-            # Get data freshness (latest update from holidays table)
-            freshness_result = await conn.fetchval(
+            quantitatives_freshness = await conn.fetchval(
+                "SELECT MAX(updated_at) FROM config_lv3_quantitatives"
+            )
+            holidays_freshness = await conn.fetchval(
                 "SELECT MAX(updated_at) FROM config_lv3_market_holidays"
             )
-            logger.debug(f"action=get_kpis phase=freshness_fetched freshness={freshness_result}")
-
-            # Format freshness as ISO string if it exists
-            data_freshness = (
-                freshness_result.isoformat() if freshness_result else None
+            trades_freshness = await conn.fetchval(
+                "SELECT MAX(updated_at) FROM txn_trades"
             )
+            logger.debug(
+                "action=get_kpis phase=freshness_fetched "
+                f"quantitatives={quantitatives_freshness} holidays={holidays_freshness} trades={trades_freshness}"
+            )
+
+            def to_iso(value):
+                return value.isoformat() if value else None
 
             # Check if database is empty and provide helpful message
             if coverage_result == 0:
                 logger.warning("action=get_kpis status=empty_database message='No data in config_lv3_targets'")
 
             logger.info(
-                f"action=get_kpis status=success coverage={coverage_result} "
-                f"dataFreshness={data_freshness}"
+                "action=get_kpis status=success "
+                f"coverage={coverage_result} quantitativesFreshness={quantitatives_freshness} "
+                f"holidaysFreshness={holidays_freshness} tradesFreshness={trades_freshness}"
             )
 
             return KPIResponse(
-                coverage=coverage_result or 0, dataFreshness=data_freshness
+                coverage=coverage_result or 0,
+                quantitativesFreshness=to_iso(quantitatives_freshness),
+                holidaysFreshness=to_iso(holidays_freshness),
+                tradesFreshness=to_iso(trades_freshness),
             )
 
     except Exception as e:
@@ -156,11 +179,61 @@ async def get_kpis(user: UserContext = Depends(require_admin)):
         raise HTTPException(status_code=500, detail=f"Failed to fetch KPIs: {str(e)}")
 
 
+@router.get("/events/kpis", response_model=EventsKPIResponse)
+async def get_events_kpis(user: UserContext = Depends(require_admin)):
+    """
+    Get KPI data for the events page.
+
+    Returns:
+        - coverage: Count of tickers in config_lv3_targets
+        - targetsFreshness: Latest update timestamp from config_lv3_targets
+        - quantitativesFreshness: Latest update timestamp from config_lv3_quantitatives
+        - eventsFreshness: Latest update timestamp from txn_events
+    """
+    logger.info("action=get_events_kpis phase=request_received")
+    try:
+        pool = await db_pool.get_pool()
+        async with pool.acquire() as conn:
+            coverage_result = await conn.fetchval(
+                "SELECT COUNT(*) FROM config_lv3_targets"
+            )
+            targets_freshness = await conn.fetchval(
+                "SELECT MAX(updated_at) FROM config_lv3_targets"
+            )
+            quantitatives_freshness = await conn.fetchval(
+                "SELECT MAX(updated_at) FROM config_lv3_quantitatives"
+            )
+            events_freshness = await conn.fetchval(
+                "SELECT MAX(updated_at) FROM txn_events"
+            )
+
+            def to_iso(value):
+                return value.isoformat() if value else None
+
+            logger.info(
+                "action=get_events_kpis status=success "
+                f"coverage={coverage_result} targetsFreshness={targets_freshness} "
+                f"quantitativesFreshness={quantitatives_freshness} eventsFreshness={events_freshness}"
+            )
+
+            return EventsKPIResponse(
+                coverage=coverage_result or 0,
+                targetsFreshness=to_iso(targets_freshness),
+                quantitativesFreshness=to_iso(quantitatives_freshness),
+                eventsFreshness=to_iso(events_freshness),
+            )
+
+    except Exception as e:
+        logger.error(f"action=get_events_kpis status=error error={str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch events KPIs: {str(e)}")
+
+
 @router.get("/events", response_model=EventsResponse)
 async def get_events(
     user: UserContext = Depends(require_admin),
     page: int = Query(1, ge=1, description="Page number starting from 1"),
     pageSize: int = Query(50, ge=1, le=1000, description="Number of rows per page"),
+    skip_count: bool = Query(False, alias="skipCount", description="Skip exact count query for faster responses"),
     sortBy: Optional[str] = Query(None, description="Column to sort by"),
     sortOrder: Optional[str] = Query(
         None, regex="^(asc|desc)$", description="Sort order: asc or desc"
@@ -320,10 +393,14 @@ async def get_events(
 
         pool = await db_pool.get_pool()
         async with pool.acquire() as conn:
-            # Get total count
-            count_query = f"SELECT COUNT(*) FROM txn_events e WHERE {where_clause}"
-            logger.debug(f"Executing count_query: {count_query} with params: {params} (types: {[type(p) for p in params]})")
-            total = await conn.fetchval(count_query, *params)
+            # Get total count (or fast estimate when skipCount enabled)
+            if skip_count:
+                total = await conn.fetchval("SELECT reltuples::bigint FROM pg_class WHERE oid = 'txn_events'::regclass")
+                total = int(total or 0)
+            else:
+                count_query = f"SELECT COUNT(*) FROM txn_events e WHERE {where_clause}"
+                logger.debug(f"Executing count_query: {count_query} with params: {params} (types: {[type(p) for p in params]})")
+                total = await conn.fetchval(count_query, *params)
 
             # Get data with txn_price_trend JOIN (price_trend JSONB is deprecated)
             data_query = f"""

@@ -655,6 +655,9 @@ async def get_quantitatives(
             logger.info(f"Skipped {len(skip_tickers)} tickers (fresh data): {', '.join(skip_ticker_names)}... and {len(skip_tickers) - 10} more")
         else:
             logger.info(f"Skipped {len(skip_tickers)} tickers (fresh data): {', '.join(skip_ticker_names)}")
+        skipped_ids = [s['ticker'] for s in skip_tickers]
+        touched = await quantitatives.touch_quantitatives_updated_at(pool, skipped_ids)
+        logger.info(f"[Phase 3] Touched updated_at for {touched}/{len(skipped_ids)} skipped tickers")
 
     # ===== Phase 4: Process work targets (new + update) =====
     work_targets = new_tickers + update_tickers

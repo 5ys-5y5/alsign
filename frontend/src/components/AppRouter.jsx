@@ -12,6 +12,8 @@ import SetRequestsPage from '../pages/SetRequestsPage';
 import ConditionGroupPage from '../pages/ConditionGroupPage';
 import DashboardPage from '../pages/DashboardPage';
 import TradesPage from '../pages/TradesPage';
+import HistoryPage from '../pages/HistoryPage';
+import EventsHistoryPage from '../pages/EventsHistoryPage';
 import ProfilePage from '../pages/ProfilePage';
 import AuthModal from './AuthModal';
 import BottomPanel from './BottomPanel';
@@ -89,6 +91,8 @@ const ROUTES = [
   { id: 'setRequests', label: 'setRequests', path: '#/setRequests', component: SetRequestsPage, adminOnly: true },
   { id: 'conditionGroup', label: 'conditionGroup', path: '#/conditionGroup', component: ConditionGroupPage, adminOnly: true },
   { id: 'dashboard', label: 'dashboard', path: '#/dashboard', component: DashboardPage, adminOnly: true },
+  { id: 'history', label: 'history', path: '#/history', component: HistoryPage, adminOnly: true },
+  { id: 'events', label: 'events', path: '#/events', component: EventsHistoryPage, adminOnly: true },
   { id: 'trades', label: 'trades', path: '#/trades', component: TradesPage },
   { id: 'profile', label: 'profile', path: '#/profile', component: ProfilePage, hideInNav: true },
 ];

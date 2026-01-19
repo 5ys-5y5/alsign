@@ -56,7 +56,8 @@ async def upsert_market_holidays(
                     is_closed = EXCLUDED.is_closed,
                     adj_open_time = EXCLUDED.adj_open_time,
                     adj_close_time = EXCLUDED.adj_close_time,
-                    is_fully_closed = EXCLUDED.is_fully_closed
+                    is_fully_closed = EXCLUDED.is_fully_closed,
+                    updated_at = NOW()
                 """,
                 holiday.get('exchange', 'NASDAQ'),
                 holiday['date'] if isinstance(holiday['date'], date) else date.fromisoformat(holiday['date']),

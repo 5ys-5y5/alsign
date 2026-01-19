@@ -628,7 +628,8 @@ async def batch_update_event_valuations(
                     disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
                     disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative),
                     price_quantitative = COALESCE(e.price_quantitative, b.price_quantitative),
-                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative)
+                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative),
+                    updated_at = NOW()
                 FROM batch_data b
                 WHERE e.ticker = b.ticker
                   AND e.event_date = b.event_date
@@ -657,7 +658,8 @@ async def batch_update_event_valuations(
                     disparity_quantitative = b.disparity_quantitative,
                     disparity_qualitative = b.disparity_qualitative,
                     price_quantitative = b.price_quantitative,
-                    peer_quantitative = b.peer_quantitative
+                    peer_quantitative = b.peer_quantitative,
+                    updated_at = NOW()
                 FROM batch_data b
                 WHERE e.ticker = b.ticker
                   AND e.event_date = b.event_date
@@ -692,7 +694,8 @@ async def batch_update_event_valuations(
                     disparity_quantitative = COALESCE(e.disparity_quantitative, b.disparity_quantitative),
                     disparity_qualitative = COALESCE(e.disparity_qualitative, b.disparity_qualitative),
                     price_quantitative = COALESCE(e.price_quantitative, b.price_quantitative),
-                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative)
+                    peer_quantitative = COALESCE(e.peer_quantitative, b.peer_quantitative),
+                    updated_at = NOW()
                 FROM batch_data b
                 WHERE e.ticker = b.ticker
                   AND e.event_date = b.event_date

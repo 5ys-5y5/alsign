@@ -172,7 +172,8 @@ async def update_target_peers(
                     UNNEST($2::jsonb[]) AS peer
             )
             UPDATE config_lv3_targets t
-            SET peer = b.peer
+            SET peer = b.peer,
+                updated_at = NOW()
             FROM batch_data b
             WHERE t.ticker = b.ticker
             """,

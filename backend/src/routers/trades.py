@@ -220,6 +220,36 @@ async def bulk_insert_trades(
                     insert_quantities,
                     insert_notes
                 )
+            
+            if existing_keys:
+                existing_list = list(existing_keys)
+                update_tickers = [key[0] for key in existing_list]
+                update_dates = [key[1] for key in existing_list]
+                update_models = [key[2] for key in existing_list]
+                await conn.execute(
+                    '''
+                    WITH batch_data AS (
+                        SELECT * FROM UNNEST(
+                            $1::text[],
+                            $2::date[],
+                            $3::text[]
+                        ) AS t(
+                            ticker,
+                            trade_date,
+                            model
+                        )
+                    )
+                    UPDATE public.txn_trades x
+                    SET updated_at = NOW()
+                    FROM batch_data b
+                    WHERE x.ticker = b.ticker
+                      AND x.trade_date = b.trade_date
+                      AND x.model = b.model
+                    ''',
+                    update_tickers,
+                    update_dates,
+                    update_models
+                )
 
         success_trades = [
             {

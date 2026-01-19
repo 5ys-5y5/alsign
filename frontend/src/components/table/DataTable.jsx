@@ -132,34 +132,103 @@ function formatNumber(value) {
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-function getDayOffsetTooltipContent(row, column, dayOffsetMode) {
+function getDayOffsetTooltipContent(
+  row,
+  column,
+  dayOffsetMode,
+  baseOffset = 0,
+  baseField = 'close',
+  minThreshold = null,
+  maxThreshold = null
+) {
   if (!row || row.is_blurred) {
     return null;
   }
 
   const targetDates = row.day_offset_target_dates;
-  const targetDate = targetDates ? targetDates[column.key] : null;
-  const targetLine = targetDate ? `기준일: ${targetDate}` : null;
+
+  // Build base day key from settings
+  const baseDayKey = baseOffset === 0
+    ? 'd_0'
+    : (baseOffset > 0 ? `d_pos${baseOffset}` : `d_neg${Math.abs(baseOffset)}`);
+  const baseLabel = (() => {
+    if (baseOffset === 0) return `D0 ${baseField}`;
+    const signed = baseOffset > 0 ? `+${baseOffset}` : `${baseOffset}`;
+    return `D${signed} ${baseField}`;
+  })();
+
+  // Get the correct OHLC map based on baseField setting
+  const ohlcMapKey = `day_offset_price_trend_${baseField}`;
+  const ohlcMap = row[ohlcMapKey];
 
   if (dayOffsetMode === 'performance') {
-    const priceTrendMap = row.day_offset_price_trend;
-    if (!priceTrendMap) {
-      return null;
-    }
-    const baseValue = Number(priceTrendMap.d_neg14);
-    const currentValue = Number(priceTrendMap[column.key]);
-    const baseLabel = 'D-14';
+    // Get base price from the configured baseOffset and baseField
+    const baseValue = ohlcMap ? Number(ohlcMap[baseDayKey]) : null;
+    const baseDate = targetDates ? targetDates[baseDayKey] : null;
+
+    const openMap = row.day_offset_price_trend_open;
+    const highMap = row.day_offset_price_trend_high;
+    const lowMap = row.day_offset_price_trend_low;
+    const closeMap = row.day_offset_price_trend_close;
+
     const currentLabel = column.label || column.key;
-    const lines = [];
-    if (targetLine) {
-      lines.push(targetLine);
-      lines.push('');
+    const currentOpen = openMap ? Number(openMap[column.key]) : null;
+    const currentHigh = highMap ? Number(highMap[column.key]) : null;
+    const currentLow = lowMap ? Number(lowMap[column.key]) : null;
+    const currentClose = closeMap ? Number(closeMap[column.key]) : null;
+
+    const performanceMap = row.day_offset_performance;
+    const rawValue = performanceMap ? Number(performanceMap[column.key]) : null;
+    const position = row?.position ? String(row.position).toLowerCase() : '';
+    const positionMultiplier = position === 'short' ? -1 : 1;
+    const displayValue = Number.isFinite(rawValue) ? rawValue * positionMultiplier : null;
+    const minNorm = minThreshold !== null ? minThreshold / 100 : null;
+    const maxNorm = maxThreshold !== null ? maxThreshold / 100 : null;
+    const tolerance = 0.0001;
+
+    let usedField = 'close';
+    if (Number.isFinite(displayValue)) {
+      if (minNorm !== null && Math.abs(displayValue - minNorm) < tolerance) {
+        usedField = positionMultiplier === -1 ? 'high' : 'low';
+      } else if (maxNorm !== null && Math.abs(displayValue - maxNorm) < tolerance) {
+        usedField = positionMultiplier === -1 ? 'low' : 'high';
+      }
     }
-    if (column.key !== 'd_neg14') {
-      lines.push(`${currentLabel} N: ${formatNumber(currentValue)}`);
-    }
-    lines.push(`${baseLabel} N: ${formatNumber(baseValue)}`);
-    return lines.join('\n');
+
+    const dimStyle = { color: '#d1d5db' };
+    const activeStyle = { fontWeight: 700, color: '#111827' };
+
+    return (
+      <div>
+        {baseDate ? <div>기준일: {baseDate}</div> : null}
+        <div style={{ marginTop: '6px' }}>
+          <div>
+            <span style={usedField === 'open' ? activeStyle : dimStyle}>
+              {currentLabel} open: {formatNumber(currentOpen)}
+            </span>
+          </div>
+          <div>
+            <span style={usedField === 'high' ? activeStyle : dimStyle}>
+              {currentLabel} high: {formatNumber(currentHigh)}
+            </span>
+          </div>
+          <div>
+            <span style={usedField === 'low' ? activeStyle : dimStyle}>
+              {currentLabel} low: {formatNumber(currentLow)}
+            </span>
+          </div>
+          <div>
+            <span style={usedField === 'close' ? activeStyle : dimStyle}>
+              {currentLabel} close: {formatNumber(currentClose)}
+            </span>
+          </div>
+        </div>
+        <div style={{ borderTop: '1px solid #e5e7eb', margin: '8px 0' }} />
+        <div>
+          <span style={activeStyle}>{baseLabel}: {formatNumber(baseValue)}</span>
+        </div>
+      </div>
+    );
   }
 
   const performanceMap = row.day_offset_performance;
@@ -175,22 +244,10 @@ function getDayOffsetTooltipContent(row, column, dayOffsetMode) {
   const displayValue = rawValue * positionMultiplier;
   const label = column.label || column.key;
   const lines = [];
-  if (targetLine) {
-    lines.push(targetLine);
-    lines.push('');
-  }
   lines.push(`${label} %: ${(displayValue * 100).toFixed(2)}%`);
   return lines.join('\n');
 }
 
-/**
- * Apply filters to data rows.
- *
- * @param {Array} data - Array of data rows
- * @param {Object} filters - Filters object { columnKey: filterValue }
- * @param {Array} columns - Column configurations
- * @returns {Array} Filtered data rows
- */
 function applyFilters(data, filters, columns) {
   return data.filter((row) => {
     return Object.entries(filters).every(([columnKey, filterValue]) => {
@@ -339,6 +396,10 @@ export default function DataTable({
   onSelectionChange,
   getRowClassName,
   dayOffsetMode = 'performance',
+  minThreshold = null,
+  maxThreshold = null,
+  baseOffset = 0,
+  baseField = 'close',
 }) {
   // Track expanded rows
   const [expandedRows, setExpandedRows] = useState(new Set());
@@ -355,7 +416,8 @@ export default function DataTable({
   }, [selectedRows, onSelectionChange]);
   // Determine visible columns
   const visibleColumns = useMemo(() => {
-    return columns.filter((col) => selectedColumns.includes(col.key));
+    const columnMap = new Map(columns.map((col) => [col.key, col]));
+    return selectedColumns.map((key) => columnMap.get(key)).filter(Boolean);
   }, [columns, selectedColumns]);
 
   // Apply filters and sorting
@@ -436,7 +498,15 @@ export default function DataTable({
   };
 
   const handleDayOffsetMove = (event, row, column) => {
-    const content = getDayOffsetTooltipContent(row, column, dayOffsetMode);
+    const content = getDayOffsetTooltipContent(
+      row,
+      column,
+      dayOffsetMode,
+      baseOffset,
+      baseField,
+      minThreshold,
+      maxThreshold
+    );
     if (!content) {
       if (hoverTooltip.visible) {
         setHoverTooltip((prev) => ({ ...prev, visible: false }));
@@ -632,25 +702,52 @@ export default function DataTable({
                             />
                           </td>
                         )}
-                        {visibleColumns.map((column) => (
-                          <td
-                            key={column.key}
-                            style={{
-                              width: column.width ? `${column.width}px` : 'auto',
-                            }}
-                          >
-                            {column.type === 'dayoffset' ? (
-                              <span
-                                onMouseMove={(event) => handleDayOffsetMove(event, row, column)}
-                                onMouseLeave={handleDayOffsetLeave}
-                              >
-                                {renderCellValue(row[column.key], column, row, dayOffsetMode)}
-                              </span>
-                            ) : (
-                              renderCellValue(row[column.key], column, row, dayOffsetMode)
-                            )}
-                          </td>
-                        ))}
+                        {visibleColumns.map((column) => {
+                          // Check for threshold breach on dayoffset columns
+                          let thresholdStyle = null;
+                          if (column.type === 'dayoffset' && dayOffsetMode === 'performance') {
+                            const rawValue = Number(row[column.key]);
+                            if (Number.isFinite(rawValue)) {
+                              const position = row?.position ? String(row.position).toLowerCase() : '';
+                              const positionMultiplier = position === 'short' ? -1 : 1;
+                              const displayValue = rawValue * positionMultiplier;
+                              const minNorm = minThreshold !== null ? minThreshold / 100 : null;
+                              const maxNorm = maxThreshold !== null ? maxThreshold / 100 : null;
+                              const tolerance = 0.0001;
+                              if (minNorm !== null && Math.abs(displayValue - minNorm) < tolerance) {
+                                thresholdStyle = { backgroundColor: 'rgba(59, 130, 246, 0.15)', fontWeight: 600 };
+                              } else if (maxNorm !== null && Math.abs(displayValue - maxNorm) < tolerance) {
+                                thresholdStyle = { backgroundColor: 'rgba(239, 68, 68, 0.15)', fontWeight: 600 };
+                              }
+                            }
+                          }
+                          return (
+                            <td
+                              key={column.key}
+                              style={{
+                                width: column.width ? `${column.width}px` : 'auto',
+                                ...thresholdStyle,
+                              }}
+                            >
+                              {column.render ? (
+                                column.render({
+                                  value: row[column.key],
+                                  row,
+                                  column,
+                                })
+                              ) : column.type === 'dayoffset' ? (
+                                <span
+                                  onMouseMove={(event) => handleDayOffsetMove(event, row, column)}
+                                  onMouseLeave={handleDayOffsetLeave}
+                                >
+                                  {renderCellValue(row[column.key], column, row, dayOffsetMode)}
+                                </span>
+                              ) : (
+                                renderCellValue(row[column.key], column, row, dayOffsetMode)
+                              )}
+                            </td>
+                          );
+                        })}
                       </tr>
                       {isExpanded && (
                         <tr className={`expanded-row ${rowClassName}`}>
@@ -662,7 +759,14 @@ export default function DataTable({
                               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 'var(--space-2)' }}>
                                 {columns.map((column) => (
                                   <div key={column.key} style={{ fontSize: 'var(--text-sm)' }}>
-                                    <strong>{column.label}:</strong> {renderCellValue(row[column.key], column, row, dayOffsetMode)}
+                                    <strong>{column.label}:</strong>{' '}
+                                    {column.render
+                                      ? column.render({
+                                        value: row[column.key],
+                                        row,
+                                        column,
+                                      })
+                                      : renderCellValue(row[column.key], column, row, dayOffsetMode)}
                                   </div>
                                 ))}
                               </div>
@@ -711,7 +815,7 @@ export default function DataTable({
             color: 'var(--text)',
             boxShadow: 'var(--shadow-md)',
             pointerEvents: 'none',
-            whiteSpace: 'pre',
+            whiteSpace: typeof hoverTooltip.content === 'string' ? 'pre' : 'normal',
             zIndex: 1000,
           }}
         >

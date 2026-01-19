@@ -8,6 +8,7 @@
 import React, { useState, useEffect } from 'react';
 import KPICard from '../components/dashboard/KPICard';
 import EventsTable from '../components/dashboard/EventsTable';
+import HistorySettingsPanel from '../components/dashboard/HistorySettingsPanel';
 
 import { API_BASE_URL, getAuthHeaders } from '../services/api';
 
@@ -239,6 +240,11 @@ export default function DashboardPage() {
             </>
           )}
         </div>
+      </section>
+
+      {/* History Settings Section */}
+      <section style={{ marginBottom: 'var(--space-5)' }}>
+        <HistorySettingsPanel />
       </section>
 
       {/* Events Section */}

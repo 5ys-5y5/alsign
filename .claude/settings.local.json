@@ -147,7 +147,10 @@
       "Bash(wmic process where \"name=''python.exe''\" delete)",
       "Bash(wmic process where \"CommandLine like ''%uvicorn%''\" get ProcessId,CommandLine)",
       "Bash(wmic process where \"name=''python.exe'' and CommandLine like ''%uvicorn%''\" get ProcessId,CommandLine)",
-      "Bash(wmic process:*)"
+      "Bash(wmic process:*)",
+      "Bash(nslookup:*)",
+      "Bash(powershell \"Test-NetConnection -ComputerName aws-1-ap-south-1.pooler.supabase.com -Port 6543\")",
+      "Bash(powershell:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

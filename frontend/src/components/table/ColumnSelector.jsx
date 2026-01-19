@@ -95,6 +95,18 @@ export default function ColumnSelector({ allColumns, selectedColumns, onChange }
     onChange([]);
   };
 
+  const moveColumn = (columnKey, direction) => {
+    const index = selectedColumns.indexOf(columnKey);
+    if (index < 0) return;
+    const nextIndex = direction === 'up' ? index - 1 : index + 1;
+    if (nextIndex < 0 || nextIndex >= selectedColumns.length) return;
+    const nextSelected = [...selectedColumns];
+    const temp = nextSelected[index];
+    nextSelected[index] = nextSelected[nextIndex];
+    nextSelected[nextIndex] = temp;
+    onChange(nextSelected);
+  };
+
   return (
     <div style={{ position: 'relative', display: 'inline-block' }}>
       <button
@@ -175,8 +187,16 @@ export default function ColumnSelector({ allColumns, selectedColumns, onChange }
               overflowY: 'auto',
             }}
           >
-            {allColumns.map((column) => {
+            {[
+              ...selectedColumns
+                .map((key) => allColumns.find((col) => col.key === key))
+                .filter(Boolean),
+              ...allColumns.filter((col) => !selectedColumns.includes(col.key)),
+            ].map((column) => {
               const isChecked = selectedColumns.includes(column.key);
+              const position = selectedColumns.indexOf(column.key);
+              const isFirst = position === 0;
+              const isLast = position === selectedColumns.length - 1;
 
               return (
                 <label
@@ -196,6 +216,54 @@ export default function ColumnSelector({ allColumns, selectedColumns, onChange }
                     onChange={() => handleToggle(column.key)}
                   />
                   <span>{column.label}</span>
+                  {isChecked && (
+                    <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: '4px' }}>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          moveColumn(column.key, 'up');
+                        }}
+                        disabled={isFirst}
+                        style={{
+                          background: 'none',
+                          border: '1px solid var(--border)',
+                          borderRadius: '6px',
+                          padding: '2px 6px',
+                          cursor: isFirst ? 'not-allowed' : 'pointer',
+                          fontSize: 'var(--text-xs)',
+                          color: 'var(--text)',
+                          opacity: isFirst ? 0.4 : 1,
+                        }}
+                        aria-label="Move column up"
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          moveColumn(column.key, 'down');
+                        }}
+                        disabled={isLast}
+                        style={{
+                          background: 'none',
+                          border: '1px solid var(--border)',
+                          borderRadius: '6px',
+                          padding: '2px 6px',
+                          cursor: isLast ? 'not-allowed' : 'pointer',
+                          fontSize: 'var(--text-xs)',
+                          color: 'var(--text)',
+                          opacity: isLast ? 0.4 : 1,
+                        }}
+                        aria-label="Move column down"
+                      >
+                        ↓
+                      </button>
+                    </span>
+                  )}
                 </label>
               );
             })}
